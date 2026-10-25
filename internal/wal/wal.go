@@ -77,6 +77,10 @@ func Open(path string, opts Options, apply func(payload []byte) error) (*Log, er
 	if err != nil {
 		return nil, err
 	}
+	if err := lock(f); err != nil {
+		f.Close()
+		return nil, err
+	}
 	good, err := Replay(f, apply)
 	if err != nil {
 		f.Close()
@@ -274,6 +278,11 @@ func (l *Log) Compact(filter func(payload []byte) (out []byte, keep bool, err er
 		return fail(err)
 	}
 	if err := tmp.Sync(); err != nil {
+		return fail(err)
+	}
+	// Lock the new file before it takes the log's name, so the log is never
+	// unlocked, not even between the rename and the old file's close.
+	if err := lock(osTmp); err != nil {
 		return fail(err)
 	}
 	if err := os.Rename(tmpPath, l.path); err != nil {

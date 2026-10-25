@@ -247,6 +247,31 @@ func TestOpenErrors(t *testing.T) {
 	}
 }
 
+func TestSecondOpenIsRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "w")
+	l, err := Open(path, Options{}, func([]byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Append([]byte("a"))
+	if _, err := Open(path, Options{}, func([]byte) error { return nil }); !errors.Is(err, ErrLocked) {
+		t.Fatalf("second open: %v", err)
+	}
+	// Still locked after compaction swaps the file.
+	if err := l.Compact(func(p []byte) ([]byte, bool, error) { return p, true, nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, Options{}, func([]byte) error { return nil }); !errors.Is(err, ErrLocked) {
+		t.Fatalf("open after compaction: %v", err)
+	}
+	l.Close()
+	l2, err := Open(path, Options{}, func([]byte) error { return nil })
+	if err != nil {
+		t.Fatalf("open after close: %v", err)
+	}
+	l2.Close()
+}
+
 func FuzzReplay(f *testing.F) {
 	f.Add(Encode(Encode(nil, []byte("a")), []byte(`{"x":1}`)))
 	f.Add([]byte("00000000 \n"))
