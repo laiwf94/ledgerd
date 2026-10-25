@@ -89,13 +89,21 @@ func loadConfig(getenv func(string) string) (config, error) {
 	return c, nil
 }
 
+// utcTime logs timestamps in UTC, like every time the ledger stores.
+func utcTime(groups []string, a slog.Attr) slog.Attr {
+	if a.Key == slog.TimeKey && len(groups) == 0 {
+		a.Value = slog.TimeValue(a.Value.Time().UTC())
+	}
+	return a
+}
+
 // run serves until ctx ends. ready, when set, receives the bound address.
 func run(ctx context.Context, getenv func(string) string, logOut io.Writer, ready func(addr string)) error {
 	cfg, err := loadConfig(getenv)
 	if err != nil {
 		return err
 	}
-	log := slog.New(slog.NewJSONHandler(logOut, &slog.HandlerOptions{Level: cfg.logLevel}))
+	log := slog.New(slog.NewJSONHandler(logOut, &slog.HandlerOptions{Level: cfg.logLevel, ReplaceAttr: utcTime}))
 	if cfg.dataDir == "" {
 		log.Warn("LEDGERD_DATA_DIR not set; the ledger lives in memory and is lost on exit")
 	}

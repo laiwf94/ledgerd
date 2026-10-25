@@ -121,7 +121,7 @@ func TestRunServesPersistsAndShutsDown(t *testing.T) {
 	if code != 200 || !strings.Contains(body, `"posted":250`) {
 		t.Fatalf("after restart: %d %s", code, body)
 	}
-	if !strings.Contains(logs.String(), `"head":1`) {
+	if !strings.Contains(logs.String(), `"head":1`) || !strings.Contains(logs.String(), `Z","level"`) {
 		t.Fatalf("recovery not logged: %s", logs.String())
 	}
 	if err := stop(); err != nil {
