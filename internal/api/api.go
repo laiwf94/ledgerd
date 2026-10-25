@@ -38,6 +38,9 @@ const (
 	minSecretLength    = 16
 	dateLayout         = "2006-01-02"
 	maxQueryValueBytes = 64
+	// MaxConcurrentReconciles bounds the memory reconciliation can use: each
+	// one holds a statement of up to 4 MiB and up to 100,000 movements.
+	MaxConcurrentReconciles = 4
 )
 
 // Config configures a Server.
@@ -61,6 +64,7 @@ type Server struct {
 	m       *metrics.Registry
 	timeout time.Duration
 	mux     *http.ServeMux
+	recon   chan struct{}
 }
 
 // New builds a server. It returns an error for unsafe configuration.
@@ -71,7 +75,7 @@ func New(cfg Config) (*Server, error) {
 	if len(cfg.APIKeys) == 0 {
 		return nil, errors.New("api: at least one API key is required")
 	}
-	s := &Server{l: cfg.Ledger, log: cfg.Logger, m: cfg.Metrics, timeout: cfg.Timeout}
+	s := &Server{l: cfg.Ledger, log: cfg.Logger, m: cfg.Metrics, timeout: cfg.Timeout, recon: make(chan struct{}, MaxConcurrentReconciles)}
 	for _, k := range cfg.APIKeys {
 		if len(k) < minSecretLength {
 			return nil, fmt.Errorf("api: API keys must be at least %d characters", minSecretLength)
@@ -613,6 +617,13 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) error {
 	acct, err := s.l.Account(id, 0)
 	if err != nil {
 		return err
+	}
+	select {
+	case s.recon <- struct{}{}:
+		defer func() { <-s.recon }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		return &apiError{http.StatusTooManyRequests, "resource_exhausted", fmt.Sprintf("at most %d reconciliations run at once; retry shortly", MaxConcurrentReconciles)}
 	}
 	lines, err := recon.Parse(r.Body)
 	var mbe *http.MaxBytesError

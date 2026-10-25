@@ -396,8 +396,19 @@ func TestErrors(t *testing.T) {
 			t.Errorf("%s %s: request id %v / %q", c.method, c.path, id, r.header.Get(requestIDHeader))
 		}
 	}
-	// An empty statement with a period lists the ledger's unmatched movements.
+	// Reconciliations beyond the concurrency limit are turned away, not queued.
+	for i := 0; i < MaxConcurrentReconciles; i++ {
+		f.api.recon <- struct{}{}
+	}
 	r := f.call("POST", "/v1/accounts/merchant/reconcile?from=2030-03-01&to=2030-03-01", "external_id,date,amount,currency,reference\n", "Content-Type", "text/csv")
+	if r.status != 429 || r.code() != "resource_exhausted" || r.header.Get("Retry-After") == "" {
+		t.Fatalf("over the limit: %d %s", r.status, r.body)
+	}
+	for i := 0; i < MaxConcurrentReconciles; i++ {
+		<-f.api.recon
+	}
+	// An empty statement with a period lists the ledger's unmatched movements.
+	r = f.call("POST", "/v1/accounts/merchant/reconcile?from=2030-03-01&to=2030-03-01", "external_id,date,amount,currency,reference\n", "Content-Type", "text/csv")
 	if r.status != 200 || num(r.json(t)["summary"].(map[string]any)["missing_in_statement"]) != 1 {
 		t.Fatalf("empty statement: %d %s", r.status, r.body)
 	}
