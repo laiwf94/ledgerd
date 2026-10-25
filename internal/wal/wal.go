@@ -156,10 +156,13 @@ func decode(line []byte) ([]byte, error) {
 	if len(line) < 9 || line[8] != ' ' {
 		return nil, errors.New("malformed record")
 	}
-	var sum [4]byte
-	if _, err := hex.Decode(sum[:], line[:8]); err != nil {
-		return nil, errors.New("malformed checksum")
+	for _, c := range line[:8] {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return nil, errors.New("malformed checksum") // lower-case hex only, so each record has one encoding
+		}
 	}
+	var sum [4]byte
+	hex.Decode(sum[:], line[:8])
 	payload := line[9:]
 	want := uint32(sum[0])<<24 | uint32(sum[1])<<16 | uint32(sum[2])<<8 | uint32(sum[3])
 	if crc32.Checksum(payload, crcTable) != want {
