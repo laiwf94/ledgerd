@@ -80,7 +80,7 @@ func Parse(r io.Reader) ([]Line, error) {
 	cr := csv.NewReader(bytes.NewReader(data))
 	cr.FieldsPerRecord = len(header)
 	cr.ReuseRecord = true
-	row := 0
+	row, records := 0, 0
 	var lines []Line
 	seen := map[string]int{}
 	for {
@@ -88,15 +88,18 @@ func Parse(r io.Reader) ([]Line, error) {
 		if errors.Is(err, io.EOF) {
 			break
 		}
-		row++
 		if err != nil {
 			var pe *csv.ParseError
 			if errors.As(err, &pe) {
 				return nil, &ParseError{Row: pe.Line, Msg: pe.Err.Error()}
 			}
-			return nil, &ParseError{Row: row, Msg: err.Error()}
+			return nil, &ParseError{Row: row + 1, Msg: err.Error()}
 		}
-		if row == 1 {
+		// Rows are file lines: the csv reader skips blank lines and a quoted
+		// field may span several, so counting records would drift.
+		row, _ = cr.FieldPos(0)
+		records++
+		if records == 1 {
 			for i, h := range header {
 				if strings.TrimSpace(strings.ToLower(rec[i])) != h {
 					return nil, &ParseError{Row: 1, Msg: "the header must be " + strings.Join(header, ",")}
@@ -118,7 +121,7 @@ func Parse(r io.Reader) ([]Line, error) {
 		ln.Row = row
 		lines = append(lines, ln)
 	}
-	if row == 0 {
+	if records == 0 {
 		return nil, &ParseError{Row: 1, Msg: "the file is empty; it needs the header " + strings.Join(header, ",")}
 	}
 	return lines, nil

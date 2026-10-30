@@ -72,6 +72,19 @@ func TestParseErrors(t *testing.T) {
 	}
 }
 
+func TestParseRowsAreFileLines(t *testing.T) {
+	// Blank lines are skipped by the csv reader but must still count.
+	in := hdr + "\nok,2030-01-02,1,USD,\n\n\nbad,x,1,USD,\n"
+	var pe *ParseError
+	if _, err := Parse(strings.NewReader(in)); !errors.As(err, &pe) || pe.Row != 6 {
+		t.Fatalf("row = %v, want 6 (err %v)", pe, err)
+	}
+	lines, err := Parse(strings.NewReader(hdr + "\nok,2030-01-02,1,USD,\n"))
+	if err != nil || len(lines) != 1 || lines[0].Row != 3 {
+		t.Fatalf("lines = %+v, %v; want one line on row 3", lines, err)
+	}
+}
+
 func TestParseLimits(t *testing.T) {
 	var b strings.Builder
 	b.WriteString(hdr)
