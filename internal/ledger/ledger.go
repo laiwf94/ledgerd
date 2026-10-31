@@ -11,6 +11,7 @@
 package ledger
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -32,6 +33,7 @@ const (
 	DefaultIdempotencyTTL = 24 * time.Hour
 	DefaultMaxBatch       = 1024
 	DefaultSweepInterval  = time.Second
+	DefaultSnapshotEvery  = 100_000
 	logName               = "ledger.wal"
 )
 
@@ -56,6 +58,12 @@ type Options struct {
 	// background. Commands also expire due reservations before they run.
 	// Negative disables the background sweep. Default 1s.
 	SweepInterval time.Duration
+	// SnapshotEvery is how many log records the writer appends between
+	// snapshots. Restart time is proportional to the records written since
+	// the newest snapshot. Close also takes one when anything changed since
+	// the last. Negative stops the ledger writing snapshots (existing ones are
+	// still loaded). Default 100,000.
+	SnapshotEvery int
 	// NewID generates transfer IDs. Default "tr_" plus 24 random hex digits.
 	NewID func() string
 	// WrapFile wraps the log file; tests use it to inject I/O failures.
@@ -84,7 +92,16 @@ type Ledger struct {
 	idemFIFO []idemAt
 	inflight map[string]*flight
 
+	// Snapshot bookkeeping. lastSnap and sinceSnap belong to the writer;
+	// snapIdle holds a token while no snapshot is being written.
+	lastSnap      uint64
+	sinceSnap     int
+	snapIdle      chan struct{}
+	compactCutoff time.Time // idempotency records at or before this are dropped by compaction
+	needCompact   bool      // recovery saw such a record
+
 	mCommitted, mRejected, mBatches, mRecords *metrics.Counter
+	mSnapOK, mSnapFailed                      *metrics.Counter
 	mCommit                                   *metrics.Histogram
 }
 
@@ -134,6 +151,9 @@ func Open(opts Options) (*Ledger, error) {
 	if opts.NewID == nil {
 		opts.NewID = randomID
 	}
+	if opts.SnapshotEvery == 0 {
+		opts.SnapshotEvery = DefaultSnapshotEvery
+	}
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.NewJSONHandler(io.Discard, nil))
 	}
@@ -142,21 +162,11 @@ func Open(opts Options) (*Ledger, error) {
 	}
 	l := &Ledger{opts: opts, st: newState(), queue: make(chan *request, 4*opts.MaxBatch),
 		quit: make(chan struct{}), done: make(chan struct{}),
-		idem: map[string]*idemEntry{}, inflight: map[string]*flight{}}
+		idem: map[string]*idemEntry{}, inflight: map[string]*flight{}, snapIdle: make(chan struct{}, 1)}
+	l.snapIdle <- struct{}{}
 
 	if opts.Dir != "" {
-		first := true
-		lg, err := wal.Open(filepath.Join(opts.Dir, logName), wal.Options{WrapFile: opts.WrapFile}, func(p []byte) error {
-			err := l.replay(p, first)
-			first = false
-			return err
-		})
-		if err != nil {
-			return nil, err
-		}
-		l.log = lg
-		if err := l.prepareLog(); err != nil {
-			lg.Close()
+		if err := l.recover(); err != nil {
 			return nil, err
 		}
 	}
@@ -172,15 +182,132 @@ func Open(opts Options) (*Ledger, error) {
 	return l, nil
 }
 
-// prepareLog writes the header into a new log, or compacts an existing one:
-// expired idempotency records are dropped. Entries are history and are
+var (
+	snapRecordPrefix = []byte(`{"t":"` + recSnapshot + `"`)
+	idemFieldTag     = []byte(`"idem":`)
+)
+
+// recover rebuilds the state from the newest valid snapshot and the log
+// records after it, or from the whole log when there is no snapshot.
+func (l *Ledger) recover() error {
+	l.compactCutoff = l.now().Add(-l.opts.IdempotencyTTL)
+	first := true
+	var skipTo uint64 // the snapshot whose log record replay is looking for
+	lg, err := wal.Open(filepath.Join(l.opts.Dir, logName), wal.Options{WrapFile: l.opts.WrapFile}, func(p []byte) error {
+		if first {
+			first = false
+			if err := l.replay(p, true); err != nil {
+				return err
+			}
+			// The log is locked from here, so no other process is writing
+			// snapshots into the directory.
+			n, err := l.loadSnapshot()
+			skipTo = n
+			return err
+		}
+		if skipTo == 0 {
+			l.sinceSnap++ // records a snapshot would save the next start from replaying
+			return l.replay(p, false)
+		}
+		// Records before the snapshot are already in it. They passed their
+		// checksums; only snapshot markers and keyed records need decoding.
+		if bytes.HasPrefix(p, snapRecordPrefix) {
+			r, err := decodeRecord(p)
+			if err != nil {
+				return err
+			}
+			if r.Snap == skipTo {
+				if r.Seq != l.st.head() {
+					return fmt.Errorf("snapshot %d holds head %d but its log record says %d", skipTo, l.st.head(), r.Seq)
+				}
+				skipTo = 0
+			}
+			return nil
+		}
+		if !l.needCompact && bytes.Contains(p, idemFieldTag) {
+			r, err := decodeRecord(p)
+			if err != nil {
+				return err
+			}
+			l.noteIdem(r)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	l.log = lg
+	fail := func(err error) error {
+		lg.Close()
+		return err
+	}
+	if skipTo != 0 {
+		return fail(fmt.Errorf("%w: snapshot %d has no record in the log", wal.ErrCorrupt, skipTo))
+	}
+	if lg.Size() == 0 {
+		if nums, err := listSnapshots(l.opts.Dir); err != nil || len(nums) > 0 {
+			return fail(fmt.Errorf("%w: the log is empty but the directory holds snapshots", wal.ErrCorrupt))
+		}
+	}
+	if err := l.prepareLog(); err != nil {
+		return fail(err)
+	}
+	return nil
+}
+
+// loadSnapshot installs the newest snapshot that reads back intact and
+// returns its number, or 0 when there is none. A damaged snapshot is
+// skipped: the log still holds everything it summarised.
+func (l *Ledger) loadSnapshot() (uint64, error) {
+	nums, err := listSnapshots(l.opts.Dir)
+	if err != nil {
+		return 0, err
+	}
+	for _, n := range nums {
+		s, st, err := readSnapshot(filepath.Join(l.opts.Dir, snapName(n)))
+		if err != nil {
+			l.opts.Logger.Warn("skipping unreadable snapshot", "snapshot", n, "error", err.Error())
+			continue
+		}
+		if s.num != n {
+			l.opts.Logger.Warn("skipping snapshot with the wrong number", "snapshot", n, "holds", s.num)
+			continue
+		}
+		l.st = st
+		for _, q := range s.idem {
+			e := q.e
+			l.idem[q.id] = &e
+			l.idemFIFO = append(l.idemFIFO, idemAt{id: q.id, at: e.at})
+			if !e.at.After(l.compactCutoff) {
+				l.needCompact = true
+			}
+		}
+		l.lastSnap = n
+		l.opts.Logger.Info("loaded snapshot", "snapshot", n, "head", s.head)
+		return n, nil
+	}
+	return 0, nil
+}
+
+// noteIdem records whether compaction has an expired key to drop.
+func (l *Ledger) noteIdem(r record) {
+	if r.Idem != nil && !r.Time.After(l.compactCutoff) {
+		l.needCompact = true
+	}
+}
+
+// prepareLog writes the header into a new log, or compacts an existing one
+// that holds expired idempotency records. Entries are history and are
 // always kept.
 func (l *Ledger) prepareLog() error {
 	if l.log.Size() == 0 {
 		p, _ := encodeRecord(record{Type: recHeader, Version: logVersion})
 		return l.log.Append(p)
 	}
-	cutoff := l.now().Add(-l.opts.IdempotencyTTL)
+	if !l.needCompact {
+		return nil
+	}
+	cutoff := l.compactCutoff
 	err := l.log.Compact(func(p []byte) ([]byte, bool, error) {
 		r, err := decodeRecord(p)
 		if err != nil {
@@ -218,6 +345,7 @@ func (l *Ledger) replay(p []byte, first bool) error {
 		if idem, err = r.Idem.idem(); err != nil {
 			return err
 		}
+		l.noteIdem(r)
 	}
 	switch r.Type {
 	case recHeader:
@@ -230,6 +358,15 @@ func (l *Ledger) replay(p []byte, first bool) error {
 			return errors.New("reject record without key or error")
 		}
 		l.storeIdem(idem, &idemEntry{hash: idem.Hash, err: r.Err, at: r.Time})
+		return nil
+	case recSnapshot:
+		if r.Seq != l.st.head() {
+			return fmt.Errorf("snapshot %d record says head %d, journal is at %d", r.Snap, r.Seq, l.st.head())
+		}
+		if r.Snap <= l.lastSnap {
+			return fmt.Errorf("snapshot %d recorded after snapshot %d", r.Snap, l.lastSnap)
+		}
+		l.lastSnap, l.sinceSnap = r.Snap, 0
 		return nil
 	case recCmd, recExpire:
 		t := newTxn(l.st, r.Time)
@@ -279,6 +416,8 @@ func (l *Ledger) registerMetrics() {
 	l.mRejected = m.Counter("ledgerd_commands_total", `result="rejected"`, "Commands executed by the writer.")
 	l.mBatches = m.Counter("ledgerd_log_batches_total", "", "Group commits: batches written with one fsync.")
 	l.mRecords = m.Counter("ledgerd_log_records_total", "", "Records written to the log.")
+	l.mSnapOK = m.Counter("ledgerd_snapshots_total", `result="written"`, "Snapshots the ledger tried to write.")
+	l.mSnapFailed = m.Counter("ledgerd_snapshots_total", `result="failed"`, "Snapshots the ledger tried to write.")
 	l.mCommit = m.Histogram("ledgerd_commit_duration_seconds", "", "Time to write and fsync one batch.")
 	m.Gauge("ledgerd_journal_head", "Sequence number of the newest journal entry.", func() float64 { return float64(l.Head()) })
 	m.Gauge("ledgerd_pending_transfers", "Open pending transfers.", func() float64 { return float64(l.Stats().OpenPending) })
@@ -439,6 +578,7 @@ func (l *Ledger) pruneIdem() {
 // run is the writer loop.
 func (l *Ledger) run() {
 	defer close(l.done)
+	l.maybeSnapshot() // recovery may have replayed enough to be worth saving
 	var tick <-chan time.Time
 	if l.opts.SweepInterval > 0 {
 		t := time.NewTicker(l.opts.SweepInterval)
@@ -449,10 +589,12 @@ func (l *Ledger) run() {
 		select {
 		case req := <-l.queue:
 			l.process(l.drain(req))
+			l.maybeSnapshot()
 		case <-tick:
 			l.pruneIdem()
 			if l.dueExpiries() {
 				l.process(nil)
+				l.maybeSnapshot()
 			}
 		case <-l.quit:
 			// Close stopped new submissions; finish what was queued.
@@ -581,6 +723,7 @@ func (l *Ledger) process(batch []*request) {
 		l.mCommit.Observe(time.Since(start))
 		l.mBatches.Inc()
 		l.mRecords.Add(uint64(len(recs)))
+		l.sinceSnap += len(recs)
 	}
 	l.mu.Lock()
 	t.commit()
@@ -601,8 +744,72 @@ func (l *Ledger) Close() error {
 	l.closeMu.Unlock()
 	close(l.quit)
 	<-l.done
-	if l.log != nil {
-		return l.log.Close()
+	<-l.snapIdle // wait for a snapshot still being written
+	if l.log == nil {
+		return nil
 	}
-	return nil
+	// A clean shutdown leaves a snapshot of everything, so the next start
+	// replays nothing.
+	if l.opts.SnapshotEvery >= 0 && l.sinceSnap > 0 {
+		if s := l.markSnapshot(); s != nil {
+			l.saveSnapshot(s)
+		}
+	}
+	return l.log.Close()
+}
+
+// maybeSnapshot starts a snapshot once enough records have been written
+// since the last one and no other snapshot is being written. The writer
+// calls it between batches, when the committed state is exactly what the log
+// holds.
+func (l *Ledger) maybeSnapshot() {
+	if l.log == nil || l.opts.SnapshotEvery < 0 || l.sinceSnap < l.opts.SnapshotEvery {
+		return
+	}
+	select {
+	case <-l.snapIdle:
+	default:
+		return // the previous one is still being written; try after the next batch
+	}
+	s := l.markSnapshot()
+	if s == nil {
+		l.snapIdle <- struct{}{}
+		return
+	}
+	go func() {
+		l.saveSnapshot(s)
+		l.snapIdle <- struct{}{}
+	}()
+}
+
+// markSnapshot appends the snapshot's log record and copies the state as of
+// that record. It returns nil if the log is unavailable.
+func (l *Ledger) markSnapshot() *snapshot {
+	if l.unavailable() != nil {
+		return nil
+	}
+	now := l.now()
+	num := l.lastSnap + 1
+	p, _ := encodeRecord(record{Type: recSnapshot, Time: now, Seq: l.st.head(), Snap: num})
+	if err := l.log.Append(p); err != nil {
+		l.halt(err)
+		return nil
+	}
+	l.lastSnap, l.sinceSnap = num, 0
+	return l.capture(num, now)
+}
+
+// saveSnapshot writes s to disk. Failure is not fatal: the log still holds
+// everything, so the next start only replays more of it.
+func (l *Ledger) saveSnapshot(s *snapshot) {
+	start := time.Now()
+	size, err := writeSnapshot(l.opts.Dir, s)
+	if err != nil {
+		l.mSnapFailed.Inc()
+		l.opts.Logger.Warn("writing a snapshot failed; recovery will replay more of the log", "snapshot", s.num, "error", err.Error())
+		return
+	}
+	l.mSnapOK.Inc()
+	l.opts.Logger.Info("snapshot written", "snapshot", s.num, "head", s.head, "bytes", size,
+		"duration_ms", time.Since(start).Milliseconds())
 }

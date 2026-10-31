@@ -21,15 +21,18 @@ func TestLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.addr != ":8080" || len(c.apiKeys) != 2 || c.idemTTL != ledger.DefaultIdempotencyTTL || c.maxBatch != ledger.DefaultMaxBatch || c.adminToken != "" {
+	if c.addr != ":8080" || len(c.apiKeys) != 2 || c.idemTTL != ledger.DefaultIdempotencyTTL || c.maxBatch != ledger.DefaultMaxBatch || c.adminToken != "" ||
+		c.snapEvery != ledger.DefaultSnapshotEvery {
 		t.Fatalf("defaults wrong: %+v", c)
 	}
 	c, err = loadConfig(env(map[string]string{"LEDGERD_API_KEYS": "k", "LEDGERD_ADDR": ":9", "LEDGERD_DATA_DIR": "/d",
-		"LEDGERD_ADMIN_TOKEN": "t", "LEDGERD_IDEMPOTENCY_TTL": "1h", "LEDGERD_MAX_BATCH": "1", "LEDGERD_LOG_LEVEL": "debug"}))
+		"LEDGERD_ADMIN_TOKEN": "t", "LEDGERD_IDEMPOTENCY_TTL": "1h", "LEDGERD_MAX_BATCH": "1", "LEDGERD_LOG_LEVEL": "debug",
+		"LEDGERD_SNAPSHOT_EVERY": "500"}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.addr != ":9" || c.dataDir != "/d" || c.adminToken != "t" || c.idemTTL != time.Hour || c.maxBatch != 1 || c.logLevel.String() != "DEBUG" {
+	if c.addr != ":9" || c.dataDir != "/d" || c.adminToken != "t" || c.idemTTL != time.Hour || c.maxBatch != 1 || c.logLevel.String() != "DEBUG" ||
+		c.snapEvery != 500 {
 		t.Fatalf("overrides wrong: %+v", c)
 	}
 }
@@ -41,6 +44,7 @@ func TestLoadConfigErrors(t *testing.T) {
 		"LEDGERD_IDEMPOTENCY_TTL must be ": {"LEDGERD_API_KEYS": "k", "LEDGERD_IDEMPOTENCY_TTL": "soon"},
 		"LEDGERD_MAX_BATCH must be":        {"LEDGERD_API_KEYS": "k", "LEDGERD_MAX_BATCH": "0"},
 		"LEDGERD_LOG_LEVEL":                {"LEDGERD_API_KEYS": "k", "LEDGERD_LOG_LEVEL": "loud"},
+		"LEDGERD_SNAPSHOT_EVERY must be":   {"LEDGERD_API_KEYS": "k", "LEDGERD_SNAPSHOT_EVERY": "-1"},
 	}
 	for want, e := range cases {
 		if _, err := loadConfig(env(e)); err == nil || !strings.Contains(err.Error(), strings.TrimSpace(want)) {
@@ -149,4 +153,11 @@ func TestRunErrors(t *testing.T) {
 		t.Fatal(code)
 	}
 	stop()
+}
+
+func TestSnapshotsCanBeTurnedOff(t *testing.T) {
+	c, err := loadConfig(env(map[string]string{"LEDGERD_API_KEYS": "k", "LEDGERD_SNAPSHOT_EVERY": "0"}))
+	if err != nil || c.snapEvery >= 0 {
+		t.Fatalf("snapEvery = %d, %v", c.snapEvery, err)
+	}
 }

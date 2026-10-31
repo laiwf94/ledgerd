@@ -532,7 +532,9 @@ func readRecords(t testing.TB, path string, from int64) ([]record, int64) {
 	var recs []record
 	end, err := wal.Replay(bytes.NewReader(data[from:]), func(p []byte) error {
 		r, err := decodeRecord(p)
-		recs = append(recs, r)
+		if r.Type != recSnapshot { // markers say where a snapshot was taken, not what happened
+			recs = append(recs, r)
+		}
 		return err
 	})
 	if err != nil {
@@ -581,7 +583,8 @@ func runModel(t *testing.T, seed int64, rounds int, seen map[string]int) {
 	clock := newClock()
 	ids := seqIDs()
 	dir := t.TempDir()
-	opts := Options{Dir: dir, Clock: clock.Now, NewID: ids, SweepInterval: -1, MaxBatch: 1 + r.Intn(16)}
+	opts := Options{Dir: dir, Clock: clock.Now, NewID: ids, SweepInterval: -1, MaxBatch: 1 + r.Intn(16),
+		SnapshotEvery: 1 + r.Intn(40)}
 	l, err := Open(opts)
 	if err != nil {
 		t.Fatal(err)
@@ -747,6 +750,11 @@ func runModel(t *testing.T, seed int64, rounds int, seen map[string]int) {
 		// perhaps half of a batch that was being written.
 		if r.Intn(10) == 0 {
 			crashDir := t.TempDir()
+			// Snapshot files survive the crash too, including one the
+			// background writer may be halfway through. They are copied
+			// before the log, as on a real disk a snapshot's log record is
+			// durable before its file exists.
+			copySnapshots(t, filepath.Dir(path), crashDir)
 			data, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal(err)
