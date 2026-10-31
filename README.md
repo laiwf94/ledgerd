@@ -53,7 +53,9 @@ Storage is a checksummed command log, fsynced before anything is
 acknowledged. Concurrent transfers share one fsync (group commit), a torn
 tail is dropped on recovery, and the tests cut the log at every byte to
 prove it. If the disk returns an error the service stops taking writes
-rather than guess.
+rather than guess. Periodic checksummed snapshots let a restart load the
+state and replay only the log written since: a million-entry ledger opens in
+2.5 s instead of 9.4 s.
 
 Reconciliation takes a bank or processor statement as CSV and reports what
 matched, what matched by reference but with a different amount, and what is
@@ -118,6 +120,7 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 |---|---|
 | Ledger logic | Random concurrent workloads (transfers, two-phase, partial posts, voids, expiries, reversals, idempotent retries, key reuse, crash-restarts) run against the real ledger; a separate single-threaded model with `big.Int` balances replays the writer's order from the log. Every result, balance, version and invariant must agree after every round. Deliberately broken versions of the ledger fail this test. |
 | Crash safety | The log is truncated at every byte offset; recovery must produce exactly the state after some prefix of acknowledged commands, and every invariant must hold. Corruption in the middle of the log stops startup. |
+| Snapshots | A snapshot plus the log after it must rebuild exactly the state (accounts, history rows, transfers, journal, expiries, idempotency results) that replaying the whole log does, across random workloads, crashes mid-snapshot, concurrent load and compaction. A snapshot cut at every byte or with a flipped bit in any byte is refused, and recovery falls back to an older snapshot or the log. |
 | Storage failures | Injected write and fsync errors: the ledger stops accepting writes, keeps serving reads, and after a restart a keyed retry reports what actually reached the disk. |
 | Idempotency | Replays across restarts, errors replayed, key reuse, scope per API key, retention expiry, concurrent duplicates held in flight by a blocked fsync. |
 | Reconciliation | The amount-and-date pass is compared with a maximum bipartite matching on random inputs; a worst case of 10,000 lines against 100,000 identical movements must stay fast. |
@@ -130,6 +133,7 @@ To run the suite and the ledger benchmarks:
 ```console
 $ go test -race ./...                 # full suite
 $ go test -run=^$ -bench=. ./internal/ledger/
+$ go test -run=^$ -bench=Recovery -benchtime=3x ./internal/ledger/   # restart time at 1 million entries
 ```
 
 ## Numbers
@@ -161,7 +165,7 @@ out as follows:
 cmd/ledgerd        server entry point and configuration
 internal/money     currency table, checked arithmetic, exact decimal parsing
 internal/wal       checksummed append-only log: batched append, replay, compaction
-internal/ledger    accounts, transfers, journal, writer with group commit, idempotency, queries, invariants
+internal/ledger    accounts, transfers, journal, writer with group commit, idempotency, snapshots, queries, invariants
 internal/recon     statement CSV parser and matcher
 internal/api       HTTP API, auth, errors, logging, metrics wiring
 internal/metrics   Prometheus text exposition

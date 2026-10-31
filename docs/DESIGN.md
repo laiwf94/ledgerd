@@ -137,8 +137,9 @@ The log is a command log. Each line is:
 
 Records are `header` (format version), `cmd` (an accepted command with the
 time it ran, the ID it generated and the entry sequence it produced),
-`expire` (a timeout released a reservation) and `reject` (a refused command
-that carried an idempotency key, with its error). Replay runs each `cmd`
+`expire` (a timeout released a reservation), `reject` (a refused command
+that carried an idempotency key, with its error) and `snapshot` (the point a
+snapshot was taken at, below). Replay runs each `cmd`
 through the same code at the recorded time, so the rebuilt state is
 identical, and it checks that each record produces the sequence number the
 log says it did. Expiries are records of their own, so recovery never
@@ -155,11 +156,11 @@ on `kill -9`. Then:
 - Any other bad line, or a record that fails to replay, means the file was
   damaged after it was acknowledged. Startup stops with an error rather than
   guess which acknowledged transfers to throw away.
-- The log is compacted: rewritten through a temporary file, fsynced, and
-  atomically renamed over the old one, dropping `reject` records and
-  idempotency keys older than the retention window. Entries are history and
-  are always kept, so the compacted log has the same structure as the
-  original and recovery from it is the same code.
+- If the log holds idempotency keys older than the retention window, it is
+  compacted: rewritten through a temporary file, fsynced, and atomically
+  renamed over the old one, dropping those `reject` records and keys.
+  Entries are history and are always kept, so the compacted log has the
+  same structure as the original and recovery from it is the same code.
 - Every invariant (below) is checked before the server accepts traffic.
 
 The crash test writes a workload of accounts, single-phase and two-phase
@@ -178,6 +179,57 @@ Rebello et al., *Can Applications Recover from fsync Failures?*). A restart
 recovers from what is really on disk, and clients learn the outcome of the
 ambiguous requests by retrying with their idempotency keys. The tests inject
 both failures and check exactly that.
+
+### Snapshots
+
+Replaying every command ever accepted makes restart time grow with the
+ledger's age, so the writer also takes snapshots: every
+`LEDGERD_SNAPSHOT_EVERY` log records (100,000 by default), after recovery
+if it replayed at least that many, and on a clean shutdown. A snapshot holds
+everything the state machine holds: each account with its totals and
+version, every transfer, the journal, and the idempotency keys still kept
+with their stored results.
+
+Between two batches, the writer appends a `snapshot` record carrying the
+snapshot's number and the journal head, fsynced like any batch, then copies
+the state as of that record. The copy costs a pass over accounts, transfers
+and keys (journal entries are immutable and shared); a background goroutine
+sorts, encodes and writes it while commits continue. The file goes to a
+temporary name, is fsynced, renamed to `snapshot-<number>.snap` and the
+directory fsynced, so a crash leaves the whole file or none. The two newest
+snapshots are kept.
+
+On start, Open loads the newest snapshot that reads back intact, then reads
+the log: records up to that snapshot's `snapshot` record are only
+checksummed, not decoded or run, and replay starts after it. The snapshot
+record must carry the snapshot's head. A damaged snapshot is skipped for an
+older one or a full replay, since the log still holds everything. A
+snapshot whose record is not in the log (a log restored from an older copy,
+say) stops startup, because the two disagree about history. Snapshot
+records survive compaction, so positions stay valid when the log is
+rewritten. Failing to write a snapshot is logged and counted in
+`ledgerd_snapshots_total{result="failed"}`; it costs restart time, never
+data.
+
+The file is binary: the magic `LDGSNAP1`, then frames of a big-endian
+`uint32` length, a CRC-32C and up to about 64 KiB of items. Items (tag byte,
+varints and length-prefixed strings) never span frames. A header gives the
+format version, snapshot number, head and item counts; accounts, transfers,
+entries and keys follow; a footer counts the frames before it. Loading
+checks every frame's checksum, every count, that entries are numbered 1 to
+head and each is listed by exactly one transfer, and refolds each account's
+entries, which must reproduce its stored totals and version; history rows
+are rebuilt by that fold. The tests flip the low and high bit of every byte,
+and cut the file at every byte, of a snapshot with every kind of state, and
+each damaged copy is refused.
+
+On a 4-vCPU 2.1 GHz Xeon virtual machine, opening a ledger of 1 million
+single-phase transfers takes 9.4 s replaying the log and 2.5 s from a
+snapshot at the head; a 10,000-entry tail after the snapshot adds about
+0.15 s of replay (`BenchmarkRecovery`). Most of what remains grows with the
+ledger, not the tail: decoding the 157 MB snapshot (about 1.7 s, much of it
+building maps and garbage collection) and the startup invariant check (about
+0.75 s). Both shrink once state lives on disk rather than wholly in memory.
 
 ## Retrying with an idempotency key
 

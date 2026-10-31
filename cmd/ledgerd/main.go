@@ -8,6 +8,7 @@
 //	LEDGERD_ADMIN_TOKEN      bearer token for /v1/admin; when unset, admin endpoints answer loopback clients only
 //	LEDGERD_IDEMPOTENCY_TTL  how long idempotency keys are kept, e.g. 24h (default 24h, at most 720h)
 //	LEDGERD_MAX_BATCH        most commands sharing one fsync (default 1024; 1 disables group commit)
+//	LEDGERD_SNAPSHOT_EVERY   log records between snapshots (default 100000; 0 disables snapshots)
 //	LEDGERD_LOG_LEVEL        debug, info, warn or error (default info)
 package main
 
@@ -47,13 +48,15 @@ type config struct {
 	adminToken string
 	idemTTL    time.Duration
 	maxBatch   int
+	snapEvery  int
 	logLevel   slog.Level
 }
 
 const maxIdempotencyTTL = 30 * 24 * time.Hour
 
 func loadConfig(getenv func(string) string) (config, error) {
-	c := config{addr: ":8080", idemTTL: ledger.DefaultIdempotencyTTL, maxBatch: ledger.DefaultMaxBatch}
+	c := config{addr: ":8080", idemTTL: ledger.DefaultIdempotencyTTL, maxBatch: ledger.DefaultMaxBatch,
+		snapEvery: ledger.DefaultSnapshotEvery}
 	if v := getenv("LEDGERD_ADDR"); v != "" {
 		c.addr = v
 	}
@@ -80,6 +83,16 @@ func loadConfig(getenv func(string) string) (config, error) {
 			return c, errors.New("LEDGERD_MAX_BATCH must be between 1 and 65536")
 		}
 		c.maxBatch = n
+	}
+	if v := getenv("LEDGERD_SNAPSHOT_EVERY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 100_000_000 {
+			return c, errors.New("LEDGERD_SNAPSHOT_EVERY must be between 0 (off) and 100000000")
+		}
+		c.snapEvery = n
+		if n == 0 {
+			c.snapEvery = -1
+		}
 	}
 	if v := getenv("LEDGERD_LOG_LEVEL"); v != "" {
 		if err := c.logLevel.UnmarshalText([]byte(v)); err != nil {
@@ -110,7 +123,7 @@ func run(ctx context.Context, getenv func(string) string, logOut io.Writer, read
 	reg := metrics.New()
 	start := time.Now()
 	l, err := ledger.Open(ledger.Options{Dir: cfg.dataDir, IdempotencyTTL: cfg.idemTTL, MaxBatch: cfg.maxBatch,
-		Logger: log, Metrics: reg})
+		SnapshotEvery: cfg.snapEvery, Logger: log, Metrics: reg})
 	if err != nil {
 		return fmt.Errorf("opening ledger: %w", err)
 	}

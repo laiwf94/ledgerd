@@ -412,6 +412,11 @@ func TestOpenErrors(t *testing.T) {
 func TestCompactionFailureIsNotFatal(t *testing.T) {
 	e := newEnv(t, true)
 	e.standard()
+	// An expired key gives the next start something to compact.
+	if _, err := e.l.Do(context.Background(), move(dr("bank", 1), cr("equity", 1)), key("", "old", "old")); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Advance(DefaultIdempotencyTTL + time.Second)
 	e.l.Close()
 	var logs bytes.Buffer
 	var calls atomic.Int32
@@ -429,5 +434,5 @@ func TestCompactionFailureIsNotFatal(t *testing.T) {
 	}
 	e.do(move(dr("bank", 1), cr("equity", 1)))
 	e.restart()
-	e.wantBalance("bank", 1, 0, 1)
+	e.wantBalance("bank", 2, 0, 2)
 }

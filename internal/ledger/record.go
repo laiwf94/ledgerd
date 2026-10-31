@@ -23,6 +23,9 @@ const (
 	recCmd    = "cmd"
 	recExpire = "expire"
 	recReject = "reject"
+	// recSnapshot marks the point in the log a snapshot was taken at: Snap
+	// is the snapshot's number and Seq the journal head.
+	recSnapshot = "snapshot"
 
 	logVersion = 1
 )
@@ -36,6 +39,7 @@ type record struct {
 	Cmd     *Command   `json:"cmd,omitempty"`
 	Idem    *idemField `json:"idem,omitempty"`
 	Err     *Error     `json:"err,omitempty"`
+	Snap    uint64     `json:"snap,omitempty"`
 }
 
 type idemField struct {
