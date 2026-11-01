@@ -145,23 +145,84 @@ identical, and it checks that each record produces the sequence number the
 log says it did. Expiries are records of their own, so recovery never
 consults the clock.
 
-On start the log file is locked with an exclusive `flock`, so a second
-process pointed at the same directory refuses to start instead of
-interleaving appends; the kernel drops the lock when the process dies, even
-on `kill -9`. Then:
+On start the log directory is locked with an exclusive `flock` on its
+`LOCK` file, so a second process pointed at the same directory refuses to
+start instead of interleaving appends; the kernel drops the lock when the
+process dies, even on `kill -9`. Then:
 
-- A torn final line (no newline, or a bad checksum on the last line) belongs
-  to a batch that was never acknowledged; it is dropped and the file
-  truncated.
-- Any other bad line, or a record that fails to replay, means the file was
+- A torn final line (no newline, or a bad checksum on the last line) in the
+  newest segment belongs to a batch that was never acknowledged; it is
+  dropped and the segment truncated.
+- Any other bad line, or a record that fails to replay, means the log was
   damaged after it was acknowledged. Startup stops with an error rather than
   guess which acknowledged transfers to throw away.
-- If the log holds idempotency keys older than the retention window, it is
-  compacted: rewritten through a temporary file, fsynced, and atomically
-  renamed over the old one, dropping those `reject` records and keys.
-  Entries are history and are always kept, so the compacted log has the
-  same structure as the original and recovery from it is the same code.
 - Every invariant (below) is checked before the server accepts traffic.
+
+### Segments
+
+The log is a directory, `wal/` under the data directory, of segment files
+and a manifest. Records are numbered from 1 across the whole log, and each
+segment is named after the number of its first record
+(`00000000000000048211.seg`). Appends go to the newest segment. When a
+batch would take it past `LEDGERD_SEGMENT_BYTES` (64 MiB by default) it is
+sealed and the batch starts a new one; a batch never spans two segments, so
+it is still one write and one fsync. A segment that already holds records
+is sealed even if one batch alone is larger than the limit.
+
+A sealed segment ends with a footer line:
+
+```text
+#seal <first record> <records> <bytes> <crc32c of those bytes> <crc32c of the line so far>
+```
+
+where `<bytes>` is the length of the segment before the footer. Record
+lines start with a hex digit, so a footer is never mistaken for a record.
+A sealed segment is never written again and describes itself completely:
+it can be checked, copied or archived on its own. On start every sealed
+segment must end exactly at a footer that matches its contents (first
+record, count, length and checksum); a sealed segment cut short, with a
+flipped bit, or with anything after its footer stops startup. Only the
+newest segment may end in a torn line, which includes a torn footer.
+
+The manifest (`MANIFEST`) lists the segments by first record, oldest
+first, and ends with a CRC-32C of everything above it:
+
+```text
+ledgerd-wal 1
+1
+48211
+crc 3f2a9c01
+```
+
+It is replaced atomically (temporary file, fsync, rename, directory fsync)
+and is the authority on which files make up the log. Each segment must
+start where the one before it ends; a listed segment that is missing stops
+startup. Sealing is ordered so every crash point is recoverable: the footer
+is written and fsynced, then the next segment is created and fsynced, then
+the manifest listing it is written. On start, a newest segment that is
+already sealed means the crash came before the manifest, and Open finishes
+the roll; an unlisted, empty segment past the end is removed.
+
+Segments are how the log is compacted. Once a snapshot is written and the
+older snapshots are pruned, every sealed segment whose records all come
+before the oldest kept snapshot's `snapshot` record is deleted: the
+manifest is rewritten first, then the files are removed, so a crash leaves
+at most unlisted older files, which the next start removes. Recovery always
+starts from one of the kept snapshots, so it never needs those records.
+Disk use therefore follows the snapshot interval, not the ledger's age,
+and idempotency keys past their retention leave the disk with their
+segments (snapshots do not copy expired keys). This replaces the earlier
+compaction, which rewrote the whole log at startup to drop expired keys.
+With snapshots turned off nothing is dropped. Failing to drop is logged
+and retried after the next snapshot or start; it costs disk space only.
+`ledgerd_log_segments` and `ledgerd_log_segments_dropped_total` report the
+segment count and drops.
+
+A data directory from an earlier version holds the log as one file,
+`ledger.wal`. On first start it is adopted as segment 1: hard-linked into
+`wal/`, the manifest written, then the old name removed. A crash at any
+point of that leaves either the old layout, which is adopted again, or the
+new one.
 
 The crash test writes a workload of accounts, single-phase and two-phase
 transfers, captures, reversals, an expiry and a keyed rejection, recording
@@ -203,11 +264,12 @@ On start, Open loads the newest snapshot that reads back intact, then reads
 the log: records up to that snapshot's `snapshot` record are only
 checksummed, not decoded or run, and replay starts after it. The snapshot
 record must carry the snapshot's head. A damaged snapshot is skipped for an
-older one or a full replay, since the log still holds everything. A
-snapshot whose record is not in the log (a log restored from an older copy,
-say) stops startup, because the two disagree about history. Snapshot
-records survive compaction, so positions stay valid when the log is
-rewritten. Failing to write a snapshot is logged and counted in
+older one, or for a full replay while the log still starts at record 1.
+The segments before the oldest kept snapshot may have been dropped, so if
+the log starts later than record 1 and no snapshot reads back intact,
+startup stops. A snapshot whose record is not in the log (a log restored
+from an older copy, say) stops startup, because the two disagree about
+history. Failing to write a snapshot is logged and counted in
 `ledgerd_snapshots_total{result="failed"}`; it costs restart time, never
 data.
 

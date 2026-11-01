@@ -104,10 +104,7 @@ func TestCrashAtEveryByte(t *testing.T) {
 	step(voidCmd("tr_000005"), "")
 	e.l.Close()
 
-	data, err := os.ReadFile(filepath.Join(e.dir, logName))
-	if err != nil {
-		t.Fatal(err)
-	}
+	data := logBytes(t, e.dir)
 	index := map[string]int{}
 	for i, s := range snapshots {
 		index[s] = i
@@ -141,7 +138,7 @@ func TestCrashAtEveryByte(t *testing.T) {
 	// Full Open (truncation, compaction, invariant check) at a sample of offsets.
 	for off := 0; off <= len(data); off += 97 {
 		dir := t.TempDir()
-		os.WriteFile(filepath.Join(dir, logName), data[:off], 0o600)
+		os.WriteFile(filepath.Join(dir, legacyLogName), data[:off], 0o600) // adopted as the first segment
 		l, err := Open(Options{Dir: dir, Clock: e.clock.Now, SweepInterval: -1})
 		if err != nil {
 			t.Fatalf("open at offset %d: %v", off, err)
@@ -160,7 +157,7 @@ func writeLog(t *testing.T, records ...string) string {
 	for _, r := range records {
 		data = wal.Encode(data, []byte(r))
 	}
-	os.WriteFile(filepath.Join(dir, logName), data, 0o600)
+	os.WriteFile(filepath.Join(dir, legacyLogName), data, 0o600)
 	return dir
 }
 
@@ -409,30 +406,62 @@ func TestOpenErrors(t *testing.T) {
 	}
 }
 
-func TestCompactionFailureIsNotFatal(t *testing.T) {
+// dropFailer fails the manifest writes that drop segments: those whose
+// list no longer starts at record 1.
+type dropFailer struct {
+	wal.File
+	armed *atomic.Bool
+}
+
+func (d dropFailer) Write(p []byte) (int, error) {
+	if d.armed.Load() && bytes.HasPrefix(p, []byte("ledgerd-wal 1\n")) && !bytes.HasPrefix(p, []byte("ledgerd-wal 1\n1\n")) {
+		return 0, errors.New("disk full")
+	}
+	return d.File.Write(p)
+}
+
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+func TestSegmentDropFailureIsNotFatal(t *testing.T) {
 	e := newEnv(t, true)
-	e.standard()
-	// An expired key gives the next start something to compact.
-	if _, err := e.l.Do(context.Background(), move(dr("bank", 1), cr("equity", 1)), key("", "old", "old")); err != nil {
-		t.Fatal(err)
-	}
-	e.clock.Advance(DefaultIdempotencyTTL + time.Second)
-	e.l.Close()
-	var logs bytes.Buffer
-	var calls atomic.Int32
+	var armed atomic.Bool
+	armed.Store(true)
+	var logs syncBuffer
 	e.opts.Logger = slog.New(slog.NewJSONHandler(&logs, nil))
-	e.opts.WrapFile = func(f wal.File) wal.File {
-		var w, s atomic.Bool
-		if calls.Add(1) == 2 { // the compaction's temporary file
-			s.Store(true)
-		}
-		return failingFile{f, &w, &s}
+	e.opts.SegmentBytes, e.opts.SnapshotEvery = 1024, 10
+	e.opts.WrapFile = func(f wal.File) wal.File { return dropFailer{f, &armed} }
+	e.restart()
+	e.standard()
+	for i := 0; i < 60; i++ {
+		e.do(move(dr("bank", 1), cr("equity", 1)))
 	}
-	e.open()
-	if !strings.Contains(logs.String(), "compaction failed") {
-		t.Fatalf("logs: %s", logs.String())
+	waitSnapshots(e.l)
+	if !strings.Contains(logs.String(), "dropping old log segments failed") || e.l.log.FirstIndex() != 1 {
+		t.Fatalf("first record %d, logs: %s", e.l.log.FirstIndex(), logs.String())
+	}
+	if e.l.unavailable() != nil {
+		t.Fatalf("a failed drop stopped the ledger: %v", e.l.unavailable())
 	}
 	e.do(move(dr("bank", 1), cr("equity", 1)))
-	e.restart()
-	e.wantBalance("bank", 2, 0, 2)
+	armed.Store(false)
+	e.restart() // the next start drops what the failed attempts left
+	if e.l.log.FirstIndex() == 1 {
+		t.Fatal("segments were not dropped on restart")
+	}
+	e.wantBalance("bank", 61, 0, 61)
 }

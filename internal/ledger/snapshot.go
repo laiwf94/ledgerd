@@ -96,7 +96,8 @@ func snapName(num uint64) string { return fmt.Sprintf("%s%020d%s", snapPrefix, n
 
 // capture copies the state the writer has committed. Only the writer (or
 // Close, after the writer has stopped) may call it. The copy costs one pass
-// over accounts, transfers and keys; journal entries are shared.
+// over accounts, transfers and keys; journal entries are shared. Expired
+// idempotency keys are not copied.
 func (l *Ledger) capture(num uint64, now time.Time) *snapshot {
 	st := l.st
 	s := &snapshot{num: num, head: st.head(), time: now,
@@ -109,9 +110,15 @@ func (l *Ledger) capture(num uint64, now time.Time) *snapshot {
 	for _, tr := range st.transfers {
 		s.transfers = append(s.transfers, tr)
 	}
+	// Keys past their retention are left out: once the segments before the
+	// snapshot are dropped, nothing on disk holds them any more.
+	cutoff := now.Add(-l.opts.IdempotencyTTL)
 	l.idemMu.Lock()
 	s.idem = make([]snapIdem, 0, len(l.idem))
 	for _, q := range l.idemFIFO {
+		if !q.at.After(cutoff) {
+			continue
+		}
 		if e, ok := l.idem[q.id]; ok && e.at.Equal(q.at) {
 			s.idem = append(s.idem, snapIdem{id: q.id, e: *e})
 		}

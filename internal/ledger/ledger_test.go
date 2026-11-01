@@ -1,11 +1,14 @@
 package ledger
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -592,23 +595,34 @@ func TestIdempotency(t *testing.T) {
 	e.invariants()
 }
 
-func TestIdempotencyCompactionDropsExpiredKeys(t *testing.T) {
+// Expired idempotency keys leave the disk with the segments that hold them,
+// and are not reloaded from a snapshot.
+func TestExpiredKeysLeaveDiskWithTheirSegments(t *testing.T) {
 	e := newEnv(t, true)
+	e.opts.SegmentBytes, e.opts.SnapshotEvery = 1024, 10
+	e.restart()
 	e.standard()
 	ctx := context.Background()
 	e.l.Do(ctx, move(dr("equity", 1), cr("alice", 1)), key("", "old-ok", "a"))
 	e.l.Do(ctx, move(dr("alice", 9), cr("bob", 9)), key("", "old-err", "b"))
 	e.clock.Advance(DefaultIdempotencyTTL + time.Second)
 	e.l.Do(ctx, move(dr("equity", 1), cr("alice", 1)), key("", "new-ok", "c"))
-	before := e.l.Stats().LogBytes
+	for i := 0; i < 60; i++ {
+		e.do(move(dr("equity", 1), cr("bob", 1)))
+	}
 	e.restart()
-	s := e.l.Stats()
-	if s.IdempotencyKeys != 1 || s.LogBytes >= before {
-		t.Fatalf("after compaction: %+v (log was %d bytes)", s, before)
+	if s := e.l.Stats(); s.IdempotencyKeys != 1 {
+		t.Fatalf("keys after restart: %+v", s)
+	}
+	files, _ := filepath.Glob(filepath.Join(e.dir, walDir, "*"))
+	files = append(files, filepath.Join(e.dir, snapName(e.l.lastSnap)))
+	for _, f := range files {
+		if data, _ := os.ReadFile(f); bytes.Contains(data, []byte("old-ok")) || bytes.Contains(data, []byte("old-err")) {
+			t.Fatalf("%s still holds an expired key", filepath.Base(f))
+		}
 	}
 	e.wantBalance("alice", 2, 0, 2)
-	e.restart() // compacting a compacted log is stable
-	e.wantBalance("alice", 2, 0, 2)
+	e.wantBalance("bob", 60, 0, 60)
 }
 
 // gate blocks fsync while armed, to hold a batch in flight.

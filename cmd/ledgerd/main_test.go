@@ -22,17 +22,17 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.addr != ":8080" || len(c.apiKeys) != 2 || c.idemTTL != ledger.DefaultIdempotencyTTL || c.maxBatch != ledger.DefaultMaxBatch || c.adminToken != "" ||
-		c.snapEvery != ledger.DefaultSnapshotEvery {
+		c.snapEvery != ledger.DefaultSnapshotEvery || c.segBytes != ledger.DefaultSegmentBytes {
 		t.Fatalf("defaults wrong: %+v", c)
 	}
 	c, err = loadConfig(env(map[string]string{"LEDGERD_API_KEYS": "k", "LEDGERD_ADDR": ":9", "LEDGERD_DATA_DIR": "/d",
 		"LEDGERD_ADMIN_TOKEN": "t", "LEDGERD_IDEMPOTENCY_TTL": "1h", "LEDGERD_MAX_BATCH": "1", "LEDGERD_LOG_LEVEL": "debug",
-		"LEDGERD_SNAPSHOT_EVERY": "500"}))
+		"LEDGERD_SNAPSHOT_EVERY": "500", "LEDGERD_SEGMENT_BYTES": "1048576"}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.addr != ":9" || c.dataDir != "/d" || c.adminToken != "t" || c.idemTTL != time.Hour || c.maxBatch != 1 || c.logLevel.String() != "DEBUG" ||
-		c.snapEvery != 500 {
+		c.snapEvery != 500 || c.segBytes != 1<<20 {
 		t.Fatalf("overrides wrong: %+v", c)
 	}
 }
@@ -45,6 +45,8 @@ func TestLoadConfigErrors(t *testing.T) {
 		"LEDGERD_MAX_BATCH must be":        {"LEDGERD_API_KEYS": "k", "LEDGERD_MAX_BATCH": "0"},
 		"LEDGERD_LOG_LEVEL":                {"LEDGERD_API_KEYS": "k", "LEDGERD_LOG_LEVEL": "loud"},
 		"LEDGERD_SNAPSHOT_EVERY must be":   {"LEDGERD_API_KEYS": "k", "LEDGERD_SNAPSHOT_EVERY": "-1"},
+		"LEDGERD_SEGMENT_BYTES must be":    {"LEDGERD_API_KEYS": "k", "LEDGERD_SEGMENT_BYTES": "4095"},
+		"LEDGERD_SEGMENT_BYTES must be ":   {"LEDGERD_API_KEYS": "k", "LEDGERD_SEGMENT_BYTES": "big"},
 	}
 	for want, e := range cases {
 		if _, err := loadConfig(env(e)); err == nil || !strings.Contains(err.Error(), strings.TrimSpace(want)) {
@@ -115,8 +117,10 @@ func TestRunServesPersistsAndShutsDown(t *testing.T) {
 	if !strings.Contains(logs.String(), `"msg":"shutting down"`) {
 		t.Fatalf("logs: %s", logs.String())
 	}
-	if _, err := os.Stat(filepath.Join(dir, "ledger.wal")); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"MANIFEST", "00000000000000000001.seg"} {
+		if _, err := os.Stat(filepath.Join(dir, "wal", name)); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// A restart recovers the balance from the log.
@@ -125,7 +129,7 @@ func TestRunServesPersistsAndShutsDown(t *testing.T) {
 	if code != 200 || !strings.Contains(body, `"posted":250`) {
 		t.Fatalf("after restart: %d %s", code, body)
 	}
-	if !strings.Contains(logs.String(), `"head":1`) || !strings.Contains(logs.String(), `Z","level"`) {
+	if !strings.Contains(logs.String(), `"head":1`) || !strings.Contains(logs.String(), `"log_segments":1`) || !strings.Contains(logs.String(), `Z","level"`) {
 		t.Fatalf("recovery not logged: %s", logs.String())
 	}
 	if err := stop(); err != nil {
