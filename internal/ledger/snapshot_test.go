@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -148,18 +147,6 @@ func sameState(t testing.TB, what string, a, b *Ledger) {
 	if !reflect.DeepEqual(a.idem, b.idem) {
 		t.Fatalf("%s: idempotency keys differ: %d and %d", what, len(a.idem), len(b.idem))
 	}
-}
-
-// liveExpiries lists the scheduled timeouts that still apply.
-func liveExpiries(st *state) []string {
-	var out []string
-	for _, e := range st.expiries {
-		if tr, ok := st.transfers[e.id]; ok && tr.State == StatePending && tr.ExpiresAt.Equal(e.at) {
-			out = append(out, e.id+"@"+e.at.String())
-		}
-	}
-	sort.Strings(out)
-	return out
 }
 
 func openAt(t testing.TB, dir string, clock *fakeClock, extra func(*Options)) *Ledger {

@@ -192,18 +192,28 @@ func countNewer(nums []uint64, n uint64) int {
 // listSnapshots returns the numbers of the snapshot files in dir, newest
 // first, and removes leftover temporary files.
 func listSnapshots(dir string) ([]uint64, error) {
+	nums, tmps, err := scanSnapshots(dir)
+	for _, name := range tmps {
+		os.Remove(filepath.Join(dir, name)) // an interrupted write; never renamed, so never used
+	}
+	return nums, err
+}
+
+// scanSnapshots returns the numbers of the snapshot files in dir, newest
+// first, and the names of temporary files left by interrupted writes. It
+// changes nothing.
+func scanSnapshots(dir string) (nums []uint64, tmps []string, err error) {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var nums []uint64
 	for _, e := range ents {
 		name := e.Name()
 		if !strings.HasPrefix(name, snapPrefix) {
 			continue
 		}
 		if strings.HasSuffix(name, snapSuffix+snapTmpSuffix) {
-			os.Remove(filepath.Join(dir, name)) // an interrupted write; never renamed, so never used
+			tmps = append(tmps, name)
 			continue
 		}
 		digits, ok := strings.CutSuffix(strings.TrimPrefix(name, snapPrefix), snapSuffix)
@@ -217,7 +227,7 @@ func listSnapshots(dir string) ([]uint64, error) {
 		nums = append(nums, n)
 	}
 	sort.Slice(nums, func(i, j int) bool { return nums[i] > nums[j] })
-	return nums, nil
+	return nums, tmps, nil
 }
 
 func syncDir(dir string) error {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -23,4 +24,24 @@ func lock(f *os.File) error {
 		return err
 	}
 	return nil
+}
+
+// HoldLock takes the lock of the log in dir without creating or changing
+// anything, so a tool can read the log while no server is writing it and
+// none can start. It returns ErrLocked if a process has the log open. A
+// directory without a lock file has never been opened by a server that
+// could still be running; HoldLock then holds nothing.
+func HoldLock(dir string) (release func(), err error) {
+	f, err := os.Open(filepath.Join(dir, lockName))
+	if errors.Is(err, os.ErrNotExist) {
+		return func() {}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := lock(f); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() { f.Close() }, nil
 }

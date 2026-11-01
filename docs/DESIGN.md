@@ -293,6 +293,47 @@ ledger, not the tail: decoding the 157 MB snapshot (about 1.7 s, much of it
 building maps and garbage collection) and the startup invariant check (about
 0.75 s). Both shrink once state lives on disk rather than wholly in memory.
 
+### Checking a data directory offline
+
+`ledgerd verify [-json] [dir]` checks a data directory without starting the
+server and without writing to it, so it can run against a backup, a copy
+taken off a dead machine, or a stopped server before an upgrade. It takes
+the log's `LOCK` (opened read-only, never created), so it refuses a
+directory a server has open and no server can start while it runs.
+
+It reads every file and checks:
+
+- every segment: each record's CRC-32C, the seal's counts and checksums,
+  that segments follow each other in the manifest without a gap, that
+  every sealed segment ends at its seal, and which segment files the
+  manifest does not list;
+- every snapshot: frame checksums, counts and the refold of each account's
+  entries (everything Open checks), and then every invariant of the state
+  it holds;
+- the log against the snapshots: replay starts at record 1 while the log
+  still has it, otherwise at the oldest intact snapshot whose record is in
+  the log, and at each later `snapshot` record the replayed state must
+  equal that snapshot exactly (accounts with history rows, transfers,
+  journal, open reservations and their timeouts, and every idempotency key
+  the snapshot kept);
+- every invariant of the fully replayed state.
+
+Damage does not stop the checksum pass: replay stops at the first problem,
+but every later segment is still read, so one report lists everything.
+
+The verdict is one of three exit codes:
+
+| Exit | Verdict | Meaning |
+|---|---|---|
+| 0 | sound | Every check passed; the server would start without changing a file. |
+| 1 | damaged | The server would refuse to start (a damaged sealed segment, a gap, a bad manifest, a newest snapshot the log does not mark, no snapshot standing in for dropped segments), or a file passes its checksums but breaks an invariant or disagrees with the log. |
+| 2 | repairable | Nothing acknowledged is lost and the server would start: a torn final write (never acknowledged, since acknowledgement follows the fsync), a roll, drop or upgrade a crash interrupted, a leftover temporary file, or a damaged or unmarked snapshot that startup skips. A normal start repairs the log; a skipped snapshot is replaced by the next one written, or can be deleted. |
+| 3 | | Verify could not run: bad usage, a directory in use, or nothing to check. |
+
+`-json` prints the full report: each segment with its records, size, seal
+and problem; each snapshot with its head, the log record that marks it and
+whether it matched; and the replayed head and counts.
+
 ## Retrying with an idempotency key
 
 The semantics are Stripe's
