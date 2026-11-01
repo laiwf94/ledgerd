@@ -50,7 +50,9 @@ neither can survive a crash without the other. For read-then-write logic, a
 transfer can require that an account's version or balance hasn't changed.
 
 Storage is a checksummed command log, fsynced before anything is
-acknowledged. Concurrent transfers share one fsync (group commit), a torn
+acknowledged. The log is split into fixed-size segments; a full one is
+sealed with a checksummed footer, and segments that only hold records
+already in a kept snapshot are deleted. Concurrent transfers share one fsync (group commit), a torn
 tail is dropped on recovery, and the tests cut the log at every byte to
 prove it. If the disk returns an error the service stops taking writes
 rather than guess. Periodic checksummed snapshots let a restart load the
@@ -120,7 +122,8 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 |---|---|
 | Ledger logic | Random concurrent workloads (transfers, two-phase, partial posts, voids, expiries, reversals, idempotent retries, key reuse, crash-restarts) run against the real ledger; a separate single-threaded model with `big.Int` balances replays the writer's order from the log. Every result, balance, version and invariant must agree after every round. Deliberately broken versions of the ledger fail this test. |
 | Crash safety | The log is truncated at every byte offset; recovery must produce exactly the state after some prefix of acknowledged commands, and every invariant must hold. Corruption in the middle of the log stops startup. |
-| Snapshots | A snapshot plus the log after it must rebuild exactly the state (accounts, history rows, transfers, journal, expiries, idempotency results) that replaying the whole log does, across random workloads, crashes mid-snapshot, concurrent load and compaction. A snapshot cut at every byte or with a flipped bit in any byte is refused, and recovery falls back to an older snapshot or the log. |
+| Snapshots | A snapshot plus the log after it must rebuild exactly the state (accounts, history rows, transfers, journal, expiries, idempotency results) that replaying the whole log does, across random workloads, crashes mid-snapshot, concurrent load and dropped log segments. A snapshot cut at every byte or with a flipped bit in any byte is refused, and recovery falls back to an older snapshot or the log. |
+| Segments | Every byte of a sealed segment is cut and bit-flipped and must be refused; a missing, unlisted or out-of-order segment and a damaged manifest stop startup; a crash at each step of sealing, dropping and adopting an old single-file log reopens to exactly the acknowledged records. The reference-model test runs with segments of 256 bytes to 4 KiB, so it rolls and drops segments and crashes across them. |
 | Storage failures | Injected write and fsync errors: the ledger stops accepting writes, keeps serving reads, and after a restart a keyed retry reports what actually reached the disk. |
 | Idempotency | Replays across restarts, errors replayed, key reuse, scope per API key, retention expiry, concurrent duplicates held in flight by a blocked fsync. |
 | Reconciliation | The amount-and-date pass is compared with a maximum bipartite matching on random inputs; a worst case of 10,000 lines against 100,000 identical movements must stay fast. |
@@ -164,7 +167,7 @@ out as follows:
 ```text
 cmd/ledgerd        server entry point and configuration
 internal/money     currency table, checked arithmetic, exact decimal parsing
-internal/wal       checksummed append-only log: batched append, replay, compaction
+internal/wal       checksummed append-only log in sealed segments: batched append, replay, segment drop
 internal/ledger    accounts, transfers, journal, writer with group commit, idempotency, snapshots, queries, invariants
 internal/recon     statement CSV parser and matcher
 internal/api       HTTP API, auth, errors, logging, metrics wiring

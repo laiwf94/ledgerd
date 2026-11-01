@@ -9,6 +9,7 @@
 //	LEDGERD_IDEMPOTENCY_TTL  how long idempotency keys are kept, e.g. 24h (default 24h, at most 720h)
 //	LEDGERD_MAX_BATCH        most commands sharing one fsync (default 1024; 1 disables group commit)
 //	LEDGERD_SNAPSHOT_EVERY   log records between snapshots (default 100000; 0 disables snapshots)
+//	LEDGERD_SEGMENT_BYTES    size at which a log segment is sealed (default 67108864; 4096 to 4294967296)
 //	LEDGERD_LOG_LEVEL        debug, info, warn or error (default info)
 package main
 
@@ -49,6 +50,7 @@ type config struct {
 	idemTTL    time.Duration
 	maxBatch   int
 	snapEvery  int
+	segBytes   int64
 	logLevel   slog.Level
 }
 
@@ -56,7 +58,7 @@ const maxIdempotencyTTL = 30 * 24 * time.Hour
 
 func loadConfig(getenv func(string) string) (config, error) {
 	c := config{addr: ":8080", idemTTL: ledger.DefaultIdempotencyTTL, maxBatch: ledger.DefaultMaxBatch,
-		snapEvery: ledger.DefaultSnapshotEvery}
+		snapEvery: ledger.DefaultSnapshotEvery, segBytes: ledger.DefaultSegmentBytes}
 	if v := getenv("LEDGERD_ADDR"); v != "" {
 		c.addr = v
 	}
@@ -94,6 +96,13 @@ func loadConfig(getenv func(string) string) (config, error) {
 			c.snapEvery = -1
 		}
 	}
+	if v := getenv("LEDGERD_SEGMENT_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 4096 || n > 1<<32 {
+			return c, errors.New("LEDGERD_SEGMENT_BYTES must be between 4096 and 4294967296")
+		}
+		c.segBytes = n
+	}
 	if v := getenv("LEDGERD_LOG_LEVEL"); v != "" {
 		if err := c.logLevel.UnmarshalText([]byte(v)); err != nil {
 			return c, fmt.Errorf("LEDGERD_LOG_LEVEL: %v", err)
@@ -123,14 +132,14 @@ func run(ctx context.Context, getenv func(string) string, logOut io.Writer, read
 	reg := metrics.New()
 	start := time.Now()
 	l, err := ledger.Open(ledger.Options{Dir: cfg.dataDir, IdempotencyTTL: cfg.idemTTL, MaxBatch: cfg.maxBatch,
-		SnapshotEvery: cfg.snapEvery, Logger: log, Metrics: reg})
+		SnapshotEvery: cfg.snapEvery, SegmentBytes: cfg.segBytes, Logger: log, Metrics: reg})
 	if err != nil {
 		return fmt.Errorf("opening ledger: %w", err)
 	}
 	defer l.Close()
 	stats := l.Stats()
 	log.Info("recovered", "head", stats.Head, "accounts", stats.Accounts, "transfers", stats.Transfers,
-		"open_pending", stats.OpenPending, "log_bytes", stats.LogBytes, "duration_ms", time.Since(start).Milliseconds())
+		"open_pending", stats.OpenPending, "log_bytes", stats.LogBytes, "log_segments", stats.LogSegments, "duration_ms", time.Since(start).Milliseconds())
 
 	srv, err := api.New(api.Config{Ledger: l, APIKeys: cfg.apiKeys, AdminToken: cfg.adminToken, Logger: log, Metrics: reg})
 	if err != nil {

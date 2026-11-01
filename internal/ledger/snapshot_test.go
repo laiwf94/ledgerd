@@ -49,17 +49,62 @@ func copySnapshots(t testing.TB, src, dst string) {
 func copyDir(t testing.TB, src string, withSnapshots bool) string {
 	t.Helper()
 	dst := t.TempDir()
-	data, err := os.ReadFile(filepath.Join(src, logName))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dst, logName), data, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	copyLog(t, src, dst)
 	if withSnapshots {
 		copySnapshots(t, src, dst)
 	}
 	return dst
+}
+
+// copyLog copies the log's manifest and segments from data directory src to
+// dst. Nothing may be appending to the log.
+func copyLog(t testing.TB, src, dst string) {
+	t.Helper()
+	from, to := filepath.Join(src, walDir), filepath.Join(dst, walDir)
+	if err := os.MkdirAll(to, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := wal.SegmentPaths(from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range append(paths, filepath.Join(from, "MANIFEST")) {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(to, filepath.Base(p)), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// activeSegment returns the path of the segment taking appends in the log
+// of data directory dir.
+func activeSegment(t testing.TB, dir string) string {
+	t.Helper()
+	paths, err := wal.SegmentPaths(filepath.Join(dir, walDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return paths[len(paths)-1]
+}
+
+// logBytes returns the contents of a log that is still a single segment.
+func logBytes(t testing.TB, dir string) []byte {
+	t.Helper()
+	paths, err := wal.SegmentPaths(filepath.Join(dir, walDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("the log has %d segments, want 1", len(paths))
+	}
+	data, err := os.ReadFile(paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func snapshotFiles(t testing.TB, dir string) []uint64 {
@@ -232,7 +277,7 @@ func TestSnapshotSkipsTheReplayedPrefix(t *testing.T) {
 
 	// Swap the first transfer, long since summarised, for a well-formed
 	// record that would fail if it were run.
-	path := filepath.Join(crashed, logName)
+	path := activeSegment(t, crashed)
 	data, _ := os.ReadFile(path)
 	i := bytes.Index(data, []byte(`"create_transfer"`))
 	start := bytes.LastIndexByte(data[:i], '\n') + 1
@@ -409,10 +454,10 @@ func TestSnapshotWithoutItsLogRecordStopsStartup(t *testing.T) {
 	d := copyDir(t, dir, false)
 	data, _ := os.ReadFile(filepath.Join(dir, snapName(1)))
 	os.WriteFile(filepath.Join(d, snapName(1)), data, 0o600)
-	logData, _ := os.ReadFile(filepath.Join(d, logName))
+	logData := logBytes(t, d)
 	idx := bytes.Index(logData, snapRecordPrefix)
 	start := bytes.LastIndexByte(logData[:idx], '\n') + 1
-	os.WriteFile(filepath.Join(d, logName), logData[:start], 0o600) // log ends before the marker
+	os.WriteFile(activeSegment(t, d), logData[:start], 0o600) // log ends before the marker
 	if _, err := Open(Options{Dir: d, SweepInterval: -1}); !errors.Is(err, wal.ErrCorrupt) {
 		t.Fatalf("snapshot ahead of the log: err = %v", err)
 	}
@@ -504,23 +549,62 @@ func TestSnapshotsUnderConcurrentLoad(t *testing.T) {
 	sameState(t, "after close", again, got)
 }
 
-// Snapshots record the log position as a numbered record, so they keep
-// working after compaction rewrites the log.
-func TestSnapshotSurvivesCompaction(t *testing.T) {
+// waitSnapshots waits until no snapshot is being written, so the segment
+// drop that follows one has happened too.
+func waitSnapshots(l *Ledger) {
+	<-l.snapIdle
+	l.snapIdle <- struct{}{}
+}
+
+// Segments holding only records before the oldest kept snapshot are
+// deleted, so the log stays a few segments long however old the ledger is.
+func TestSegmentsAreDroppedBehindSnapshots(t *testing.T) {
 	e := newEnv(t, true)
-	e.standard()
-	ctx := context.Background()
-	e.l.Do(ctx, move(dr("bank", 1), cr("alice", 1)), key("", "old", "old"))
-	e.clock.Advance(DefaultIdempotencyTTL + time.Second)
-	e.l.Do(ctx, move(dr("bank", 2), cr("alice", 2)), key("", "new", "new"))
-	e.restart() // compacts, then loads snapshot 1
-	if s := e.l.Stats(); s.IdempotencyKeys != 1 {
-		t.Fatalf("keys after compaction: %+v", s)
-	}
-	e.do(move(dr("bank", 4), cr("alice", 4)))
+	e.opts.SegmentBytes, e.opts.SnapshotEvery = 2048, 20
 	e.restart()
-	e.wantBalance("alice", 7, 0, 7)
-	sameState(t, "compacted", e.l, openAt(t, copyDir(t, e.dir, false), e.clock, nil))
+	e.standard()
+	for i := 0; i < 400; i++ {
+		e.do(move(dr("bank", 1), cr("alice", 1)))
+	}
+	waitSnapshots(e.l)
+	lg := e.l.log
+	segs, _ := wal.SegmentPaths(filepath.Join(e.dir, walDir))
+	files, _ := filepath.Glob(filepath.Join(e.dir, walDir, "*.seg"))
+	if lg.FirstIndex() == 1 || len(segs) != lg.Segments() || len(files) != len(segs) {
+		t.Fatalf("first record %d, %d segments, %d listed, %d files", lg.FirstIndex(), lg.Segments(), len(segs), len(files))
+	}
+	// Two snapshots 20 records apart, plus the segments they fall in.
+	if lg.Segments() > 8 || e.l.mSegDropped.Value() == 0 {
+		t.Fatalf("%d segments kept, %d dropped", lg.Segments(), e.l.mSegDropped.Value())
+	}
+	want := digest(e.l)
+	e.restart()
+	if got := digest(e.l); got != want {
+		t.Fatalf("after restart:\n%s\nwant\n%s", got, want)
+	}
+	e.do(move(dr("bank", 1), cr("alice", 1)))
+	e.l.Close()
+	want = digest(e.l)
+
+	// The records the dropped segments held are only in the snapshots now.
+	if _, err := Open(Options{Dir: copyDir(t, e.dir, false), SweepInterval: -1}); !errors.Is(err, wal.ErrCorrupt) {
+		t.Fatalf("open without snapshots: %v", err)
+	}
+	// The older of the two kept snapshots still has its record in the log,
+	// so a damaged newest one falls back to it.
+	d := copyDir(t, e.dir, true)
+	nums := snapshotFiles(t, d)
+	if len(nums) != 2 {
+		t.Fatalf("snapshots %v", nums)
+	}
+	newest := filepath.Join(d, snapName(nums[0]))
+	data, _ := os.ReadFile(newest)
+	data[len(data)/2] ^= 0x80
+	os.WriteFile(newest, data, 0o600)
+	l := openAt(t, d, e.clock, nil)
+	if got := digest(l); got != want {
+		t.Fatalf("from the older snapshot:\n%s\nwant\n%s", got, want)
+	}
 }
 
 func TestReadSnapshotErrors(t *testing.T) {

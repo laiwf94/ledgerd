@@ -127,6 +127,7 @@ type Stats struct {
 	IdempotencyKeys int    `json:"idempotency_keys"`
 	LogBytes        int64  `json:"log_bytes"`
 	LogSyncs        uint64 `json:"log_syncs"`
+	LogSegments     int    `json:"log_segments"`
 }
 
 // Stats returns current counts.
@@ -138,7 +139,7 @@ func (l *Ledger) Stats() Stats {
 	s.IdempotencyKeys = len(l.idem)
 	l.idemMu.Unlock()
 	if l.log != nil {
-		s.LogBytes, s.LogSyncs = l.log.Size(), l.log.Syncs()
+		s.LogBytes, s.LogSyncs, s.LogSegments = l.log.Size(), l.log.Syncs(), l.log.Segments()
 	}
 	return s
 }

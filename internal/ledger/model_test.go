@@ -1,7 +1,6 @@
 package ledger
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -523,14 +522,16 @@ func transferSnapshot(tr *Transfer) string {
 	return fmt.Sprintf("%s %s %s %v %s", tr.ID, tr.State, tr.Currency, ps, tr.Reverses)
 }
 
-func readRecords(t testing.TB, path string, from int64) ([]record, int64) {
+// readRecords returns the records from index from onwards in the log of
+// data directory dir, and the index after the last one. The caller holds
+// the ledger's dropMu, so no segment disappears while it reads.
+func readRecords(t testing.TB, dir string, from uint64) ([]record, uint64) {
 	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
 	var recs []record
-	end, err := wal.Replay(bytes.NewReader(data[from:]), func(p []byte) error {
+	next, err := wal.Read(filepath.Join(dir, walDir), func(i uint64, p []byte) error {
+		if i < from {
+			return nil
+		}
 		r, err := decodeRecord(p)
 		if r.Type != recSnapshot { // markers say where a snapshot was taken, not what happened
 			recs = append(recs, r)
@@ -540,7 +541,10 @@ func readRecords(t testing.TB, path string, from int64) ([]record, int64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return recs, from + end
+	if next < from {
+		t.Fatalf("the log ends at record %d, before %d", next, from)
+	}
+	return recs, next
 }
 
 func TestMatchesReferenceModel(t *testing.T) {
@@ -584,14 +588,24 @@ func runModel(t *testing.T, seed int64, rounds int, seen map[string]int) {
 	ids := seqIDs()
 	dir := t.TempDir()
 	opts := Options{Dir: dir, Clock: clock.Now, NewID: ids, SweepInterval: -1, MaxBatch: 1 + r.Intn(16),
-		SnapshotEvery: 1 + r.Intn(40)}
+		SnapshotEvery: 1 + r.Intn(40), SegmentBytes: 256 + int64(r.Intn(4096))}
 	l, err := Open(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { l.Close() }()
-	path := filepath.Join(dir, logName)
-	_, offset := readRecords(t, path, 0)
+	// The test holds dropMu while it reads the log, so a snapshot finishing
+	// in the background cannot drop segments it has not read yet. Drops
+	// happen between rounds.
+	held := false
+	hold := func() { l.dropMu.Lock(); held = true }
+	release := func() {
+		if held {
+			held = false
+			l.dropMu.Unlock()
+		}
+	}
+	defer func() { release(); l.Close() }()
+	path := dir
 
 	m := newModel(clock.Now())
 	g := &gen{r: r, m: m, accts: []string{"a", "b", "c", "d", "e", "f", "g", "h"}}
@@ -612,9 +626,12 @@ func runModel(t *testing.T, seed int64, rounds int, seen map[string]int) {
 		m.exec(&c, "")
 		results[o.key], hashes[o.key] = mResult{}, o.hash
 	}
-	_, offset = readRecords(t, path, 0)
+	hold()
+	_, offset := readRecords(t, path, 0)
+	release()
 
 	for round := 0; round < rounds; round++ {
+		hold()
 		// Time passes; due reservations expire before anything else runs.
 		if r.Intn(3) == 0 {
 			clock.Advance(time.Duration(r.Intn(4)) * time.Second)
@@ -754,28 +771,35 @@ func runModel(t *testing.T, seed int64, rounds int, seen map[string]int) {
 			// background writer may be halfway through. They are copied
 			// before the log, as on a real disk a snapshot's log record is
 			// durable before its file exists.
-			copySnapshots(t, filepath.Dir(path), crashDir)
-			data, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
+			copySnapshots(t, path, crashDir)
+			copyLog(t, path, crashDir)
 			if r.Intn(2) == 0 {
 				torn := wal.Encode(nil, []byte(`{"t":"cmd","cmd":{"void":{"transfer_id":"x"}}}`))
-				data = append(data, torn[:1+r.Intn(len(torn)-1)]...)
+				f, err := os.OpenFile(activeSegment(t, crashDir), os.O_WRONLY|os.O_APPEND, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				f.Write(torn[:1+r.Intn(len(torn)-1)])
+				f.Close()
 			}
-			if err := os.WriteFile(filepath.Join(crashDir, logName), data, 0o600); err != nil {
-				t.Fatal(err)
-			}
+			release()
 			l.Close()
 			opts.Dir = crashDir
+			var err error
 			if l, err = Open(opts); err != nil {
 				t.Fatalf("round %d: recovery failed: %v", round, err)
 			}
-			path = filepath.Join(crashDir, logName)
+			hold()
+			path = crashDir
 			seen["crash"]++
 			_, offset = readRecords(t, path, 0)
 			compare(t, round, l, m)
 		}
+		release()
+	}
+	segs, _ := wal.SegmentPaths(filepath.Join(path, walDir))
+	if l.log.FirstIndex() == 1 || len(segs) < 2 {
+		t.Errorf("the workload never rolled and dropped segments: first record %d, %d segments", l.log.FirstIndex(), len(segs))
 	}
 }
 

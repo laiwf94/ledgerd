@@ -34,7 +34,9 @@ const (
 	DefaultMaxBatch       = 1024
 	DefaultSweepInterval  = time.Second
 	DefaultSnapshotEvery  = 100_000
-	logName               = "ledger.wal"
+	DefaultSegmentBytes   = wal.DefaultSegmentBytes
+	walDir                = "wal"
+	legacyLogName         = "ledger.wal" // the single-file log of earlier versions
 )
 
 // ErrClosed is returned for commands sent after Close.
@@ -64,9 +66,15 @@ type Options struct {
 	// the last. Negative stops the ledger writing snapshots (existing ones are
 	// still loaded). Default 100,000.
 	SnapshotEvery int
+	// SegmentBytes is the size at which a log segment is sealed and a new
+	// one started. Segments older than the oldest kept snapshot are
+	// deleted, so disk use follows the snapshot interval rather than the
+	// ledger's age. Default DefaultSegmentBytes.
+	SegmentBytes int64
 	// NewID generates transfer IDs. Default "tr_" plus 24 random hex digits.
 	NewID func() string
-	// WrapFile wraps the log file; tests use it to inject I/O failures.
+	// WrapFile wraps every log file opened for writing; tests use it to
+	// inject I/O failures.
 	WrapFile func(wal.File) wal.File
 	Logger   *slog.Logger
 	Metrics  *metrics.Registry
@@ -94,14 +102,15 @@ type Ledger struct {
 
 	// Snapshot bookkeeping. lastSnap and sinceSnap belong to the writer;
 	// snapIdle holds a token while no snapshot is being written.
-	lastSnap      uint64
-	sinceSnap     int
-	snapIdle      chan struct{}
-	compactCutoff time.Time // idempotency records at or before this are dropped by compaction
-	needCompact   bool      // recovery saw such a record
+	lastSnap  uint64
+	sinceSnap int
+	snapIdle  chan struct{}
+	snapMu    sync.Mutex
+	snapIndex map[uint64]uint64 // snapshot number to the log index of its record
+	dropMu    sync.Mutex        // serializes segment drops; tests hold it to keep segments in place
 
 	mCommitted, mRejected, mBatches, mRecords *metrics.Counter
-	mSnapOK, mSnapFailed                      *metrics.Counter
+	mSnapOK, mSnapFailed, mSegDropped         *metrics.Counter
 	mCommit                                   *metrics.Histogram
 }
 
@@ -162,7 +171,8 @@ func Open(opts Options) (*Ledger, error) {
 	}
 	l := &Ledger{opts: opts, st: newState(), queue: make(chan *request, 4*opts.MaxBatch),
 		quit: make(chan struct{}), done: make(chan struct{}),
-		idem: map[string]*idemEntry{}, inflight: map[string]*flight{}, snapIdle: make(chan struct{}, 1)}
+		idem: map[string]*idemEntry{}, inflight: map[string]*flight{}, snapIdle: make(chan struct{}, 1),
+		snapIndex: map[uint64]uint64{}}
 	l.snapIdle <- struct{}{}
 
 	if opts.Dir != "" {
@@ -178,58 +188,75 @@ func Open(opts Options) (*Ledger, error) {
 		return nil, fmt.Errorf("%w: recovered state breaks %d invariants, first: %s", wal.ErrCorrupt, len(v), v[0])
 	}
 	l.registerMetrics()
+	if l.log != nil {
+		// A crash may have come between writing a snapshot and dropping the
+		// segments it made redundant.
+		l.dropSegments()
+	}
 	go l.run()
 	return l, nil
 }
 
-var (
-	snapRecordPrefix = []byte(`{"t":"` + recSnapshot + `"`)
-	idemFieldTag     = []byte(`"idem":`)
-)
+var snapRecordPrefix = []byte(`{"t":"` + recSnapshot + `"`)
 
 // recover rebuilds the state from the newest valid snapshot and the log
-// records after it, or from the whole log when there is no snapshot.
+// records after it, or from the whole log when there is no snapshot. Once
+// segments before a snapshot have been dropped, the log no longer starts at
+// record 1, and only a snapshot can stand in for what is gone.
 func (l *Ledger) recover() error {
-	l.compactCutoff = l.now().Add(-l.opts.IdempotencyTTL)
 	first := true
 	var skipTo uint64 // the snapshot whose log record replay is looking for
-	lg, err := wal.Open(filepath.Join(l.opts.Dir, logName), wal.Options{WrapFile: l.opts.WrapFile}, func(p []byte) error {
+	opts := wal.Options{SegmentBytes: l.opts.SegmentBytes, Legacy: filepath.Join(l.opts.Dir, legacyLogName),
+		WrapFile: l.opts.WrapFile}
+	lg, err := wal.Open(filepath.Join(l.opts.Dir, walDir), opts, func(index uint64, p []byte) error {
 		if first {
 			first = false
-			if err := l.replay(p, true); err != nil {
-				return err
+			if index == 1 {
+				if err := l.replay(p, true); err != nil {
+					return err
+				}
 			}
 			// The log is locked from here, so no other process is writing
 			// snapshots into the directory.
 			n, err := l.loadSnapshot()
+			if err != nil {
+				return err
+			}
+			if index == 1 {
+				skipTo = n
+				return nil
+			}
+			if n == 0 {
+				return fmt.Errorf("the log starts at record %d and no snapshot holds the records before it", index)
+			}
 			skipTo = n
-			return err
 		}
 		if skipTo == 0 {
 			l.sinceSnap++ // records a snapshot would save the next start from replaying
+			if bytes.HasPrefix(p, snapRecordPrefix) {
+				l.sinceSnap = 0
+				return l.replaySnapshotRecord(index, p)
+			}
 			return l.replay(p, false)
 		}
 		// Records before the snapshot are already in it. They passed their
-		// checksums; only snapshot markers and keyed records need decoding.
-		if bytes.HasPrefix(p, snapRecordPrefix) {
-			r, err := decodeRecord(p)
-			if err != nil {
-				return err
-			}
-			if r.Snap == skipTo {
-				if r.Seq != l.st.head() {
-					return fmt.Errorf("snapshot %d holds head %d but its log record says %d", skipTo, l.st.head(), r.Seq)
-				}
-				skipTo = 0
-			}
+		// checksums; only snapshot markers need decoding.
+		if !bytes.HasPrefix(p, snapRecordPrefix) {
 			return nil
 		}
-		if !l.needCompact && bytes.Contains(p, idemFieldTag) {
-			r, err := decodeRecord(p)
-			if err != nil {
-				return err
+		r, err := decodeRecord(p)
+		if err != nil {
+			return err
+		}
+		if r.Type != recSnapshot {
+			return fmt.Errorf("record of type %q looks like a snapshot record", r.Type)
+		}
+		l.noteSnapIndex(r.Snap, index)
+		if r.Snap == skipTo {
+			if r.Seq != l.st.head() {
+				return fmt.Errorf("snapshot %d holds head %d but its log record says %d", skipTo, l.st.head(), r.Seq)
 			}
-			l.noteIdem(r)
+			skipTo = 0
 		}
 		return nil
 	})
@@ -244,15 +271,64 @@ func (l *Ledger) recover() error {
 	if skipTo != 0 {
 		return fail(fmt.Errorf("%w: snapshot %d has no record in the log", wal.ErrCorrupt, skipTo))
 	}
-	if lg.Size() == 0 {
+	if lg.NextIndex() == 1 {
 		if nums, err := listSnapshots(l.opts.Dir); err != nil || len(nums) > 0 {
 			return fail(fmt.Errorf("%w: the log is empty but the directory holds snapshots", wal.ErrCorrupt))
 		}
-	}
-	if err := l.prepareLog(); err != nil {
-		return fail(err)
+		p, _ := encodeRecord(record{Type: recHeader, Version: logVersion})
+		if err := lg.Append(p); err != nil {
+			return fail(err)
+		}
 	}
 	return nil
+}
+
+// replaySnapshotRecord checks a snapshot marker met during replay and
+// remembers where it is in the log.
+func (l *Ledger) replaySnapshotRecord(index uint64, p []byte) error {
+	if err := l.replay(p, false); err != nil {
+		return err
+	}
+	l.noteSnapIndex(l.lastSnap, index)
+	return nil
+}
+
+func (l *Ledger) noteSnapIndex(num, index uint64) {
+	l.snapMu.Lock()
+	l.snapIndex[num] = index
+	l.snapMu.Unlock()
+}
+
+// dropSegments deletes the log segments that hold only records before the
+// oldest snapshot kept on disk. Recovery starts from a snapshot at or after
+// that one, so it never reads them. Failing to drop costs disk space only.
+func (l *Ledger) dropSegments() {
+	l.dropMu.Lock()
+	defer l.dropMu.Unlock()
+	nums, err := listSnapshots(l.opts.Dir)
+	if err != nil || len(nums) == 0 {
+		return
+	}
+	oldest := nums[len(nums)-1]
+	l.snapMu.Lock()
+	index, ok := l.snapIndex[oldest]
+	for n := range l.snapIndex {
+		if n < oldest {
+			delete(l.snapIndex, n)
+		}
+	}
+	l.snapMu.Unlock()
+	if !ok {
+		return
+	}
+	n, err := l.log.DropBefore(index)
+	if err != nil {
+		l.opts.Logger.Warn("dropping old log segments failed", "error", err.Error())
+	}
+	if n > 0 {
+		l.mSegDropped.Add(uint64(n))
+		l.opts.Logger.Info("dropped log segments", "segments", n, "before_record", index)
+	}
 }
 
 // loadSnapshot installs the newest snapshot that reads back intact and
@@ -278,57 +354,12 @@ func (l *Ledger) loadSnapshot() (uint64, error) {
 			e := q.e
 			l.idem[q.id] = &e
 			l.idemFIFO = append(l.idemFIFO, idemAt{id: q.id, at: e.at})
-			if !e.at.After(l.compactCutoff) {
-				l.needCompact = true
-			}
 		}
 		l.lastSnap = n
 		l.opts.Logger.Info("loaded snapshot", "snapshot", n, "head", s.head)
 		return n, nil
 	}
 	return 0, nil
-}
-
-// noteIdem records whether compaction has an expired key to drop.
-func (l *Ledger) noteIdem(r record) {
-	if r.Idem != nil && !r.Time.After(l.compactCutoff) {
-		l.needCompact = true
-	}
-}
-
-// prepareLog writes the header into a new log, or compacts an existing one
-// that holds expired idempotency records. Entries are history and are
-// always kept.
-func (l *Ledger) prepareLog() error {
-	if l.log.Size() == 0 {
-		p, _ := encodeRecord(record{Type: recHeader, Version: logVersion})
-		return l.log.Append(p)
-	}
-	if !l.needCompact {
-		return nil
-	}
-	cutoff := l.compactCutoff
-	err := l.log.Compact(func(p []byte) ([]byte, bool, error) {
-		r, err := decodeRecord(p)
-		if err != nil {
-			return nil, false, err
-		}
-		if r.Idem == nil || r.Time.After(cutoff) {
-			return p, true, nil
-		}
-		if r.Type == recReject {
-			return nil, false, nil
-		}
-		r.Idem = nil
-		out, err := encodeRecord(r)
-		return out, true, err
-	})
-	if err != nil && !errors.Is(err, wal.ErrBroken) {
-		// The old log is intact; running on it is safe, only larger.
-		l.opts.Logger.Warn("log compaction failed; continuing with the uncompacted log", "error", err.Error())
-		return nil
-	}
-	return err
 }
 
 // replay applies one log record during recovery.
@@ -345,7 +376,6 @@ func (l *Ledger) replay(p []byte, first bool) error {
 		if idem, err = r.Idem.idem(); err != nil {
 			return err
 		}
-		l.noteIdem(r)
 	}
 	switch r.Type {
 	case recHeader:
@@ -418,6 +448,10 @@ func (l *Ledger) registerMetrics() {
 	l.mRecords = m.Counter("ledgerd_log_records_total", "", "Records written to the log.")
 	l.mSnapOK = m.Counter("ledgerd_snapshots_total", `result="written"`, "Snapshots the ledger tried to write.")
 	l.mSnapFailed = m.Counter("ledgerd_snapshots_total", `result="failed"`, "Snapshots the ledger tried to write.")
+	l.mSegDropped = m.Counter("ledgerd_log_segments_dropped_total", "", "Log segments deleted because a snapshot holds their records.")
+	if l.log != nil {
+		m.Gauge("ledgerd_log_segments", "Log segments on disk, sealed and active.", func() float64 { return float64(l.log.Segments()) })
+	}
 	l.mCommit = m.Histogram("ledgerd_commit_duration_seconds", "", "Time to write and fsync one batch.")
 	m.Gauge("ledgerd_journal_head", "Sequence number of the newest journal entry.", func() float64 { return float64(l.Head()) })
 	m.Gauge("ledgerd_pending_transfers", "Open pending transfers.", func() float64 { return float64(l.Stats().OpenPending) })
@@ -791,11 +825,13 @@ func (l *Ledger) markSnapshot() *snapshot {
 	now := l.now()
 	num := l.lastSnap + 1
 	p, _ := encodeRecord(record{Type: recSnapshot, Time: now, Seq: l.st.head(), Snap: num})
+	index := l.log.NextIndex() // the writer is the only appender
 	if err := l.log.Append(p); err != nil {
 		l.halt(err)
 		return nil
 	}
 	l.lastSnap, l.sinceSnap = num, 0
+	l.noteSnapIndex(num, index)
 	return l.capture(num, now)
 }
 
@@ -812,4 +848,5 @@ func (l *Ledger) saveSnapshot(s *snapshot) {
 	l.mSnapOK.Inc()
 	l.opts.Logger.Info("snapshot written", "snapshot", s.num, "head", s.head, "bytes", size,
 		"duration_ms", time.Since(start).Milliseconds())
+	l.dropSegments()
 }

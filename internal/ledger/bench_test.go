@@ -167,11 +167,20 @@ func copyFile(b *testing.B, src, dst string) {
 func BenchmarkRecovery(b *testing.B) {
 	const entries, tail = 1_000_000, 10_000
 	full := b.TempDir()
-	writeBenchLog(b, filepath.Join(full, logName), 1, entries)
+	writeBenchLog(b, filepath.Join(full, legacyLogName), 1, entries)
+	// The first Open adopts the single file as one large segment.
+	l, err := Open(Options{Dir: full, SweepInterval: -1, SnapshotEvery: -1})
+	if err != nil {
+		b.Fatal(err)
+	}
+	l.Close()
 
+	// The snapshot record goes into a new segment, since the adopted one is
+	// past the size limit, and once the snapshot is written the old segment
+	// is dropped.
 	snap := b.TempDir()
-	copyFile(b, filepath.Join(full, logName), filepath.Join(snap, logName))
-	l, err := Open(Options{Dir: snap, SweepInterval: -1})
+	copyLog(b, full, snap)
+	l, err = Open(Options{Dir: snap, SweepInterval: -1})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -179,10 +188,9 @@ func BenchmarkRecovery(b *testing.B) {
 		b.Fatal(err)
 	}
 	withTail := b.TempDir()
-	for _, name := range []string{logName, snapName(1)} {
-		copyFile(b, filepath.Join(snap, name), filepath.Join(withTail, name))
-	}
-	writeBenchLog(b, filepath.Join(withTail, logName), entries+1, entries+tail)
+	copyLog(b, snap, withTail)
+	copyFile(b, filepath.Join(snap, snapName(1)), filepath.Join(withTail, snapName(1)))
+	writeBenchLog(b, activeSegment(b, withTail), entries+1, entries+tail)
 
 	for _, c := range []struct {
 		name string
