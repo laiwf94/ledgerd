@@ -64,6 +64,11 @@ matched, what matched by reference but with a different amount, and what is
 missing on either side. An invariant checker (debits equal credits per
 currency, every balance equals the fold of its entries, limits hold,
 reservations match open pending transfers) runs at startup and on demand.
+`ledgerd verify` checks a stopped server's data directory offline: every
+checksum in every segment and snapshot, segment continuity, every invariant,
+and that replaying the log reproduces each snapshot exactly. It exits 0 for
+sound, 1 for damaged and 2 for repairable (a normal start fixes it without
+losing an acknowledged write).
 
 The HTTP layer checks API keys in constant time, rejects loose JSON, bounds
 every size and wait, and emits JSON logs with request IDs and Prometheus
@@ -85,6 +90,12 @@ $ docker build -t ledgerd .
 $ docker run -p 8080:8080 -v ledgerd-data:/data -e LEDGERD_API_KEYS=local-dev-key-0123456 \
     -e LEDGERD_ADMIN_TOKEN=local-admin-token-0123 ledgerd
 $ LEDGERD_ADMIN_TOKEN=local-admin-token-0123 ./examples/demo.sh
+```
+
+To check a data directory while the server is stopped (a backup or a copy works too):
+
+```console
+$ go run ./cmd/ledgerd verify ./data          # or -json for the full report
 ```
 
 Configuration is environment variables, listed in
@@ -124,6 +135,7 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 | Crash safety | The log is truncated at every byte offset; recovery must produce exactly the state after some prefix of acknowledged commands, and every invariant must hold. Corruption in the middle of the log stops startup. |
 | Snapshots | A snapshot plus the log after it must rebuild exactly the state (accounts, history rows, transfers, journal, expiries, idempotency results) that replaying the whole log does, across random workloads, crashes mid-snapshot, concurrent load and dropped log segments. A snapshot cut at every byte or with a flipped bit in any byte is refused, and recovery falls back to an older snapshot or the log. |
 | Segments | Every byte of a sealed segment is cut and bit-flipped and must be refused; a missing, unlisted or out-of-order segment and a damaged manifest stop startup; a crash at each step of sealing, dropping and adopting an old single-file log reopens to exactly the acknowledged records. The reference-model test runs with segments of 256 bytes to 4 KiB, so it rolls and drops segments and crashes across them. |
+| Offline verify | `ledgerd verify` is run on sound ledgers (with and without dropped segments), on each kind of crash debris the server repairs, and on each kind of damage it refuses: flipped bytes, missing segments, lost snapshots, a snapshot rewritten with valid checksums that disagrees with the log or breaks an invariant, and a newest snapshot the log does not mark. Each must get the right verdict, a repairable directory must then open to the same head, and verify must never change a file. |
 | Storage failures | Injected write and fsync errors: the ledger stops accepting writes, keeps serving reads, and after a restart a keyed retry reports what actually reached the disk. |
 | Idempotency | Replays across restarts, errors replayed, key reuse, scope per API key, retention expiry, concurrent duplicates held in flight by a blocked fsync. |
 | Reconciliation | The amount-and-date pass is compared with a maximum bipartite matching on random inputs; a worst case of 10,000 lines against 100,000 identical movements must stay fast. |

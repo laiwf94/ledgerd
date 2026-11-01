@@ -1,5 +1,8 @@
 // Command ledgerd runs the double-entry ledger service.
 //
+//	ledgerd                  serve the HTTP API
+//	ledgerd verify [dir]     check a data directory offline (see ledgerd verify -h)
+//
 // Configuration comes from the environment:
 //
 //	LEDGERD_ADDR             listen address (default ":8080")
@@ -34,6 +37,9 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "verify" {
+		os.Exit(verify(os.Args[2:], os.Getenv, os.Stdout, os.Stderr))
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, os.Getenv, os.Stdout, nil); err != nil {

@@ -349,17 +349,22 @@ func (l *Ledger) loadSnapshot() (uint64, error) {
 			l.opts.Logger.Warn("skipping snapshot with the wrong number", "snapshot", n, "holds", s.num)
 			continue
 		}
-		l.st = st
-		for _, q := range s.idem {
-			e := q.e
-			l.idem[q.id] = &e
-			l.idemFIFO = append(l.idemFIFO, idemAt{id: q.id, at: e.at})
-		}
-		l.lastSnap = n
+		l.install(s, st)
 		l.opts.Logger.Info("loaded snapshot", "snapshot", n, "head", s.head)
 		return n, nil
 	}
 	return 0, nil
+}
+
+// install makes a snapshot read back from disk the ledger's state.
+func (l *Ledger) install(s *snapshot, st *state) {
+	l.st = st
+	for _, q := range s.idem {
+		e := q.e
+		l.idem[q.id] = &e
+		l.idemFIFO = append(l.idemFIFO, idemAt{id: q.id, at: e.at})
+	}
+	l.lastSnap = s.num
 }
 
 // replay applies one log record during recovery.
