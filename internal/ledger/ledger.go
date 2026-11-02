@@ -76,8 +76,11 @@ type Options struct {
 	// WrapFile wraps every log file opened for writing; tests use it to
 	// inject I/O failures.
 	WrapFile func(wal.File) wal.File
-	Logger   *slog.Logger
-	Metrics  *metrics.Registry
+	// FS is the file system Dir is on. Default wal.OSFS; the power-loss
+	// tests use faultfs.
+	FS      wal.FS
+	Logger  *slog.Logger
+	Metrics *metrics.Registry
 }
 
 // Ledger is an open ledger. It is safe for concurrent use.
@@ -172,6 +175,9 @@ func Open(opts Options) (*Ledger, error) {
 	if opts.Metrics == nil {
 		opts.Metrics = metrics.New()
 	}
+	if opts.FS == nil {
+		opts.FS = wal.OSFS{}
+	}
 	l := &Ledger{opts: opts, st: newState(), queue: make(chan *request, 4*opts.MaxBatch),
 		quit: make(chan struct{}), done: make(chan struct{}),
 		idem: map[string]*idemEntry{}, inflight: map[string]*flight{}, snapIdle: make(chan struct{}, 1),
@@ -210,7 +216,7 @@ func (l *Ledger) recover() error {
 	first := true
 	var skipTo uint64 // the snapshot whose log record replay is looking for
 	opts := wal.Options{SegmentBytes: l.opts.SegmentBytes, Legacy: filepath.Join(l.opts.Dir, legacyLogName),
-		WrapFile: l.opts.WrapFile}
+		WrapFile: l.opts.WrapFile, FS: l.opts.FS}
 	lg, err := wal.Open(filepath.Join(l.opts.Dir, walDir), opts, func(index uint64, p []byte) error {
 		if first {
 			first = false
@@ -275,7 +281,7 @@ func (l *Ledger) recover() error {
 		return fail(fmt.Errorf("%w: snapshot %d has no record in the log", wal.ErrCorrupt, skipTo))
 	}
 	if lg.NextIndex() == 1 {
-		if nums, err := listSnapshots(l.opts.Dir); err != nil || len(nums) > 0 {
+		if nums, err := listSnapshots(l.opts.FS, l.opts.Dir); err != nil || len(nums) > 0 {
 			return fail(fmt.Errorf("%w: the log is empty but the directory holds snapshots", wal.ErrCorrupt))
 		}
 		p, _ := encodeRecord(record{Type: recHeader, Version: logVersion})
@@ -308,7 +314,7 @@ func (l *Ledger) noteSnapIndex(num, index uint64) {
 func (l *Ledger) dropSegments() {
 	l.dropMu.Lock()
 	defer l.dropMu.Unlock()
-	nums, err := listSnapshots(l.opts.Dir)
+	nums, err := listSnapshots(l.opts.FS, l.opts.Dir)
 	if err != nil || len(nums) == 0 {
 		return
 	}
@@ -338,12 +344,12 @@ func (l *Ledger) dropSegments() {
 // returns its number, or 0 when there is none. A damaged snapshot is
 // skipped: the log still holds everything it summarised.
 func (l *Ledger) loadSnapshot() (uint64, error) {
-	nums, err := listSnapshots(l.opts.Dir)
+	nums, err := listSnapshots(l.opts.FS, l.opts.Dir)
 	if err != nil {
 		return 0, err
 	}
 	for _, n := range nums {
-		s, st, err := readSnapshot(filepath.Join(l.opts.Dir, snapName(n)))
+		s, st, err := readSnapshot(l.opts.FS, filepath.Join(l.opts.Dir, snapName(n)))
 		if err != nil {
 			l.opts.Logger.Warn("skipping unreadable snapshot", "snapshot", n, "error", err.Error())
 			continue
@@ -847,7 +853,7 @@ func (l *Ledger) markSnapshot() *snapshot {
 // everything, so the next start only replays more of it.
 func (l *Ledger) saveSnapshot(s *snapshot) {
 	start := time.Now()
-	size, err := writeSnapshot(l.opts.Dir, s)
+	size, err := writeSnapshot(l.opts.FS, l.opts.Dir, s)
 	if err != nil {
 		l.mSnapFailed.Inc()
 		l.opts.Logger.Warn("writing a snapshot failed; recovery will replay more of the log", "snapshot", s.num, "error", err.Error())

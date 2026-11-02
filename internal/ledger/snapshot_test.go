@@ -108,7 +108,7 @@ func logBytes(t testing.TB, dir string) []byte {
 
 func snapshotFiles(t testing.TB, dir string) []uint64 {
 	t.Helper()
-	nums, err := listSnapshots(dir)
+	nums, err := listSnapshots(wal.OSFS{}, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,14 +364,14 @@ func TestDamagedSnapshotsAreRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := readSnapshot(path); err != nil {
+	if _, _, err := readSnapshot(wal.OSFS{}, path); err != nil {
 		t.Fatal(err)
 	}
 	try := func(what string, data []byte) {
 		t.Helper()
 		p := filepath.Join(t.TempDir(), snapName(1))
 		os.WriteFile(p, data, 0o600)
-		if _, _, err := readSnapshot(p); err == nil {
+		if _, _, err := readSnapshot(wal.OSFS{}, p); err == nil {
 			t.Fatalf("%s: damaged snapshot accepted", what)
 		}
 	}
@@ -595,12 +595,12 @@ func TestSegmentsAreDroppedBehindSnapshots(t *testing.T) {
 }
 
 func TestReadSnapshotErrors(t *testing.T) {
-	if _, _, err := readSnapshot(filepath.Join(t.TempDir(), "missing")); err == nil {
+	if _, _, err := readSnapshot(wal.OSFS{}, filepath.Join(t.TempDir(), "missing")); err == nil {
 		t.Fatal("read a missing file")
 	}
 	p := filepath.Join(t.TempDir(), snapName(1))
 	os.WriteFile(p, []byte("LDGSNAP9"), 0o600)
-	if _, _, err := readSnapshot(p); !errors.Is(err, errSnapshot) {
+	if _, _, err := readSnapshot(wal.OSFS{}, p); !errors.Is(err, errSnapshot) {
 		t.Fatalf("wrong magic: %v", err)
 	}
 	// Frames that decode but describe impossible state.
@@ -660,7 +660,7 @@ func TestReadSnapshotErrors(t *testing.T) {
 		w.flush()
 		w.w.Flush()
 		os.WriteFile(p, buf.Bytes(), 0o600)
-		if _, _, err := readSnapshot(p); !errors.Is(err, errSnapshot) {
+		if _, _, err := readSnapshot(wal.OSFS{}, p); !errors.Is(err, errSnapshot) {
 			t.Errorf("%s: err = %v", name, err)
 		}
 	}

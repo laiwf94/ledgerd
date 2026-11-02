@@ -325,9 +325,9 @@ func TestManifestAndSegmentSetDamage(t *testing.T) {
 			b, _ := os.ReadFile(p)
 			os.WriteFile(p, b[:len(b)-3], 0o600)
 		},
-		"gap in the manifest": func(dir string) { writeManifest(dir, []uint64{1, 7}, nil) },
+		"gap in the manifest": func(dir string) { writeManifest(OSFS{}, dir, []uint64{1, 7}, nil) },
 		"unlisted segment inside the log": func(dir string) {
-			writeManifest(dir, []uint64{1, 7}, nil)
+			writeManifest(OSFS{}, dir, []uint64{1, 7}, nil)
 			os.Rename(filepath.Join(dir, segName(4)), filepath.Join(dir, segName(5)))
 		},
 		"non-empty segment past the end": func(dir string) {
@@ -372,7 +372,7 @@ func TestInterruptedRollAndDrop(t *testing.T) {
 	crash := t.TempDir()
 	copyLog(t, dir, crash)
 	os.Remove(filepath.Join(crash, segName(4)))
-	writeManifest(crash, []uint64{1}, nil)
+	writeManifest(OSFS{}, crash, []uint64{1}, nil)
 	os.WriteFile(filepath.Join(crash, segName(4)), nil, 0o600) // created, not listed
 	got := collect(t, crash, Options{})
 	if len(got) != 3 || activePath(t, crash) != filepath.Join(crash, segName(4)) {
@@ -389,7 +389,7 @@ func TestInterruptedRollAndDrop(t *testing.T) {
 	crash = t.TempDir()
 	copyLog(t, dir, crash)
 	os.Remove(filepath.Join(crash, segName(4)))
-	writeManifest(crash, []uint64{1}, nil)
+	writeManifest(OSFS{}, crash, []uint64{1}, nil)
 	seg1 := filepath.Join(crash, segName(1))
 	b, _ := os.ReadFile(seg1)
 	os.WriteFile(seg1, b[:len(b)-5], 0o600)
@@ -403,7 +403,7 @@ func TestInterruptedRollAndDrop(t *testing.T) {
 	// Manifest replaced by a drop, files not yet removed.
 	crash = t.TempDir()
 	copyLog(t, dir, crash)
-	writeManifest(crash, []uint64{4}, nil)
+	writeManifest(OSFS{}, crash, []uint64{4}, nil)
 	if got := collect(t, crash, Options{}); strings.Join(got, ",") != "4:record-003,5:record-004" {
 		t.Fatalf("after a crash mid-drop: %q", got)
 	}
@@ -465,7 +465,7 @@ func TestDropBefore(t *testing.T) {
 	if got := collect(t, dir, opts); strings.Join(got, ",") != "10:record-009,11:record-010" {
 		t.Fatalf("after dropping: %q", got)
 	}
-	if segs, _ := listSegments(dir); len(segs) != 1 {
+	if segs, _ := listSegments(OSFS{}, dir); len(segs) != 1 {
 		t.Fatalf("files left: %v", segs)
 	}
 
@@ -565,7 +565,7 @@ func TestLegacyLogIsAdopted(t *testing.T) {
 	os.WriteFile(legacy, data, 0o600)
 	os.MkdirAll(dir, 0o700)
 	os.Link(legacy, filepath.Join(dir, segName(1)))
-	writeManifest(dir, []uint64{1}, nil)
+	writeManifest(OSFS{}, dir, []uint64{1}, nil)
 	if got := collect(t, dir, Options{Legacy: legacy}); len(got) != 3 {
 		t.Fatalf("after an interrupted removal: %q", got)
 	}

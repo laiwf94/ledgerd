@@ -78,8 +78,8 @@ func decodeManifest(data []byte) ([]uint64, error) {
 
 // readManifest returns the segments listed in dir's manifest. A missing
 // manifest is reported with an error matching os.ErrNotExist.
-func readManifest(dir string) ([]uint64, error) {
-	data, err := os.ReadFile(filepath.Join(dir, manifestName))
+func readManifest(fsys FS, dir string) ([]uint64, error) {
+	data, err := ReadFile(fsys, filepath.Join(dir, manifestName))
 	if err != nil {
 		return nil, err
 	}
@@ -91,9 +91,9 @@ func readManifest(dir string) ([]uint64, error) {
 }
 
 // writeManifest atomically replaces dir's manifest.
-func writeManifest(dir string, firsts []uint64, wrap func(File) File) error {
+func writeManifest(fsys FS, dir string, firsts []uint64, wrap func(File) File) error {
 	tmpPath := filepath.Join(dir, manifestName+".tmp")
-	osf, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	osf, err := fsys.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
@@ -103,24 +103,24 @@ func writeManifest(dir string, firsts []uint64, wrap func(File) File) error {
 	}
 	if _, err := f.Write(encodeManifest(firsts)); err != nil {
 		f.Close()
-		os.Remove(tmpPath)
+		fsys.Remove(tmpPath)
 		return err
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
-		os.Remove(tmpPath)
+		fsys.Remove(tmpPath)
 		return err
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(tmpPath)
+		fsys.Remove(tmpPath)
 		return err
 	}
-	if err := os.Rename(tmpPath, filepath.Join(dir, manifestName)); err != nil {
-		os.Remove(tmpPath)
+	if err := fsys.Rename(tmpPath, filepath.Join(dir, manifestName)); err != nil {
+		fsys.Remove(tmpPath)
 		return err
 	}
-	if err := syncDir(dir); err != nil {
-		return fmt.Errorf("%w: %v", errAfterRename, err)
+	if err := fsys.SyncDir(dir); err != nil {
+		return fmt.Errorf("%w: %w", errAfterRename, err)
 	}
 	return nil
 }
@@ -128,7 +128,12 @@ func writeManifest(dir string, firsts []uint64, wrap func(File) File) error {
 // SegmentPaths returns the paths of the segments listed in the manifest of
 // the log in dir, oldest first. The last one is the segment taking appends.
 func SegmentPaths(dir string) ([]string, error) {
-	firsts, err := readManifest(dir)
+	return SegmentPathsFS(OSFS{}, dir)
+}
+
+// SegmentPathsFS is SegmentPaths on the file system fsys.
+func SegmentPathsFS(fsys FS, dir string) ([]string, error) {
+	firsts, err := readManifest(fsys, dir)
 	if err != nil {
 		return nil, err
 	}

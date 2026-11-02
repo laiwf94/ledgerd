@@ -147,7 +147,7 @@ func offline() *Ledger {
 // readSnapshots reads every snapshot file once, checking its checksums,
 // its internal consistency and the invariants of the state it holds.
 func (v *verifier) readSnapshots() error {
-	nums, tmps, err := scanSnapshots(v.dir)
+	nums, tmps, err := scanSnapshots(wal.OSFS{}, v.dir)
 	if err != nil {
 		return err
 	}
@@ -160,7 +160,7 @@ func (v *verifier) readSnapshots() error {
 		if fi, err := os.Stat(path); err == nil {
 			sr.Bytes = fi.Size()
 		}
-		s, st, err := readSnapshot(path)
+		s, st, err := readSnapshot(wal.OSFS{}, path)
 		switch {
 		case err != nil:
 			sr.Problem = err.Error()
@@ -252,7 +252,7 @@ func (v *verifier) pass(cands []uint64, c int) (*passResult, error) {
 				return errNoBase
 			}
 			n := cands[c]
-			s, st, err := readSnapshot(filepath.Join(v.dir, snapName(n)))
+			s, st, err := readSnapshot(wal.OSFS{}, filepath.Join(v.dir, snapName(n)))
 			if err != nil {
 				return fmt.Errorf("snapshot %d changed while it was being checked: %v", n, err)
 			}
@@ -313,7 +313,7 @@ func (v *verifier) pass(cands []uint64, c int) (*passResult, error) {
 // compare re-reads snapshot n and compares it with the replayed state. It
 // returns a description of the first difference, or "".
 func (v *verifier) compare(l *Ledger, n uint64) (string, error) {
-	s, st, err := readSnapshot(filepath.Join(v.dir, snapName(n)))
+	s, st, err := readSnapshot(wal.OSFS{}, filepath.Join(v.dir, snapName(n)))
 	if err != nil {
 		return "", fmt.Errorf("snapshot %d changed while it was being checked: %v", n, err)
 	}
