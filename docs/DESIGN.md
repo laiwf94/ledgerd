@@ -231,6 +231,40 @@ every byte offset and recovers each prefix: the result must equal the
 state after some acknowledged prefix, never go backwards as the offset grows,
 and satisfy every invariant.
 
+### Power loss
+
+A truncated log is only one thing a power cut can leave. An fsync covers one
+file's data; a new, renamed or removed name is durable only once its
+directory is fsynced; and until then, writes may reach the disk partly, in
+any order, or not at all. The log and the snapshots go through a small file
+system interface (`wal.FS`), and the tests run them on `internal/wal/faultfs`,
+an in-memory file system that keeps every file's synced bytes and every
+directory's synced entries apart from what changed since. A power cut keeps
+the synced state plus a random selection of the rest, chosen per file and per
+directory: none of it, all of it, a prefix whose last write may be torn, a
+random subset in order, or (for file data) a random subset applied out of
+order. A rename survives whole or not at all. The one thing it does not do is
+tear a single write into pieces that are not a prefix; the log assumes an
+interrupted append leaves a prefix.
+
+Two tests cut the power thousands of times. The log test appends batches,
+rolls and seals segments, drops old ones and adopts a legacy single-file log,
+with cuts landing inside Open, between a batch's write and its fsync, in the
+middle of a roll and inside a drop; every acknowledged record must replay at
+its index, followed by at most a prefix of the batch in flight. The ledger
+test runs the reference-model workload below and cuts the power in the middle
+of concurrent commands, during expiry sweeps, while a snapshot is written in
+the background and while segments are dropped. The ledger must open after
+every cut, every acknowledged command must still be there with the result it
+was given, and the model, fed whatever the recovered log holds, must agree on
+every balance, transfer and invariant. Both tests require every kind of loss
+to have happened at least once.
+
+This found one real gap: the data directory and `wal/` were created without
+fsyncing their parents, so a power cut could take a new ledger's whole log,
+acknowledged transfers included, with the directory entry that held it. Directories are now created by
+`wal.MkdirAll`, which fsyncs the parent of each one it creates.
+
 Storage errors are fail-stop. If a write or fsync fails, the ledger stops
 accepting writes (HTTP 503, `/readyz` fails) and keeps serving reads of the
 last durable state. It does not retry the fsync: after a failed fsync the

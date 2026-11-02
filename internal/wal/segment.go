@@ -9,6 +9,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // A segment is one file of the log, named after the index of its first
@@ -110,7 +111,8 @@ type segScan struct {
 // disagrees with the records before it is ErrCorrupt, as is an error
 // returned by apply.
 func scanSegment(r io.Reader, first uint64, apply func(index uint64, payload []byte) error) (segScan, error) {
-	br := bufio.NewReaderSize(r, MaxRecord+16)
+	br := getReader(r)
+	defer putReader(br)
 	var s segScan
 	atEOF := func() bool { _, err := br.Peek(1); return errors.Is(err, io.EOF) }
 	for {
@@ -161,6 +163,22 @@ func scanSegment(r io.Reader, first uint64, apply func(index uint64, payload []b
 		s.crc = crc32.Update(s.crc, crcTable, line)
 		s.end = s.good
 	}
+}
+
+// Readers big enough for the longest record are pooled: replaying a log of
+// many small segments would otherwise allocate and clear a megabyte per
+// segment.
+var readers = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, MaxRecord+16) }}
+
+func getReader(r io.Reader) *bufio.Reader {
+	br := readers.Get().(*bufio.Reader)
+	br.Reset(r)
+	return br
+}
+
+func putReader(br *bufio.Reader) {
+	br.Reset(nil)
+	readers.Put(br)
 }
 
 func crc32Checksum(b []byte) uint32 { return crc32.Checksum(b, crcTable) }

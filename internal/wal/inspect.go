@@ -68,7 +68,7 @@ func Inspect(dir, legacy string, apply func(index uint64, payload []byte) error)
 		return nil
 	}
 
-	segs, err := listSegments(dir)
+	segs, err := listSegments(OSFS{}, dir)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
@@ -81,7 +81,7 @@ func Inspect(dir, legacy string, apply func(index uint64, payload []byte) error)
 		return nil, legacyErr
 	}
 
-	firsts, err := readManifest(dir)
+	firsts, err := readManifest(OSFS{}, dir)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return inspectWithoutManifest(rep, dir, legacy, segs, hasLegacy, guarded, damage, repairable)

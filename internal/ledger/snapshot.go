@@ -43,6 +43,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/laiwf94/ledgerd/internal/wal"
+
 	"github.com/laiwf94/ledgerd/internal/money"
 )
 
@@ -129,18 +131,18 @@ func (l *Ledger) capture(num uint64, now time.Time) *snapshot {
 
 // writeSnapshot stores s in dir and removes snapshots older than the newest
 // snapKeep. It returns the size of the file.
-func writeSnapshot(dir string, s *snapshot) (int64, error) {
+func writeSnapshot(fsys wal.FS, dir string, s *snapshot) (int64, error) {
 	sort.Slice(s.accounts, func(i, j int) bool { return s.accounts[i].ID < s.accounts[j].ID })
 	sort.Slice(s.transfers, func(i, j int) bool { return s.transfers[i].ID < s.transfers[j].ID })
 	final := filepath.Join(dir, snapName(s.num))
 	tmp := final + snapTmpSuffix
-	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	f, err := fsys.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return 0, err
 	}
 	fail := func(err error) (int64, error) {
 		f.Close()
-		os.Remove(tmp)
+		fsys.Remove(tmp)
 		return 0, err
 	}
 	w := &snapWriter{w: bufio.NewWriterSize(f, 1<<20)}
@@ -155,23 +157,23 @@ func writeSnapshot(dir string, s *snapshot) (int64, error) {
 		return fail(err)
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(tmp)
+		fsys.Remove(tmp)
 		return 0, err
 	}
-	if err := os.Rename(tmp, final); err != nil {
-		os.Remove(tmp)
+	if err := fsys.Rename(tmp, final); err != nil {
+		fsys.Remove(tmp)
 		return 0, err
 	}
-	if err := syncDir(dir); err != nil {
+	if err := fsys.SyncDir(dir); err != nil {
 		return 0, err
 	}
-	nums, err := listSnapshots(dir)
+	nums, err := listSnapshots(fsys, dir)
 	if err != nil {
 		return w.size, err
 	}
 	for _, n := range nums {
 		if n < s.num && countNewer(nums, n) >= snapKeep {
-			if err := os.Remove(filepath.Join(dir, snapName(n))); err != nil {
+			if err := fsys.Remove(filepath.Join(dir, snapName(n))); err != nil {
 				return w.size, err
 			}
 		}
@@ -191,10 +193,10 @@ func countNewer(nums []uint64, n uint64) int {
 
 // listSnapshots returns the numbers of the snapshot files in dir, newest
 // first, and removes leftover temporary files.
-func listSnapshots(dir string) ([]uint64, error) {
-	nums, tmps, err := scanSnapshots(dir)
+func listSnapshots(fsys wal.FS, dir string) ([]uint64, error) {
+	nums, tmps, err := scanSnapshots(fsys, dir)
 	for _, name := range tmps {
-		os.Remove(filepath.Join(dir, name)) // an interrupted write; never renamed, so never used
+		fsys.Remove(filepath.Join(dir, name)) // an interrupted write; never renamed, so never used
 	}
 	return nums, err
 }
@@ -202,8 +204,8 @@ func listSnapshots(dir string) ([]uint64, error) {
 // scanSnapshots returns the numbers of the snapshot files in dir, newest
 // first, and the names of temporary files left by interrupted writes. It
 // changes nothing.
-func scanSnapshots(dir string) (nums []uint64, tmps []string, err error) {
-	ents, err := os.ReadDir(dir)
+func scanSnapshots(fsys wal.FS, dir string) (nums []uint64, tmps []string, err error) {
+	ents, err := fsys.ReadDir(dir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -228,15 +230,6 @@ func scanSnapshots(dir string) (nums []uint64, tmps []string, err error) {
 	}
 	sort.Slice(nums, func(i, j int) bool { return nums[i] > nums[j] })
 	return nums, tmps, nil
-}
-
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
 }
 
 // snapWriter frames items as they are encoded.
@@ -750,8 +743,8 @@ func entryIndex(t *Transfer, seq uint64) int {
 // readSnapshot decodes and checks a snapshot file and builds the state it
 // holds, including each account's history rows. The idempotency keys are
 // returned in the order they were stored.
-func readSnapshot(path string) (*snapshot, *state, error) {
-	f, err := os.Open(path)
+func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
+	f, err := fsys.OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, nil, err
 	}

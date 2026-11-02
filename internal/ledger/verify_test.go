@@ -187,14 +187,14 @@ func segName(first uint64) string { return fmt.Sprintf("%020d.seg", first) }
 // holding the state mutate makes of it.
 func rewriteSnapshot(t *testing.T, dir string, n uint64, mutate func(st *state)) {
 	t.Helper()
-	s, st, err := readSnapshot(filepath.Join(dir, snapName(n)))
+	s, st, err := readSnapshot(wal.OSFS{}, filepath.Join(dir, snapName(n)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	l := offline()
 	l.install(s, st)
 	mutate(l.st)
-	if _, err := writeSnapshot(dir, l.capture(n, s.time)); err != nil {
+	if _, err := writeSnapshot(wal.OSFS{}, dir, l.capture(n, s.time)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -262,10 +262,10 @@ func TestVerifyNewestSnapshotWithoutRecord(t *testing.T) {
 	dir, clock := verifyFixture(t, 1<<30)
 	nums := snapshotFiles(t, dir)
 	rewriteSnapshot(t, dir, nums[0], func(*state) {})
-	s, st, _ := readSnapshot(filepath.Join(dir, snapName(nums[0])))
+	s, st, _ := readSnapshot(wal.OSFS{}, filepath.Join(dir, snapName(nums[0])))
 	l := offline()
 	l.install(s, st)
-	if _, err := writeSnapshot(dir, l.capture(nums[0]+5, s.time)); err != nil {
+	if _, err := writeSnapshot(wal.OSFS{}, dir, l.capture(nums[0]+5, s.time)); err != nil {
 		t.Fatal(err)
 	}
 	r := mustVerify(t, dir)
@@ -322,13 +322,13 @@ func TestVerifyErrors(t *testing.T) {
 func TestVerifySkipsAnUnmarkedOlderSnapshot(t *testing.T) {
 	dir, clock := verifyFixture(t, 1024)
 	nums := snapshotFiles(t, dir)
-	s, st, err := readSnapshot(filepath.Join(dir, snapName(nums[1])))
+	s, st, err := readSnapshot(wal.OSFS{}, filepath.Join(dir, snapName(nums[1])))
 	if err != nil {
 		t.Fatal(err)
 	}
 	l := offline()
 	l.install(s, st)
-	if _, err := writeSnapshot(dir, l.capture(1, s.time)); err != nil { // snapshot 1's record was dropped long ago
+	if _, err := writeSnapshot(wal.OSFS{}, dir, l.capture(1, s.time)); err != nil { // snapshot 1's record was dropped long ago
 		t.Fatal(err)
 	}
 	r := mustVerify(t, dir)
@@ -345,12 +345,12 @@ func TestStateDiff(t *testing.T) {
 	dir, _ := verifyFixture(t, 1<<30)
 	path := filepath.Join(dir, snapName(snapshotFiles(t, dir)[0]))
 	load := func() (*Ledger, *snapshot, *state) {
-		s, st, err := readSnapshot(path)
+		s, st, err := readSnapshot(wal.OSFS{}, path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		l := offline()
-		s2, st2, _ := readSnapshot(path)
+		s2, st2, _ := readSnapshot(wal.OSFS{}, path)
 		l.install(s2, st2)
 		return l, s, st
 	}

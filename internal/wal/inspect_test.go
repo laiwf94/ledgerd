@@ -87,9 +87,9 @@ func TestInspectFindsWhatOpenRefuses(t *testing.T) {
 			b[len(manifestMagic)+1] ^= 1
 			os.WriteFile(p, b, 0o600)
 		},
-		"gap in the manifest": func(dir string) { writeManifest(dir, []uint64{1, 7}, nil) },
+		"gap in the manifest": func(dir string) { writeManifest(OSFS{}, dir, []uint64{1, 7}, nil) },
 		"unlisted segment inside the log": func(dir string) {
-			writeManifest(dir, []uint64{1, 7}, nil)
+			writeManifest(OSFS{}, dir, []uint64{1, 7}, nil)
 			os.Rename(filepath.Join(dir, segName(4)), filepath.Join(dir, segName(5)))
 		},
 		"non-empty segment past the end": func(dir string) {
@@ -167,10 +167,10 @@ func TestInspectFindsWhatOpenRepairs(t *testing.T) {
 		}, "torn write of 5 bytes"},
 		"sealed newest segment": {func(dir string) {
 			os.Remove(filepath.Join(dir, segName(7)))
-			writeManifest(dir, []uint64{1, 4}, nil)
+			writeManifest(OSFS{}, dir, []uint64{1, 4}, nil)
 			os.WriteFile(filepath.Join(dir, segName(7)), nil, 0o600)
 		}, "interrupted roll"},
-		"older segment left by a drop": {func(dir string) { writeManifest(dir, []uint64{4, 7}, nil) }, "interrupted drop"},
+		"older segment left by a drop": {func(dir string) { writeManifest(OSFS{}, dir, []uint64{4, 7}, nil) }, "interrupted drop"},
 		"temporary manifest": {func(dir string) {
 			os.WriteFile(filepath.Join(dir, manifestName+".tmp"), []byte("x"), 0o600)
 		}, "temporary manifest"},
@@ -221,7 +221,7 @@ func TestInspectLegacyLog(t *testing.T) {
 	os.WriteFile(legacy, data, 0o600)
 	os.MkdirAll(dir, 0o700)
 	os.Link(legacy, filepath.Join(dir, segName(1)))
-	writeManifest(dir, []uint64{1}, nil)
+	writeManifest(OSFS{}, dir, []uint64{1}, nil)
 	rep, got = inspect(t, dir, legacy)
 	if len(got) != 3 || len(rep.Damage) != 0 || !strings.Contains(strings.Join(rep.Repairable, ""), "interrupted upgrade") {
 		t.Fatalf("interrupted upgrade: %q %+v", got, rep)

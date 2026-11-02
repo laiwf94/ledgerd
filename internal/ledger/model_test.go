@@ -527,8 +527,19 @@ func transferSnapshot(tr *Transfer) string {
 // the ledger's dropMu, so no segment disappears while it reads.
 func readRecords(t testing.TB, dir string, from uint64) ([]record, uint64) {
 	t.Helper()
+	return readRecordsFS(t, wal.OSFS{}, dir, from)
+}
+
+// readRecordsFS is readRecords on the file system fsys. It fails if the log
+// no longer holds record from.
+func readRecordsFS(t testing.TB, fsys wal.FS, dir string, from uint64) ([]record, uint64) {
+	t.Helper()
 	var recs []record
-	next, err := wal.Read(filepath.Join(dir, walDir), func(i uint64, p []byte) error {
+	first := uint64(0)
+	next, err := wal.ReadFS(fsys, filepath.Join(dir, walDir), func(i uint64, p []byte) error {
+		if first == 0 {
+			first = i
+		}
 		if i < from {
 			return nil
 		}
@@ -543,6 +554,9 @@ func readRecords(t testing.TB, dir string, from uint64) ([]record, uint64) {
 	}
 	if next < from {
 		t.Fatalf("the log ends at record %d, before %d", next, from)
+	}
+	if from > 0 && first > from && next > from {
+		t.Fatalf("the log starts at record %d, after %d", first, from)
 	}
 	return recs, next
 }

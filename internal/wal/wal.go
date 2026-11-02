@@ -73,6 +73,8 @@ type Options struct {
 	// segments and manifests. The failure-injection tests use it to make
 	// writes and fsyncs fail.
 	WrapFile func(File) File
+	// FS is the file system the log lives on. Default OSFS.
+	FS FS
 }
 
 type segment struct {
@@ -85,7 +87,8 @@ type Log struct {
 	mu     sync.Mutex
 	dir    string
 	opts   Options
-	lockf  *os.File
+	fs     FS
+	lockf  io.Closer
 	segs   []segment // oldest first; the last takes appends
 	f      File      // the last segment
 	crc    uint32    // crc32c of the last segment's bytes
@@ -101,18 +104,17 @@ func Open(dir string, opts Options, apply func(index uint64, payload []byte) err
 	if opts.SegmentBytes <= 0 {
 		opts.SegmentBytes = DefaultSegmentBytes
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if opts.FS == nil {
+		opts.FS = OSFS{}
+	}
+	if err := MkdirAll(opts.FS, dir); err != nil {
 		return nil, err
 	}
-	lockf, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR|os.O_CREATE, 0o600)
+	lockf, err := opts.FS.Lock(filepath.Join(dir, lockName), true)
 	if err != nil {
 		return nil, err
 	}
-	if err := lock(lockf); err != nil {
-		lockf.Close()
-		return nil, err
-	}
-	l := &Log{dir: dir, opts: opts, lockf: lockf}
+	l := &Log{dir: dir, opts: opts, fs: opts.FS, lockf: lockf}
 	if err := l.open(apply); err != nil {
 		if l.f != nil {
 			l.f.Close()
@@ -123,7 +125,7 @@ func Open(dir string, opts Options, apply func(index uint64, payload []byte) err
 	return l, nil
 }
 
-func (l *Log) wrap(f *os.File) File {
+func (l *Log) wrap(f FSFile) File {
 	if l.opts.WrapFile != nil {
 		return l.opts.WrapFile(f)
 	}
@@ -131,8 +133,8 @@ func (l *Log) wrap(f *os.File) File {
 }
 
 func (l *Log) open(apply func(uint64, []byte) error) error {
-	os.Remove(filepath.Join(l.dir, manifestName+".tmp"))
-	firsts, err := readManifest(l.dir)
+	l.fs.Remove(filepath.Join(l.dir, manifestName+".tmp"))
+	firsts, err := readManifest(l.fs, l.dir)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		if firsts, err = l.create(); err != nil {
@@ -159,7 +161,7 @@ func (l *Log) open(apply func(uint64, []byte) error) error {
 		if last {
 			flag = os.O_RDWR
 		}
-		f, err := os.OpenFile(path, flag, 0)
+		f, err := l.fs.OpenFile(path, flag, 0)
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("%w: segment %s is missing", ErrCorrupt, segName(first))
 		}
@@ -200,7 +202,7 @@ func (l *Log) open(apply func(uint64, []byte) error) error {
 }
 
 // truncateTo cuts a torn tail off f and leaves it positioned for appends.
-func truncateTo(f *os.File, end int64) error {
+func truncateTo(f FSFile, end int64) error {
 	st, err := f.Stat()
 	if err != nil {
 		return err
@@ -220,34 +222,39 @@ func truncateTo(f *os.File, end int64) error {
 // create starts a log in a directory without a manifest: from the legacy
 // single-file log if there is one, otherwise empty.
 func (l *Log) create() ([]uint64, error) {
-	segs, err := listSegments(l.dir)
+	segs, err := listSegments(l.fs, l.dir)
 	if err != nil {
 		return nil, err
 	}
-	legacy, err := os.Open(l.opts.Legacy)
+	var legacy io.Closer
+	if l.opts.Legacy != "" {
+		// An earlier version locked the file itself; hold that lock too while
+		// moving it, so an old binary cannot be appending to it.
+		legacy, err = l.fs.Lock(l.opts.Legacy, false)
+	}
 	if l.opts.Legacy == "" || errors.Is(err, os.ErrNotExist) {
 		// Segment files without a manifest are left by a crash while the log
 		// was being created, before any record could be appended.
 		for _, first := range segs {
 			path := filepath.Join(l.dir, segName(first))
-			if st, err := os.Stat(path); err != nil || st.Size() != 0 {
+			if st, err := l.fs.Stat(path); err != nil || st.Size() != 0 {
 				return nil, fmt.Errorf("%w: segment %s exists without a manifest", ErrCorrupt, segName(first))
 			}
-			if err := os.Remove(path); err != nil {
+			if err := l.fs.Remove(path); err != nil {
 				return nil, err
 			}
 		}
-		osf, err := os.OpenFile(filepath.Join(l.dir, segName(1)), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		osf, err := l.fs.OpenFile(filepath.Join(l.dir, segName(1)), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			return nil, err
 		}
 		f := l.wrap(osf)
 		err = f.Sync()
 		if err == nil {
-			err = syncDir(l.dir)
+			err = l.fs.SyncDir(l.dir)
 		}
 		if err == nil {
-			err = writeManifest(l.dir, []uint64{1}, l.opts.WrapFile)
+			err = writeManifest(l.fs, l.dir, []uint64{1}, l.opts.WrapFile)
 		}
 		f.Close()
 		if err != nil {
@@ -259,24 +266,19 @@ func (l *Log) create() ([]uint64, error) {
 		return nil, err
 	}
 	defer legacy.Close()
-	// An earlier version locked the file itself; hold that lock too while
-	// moving it, so an old binary cannot be appending to it.
-	if err := lock(legacy); err != nil {
-		return nil, err
-	}
 	// Any segment here is a link made by an interrupted migration.
 	for _, first := range segs {
-		if err := os.Remove(filepath.Join(l.dir, segName(first))); err != nil {
+		if err := l.fs.Remove(filepath.Join(l.dir, segName(first))); err != nil {
 			return nil, err
 		}
 	}
-	if err := os.Link(l.opts.Legacy, filepath.Join(l.dir, segName(1))); err != nil {
+	if err := l.fs.Link(l.opts.Legacy, filepath.Join(l.dir, segName(1))); err != nil {
 		return nil, err
 	}
-	if err := syncDir(l.dir); err != nil {
+	if err := l.fs.SyncDir(l.dir); err != nil {
 		return nil, err
 	}
-	if err := writeManifest(l.dir, []uint64{1}, l.opts.WrapFile); err != nil {
+	if err := writeManifest(l.fs, l.dir, []uint64{1}, l.opts.WrapFile); err != nil {
 		return nil, err
 	}
 	if err := l.retireLegacy(1); err != nil {
@@ -292,28 +294,28 @@ func (l *Log) retireLegacy(first uint64) error {
 	if l.opts.Legacy == "" {
 		return nil
 	}
-	lst, err := os.Stat(l.opts.Legacy)
+	lst, err := l.fs.Stat(l.opts.Legacy)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	sst, err := os.Stat(filepath.Join(l.dir, segName(first)))
-	if err != nil || !os.SameFile(lst, sst) {
+	sst, err := l.fs.Stat(filepath.Join(l.dir, segName(first)))
+	if err != nil || !l.fs.SameFile(lst, sst) {
 		return fmt.Errorf("%w: both %s and a segmented log in %s exist", ErrCorrupt, l.opts.Legacy, l.dir)
 	}
-	if err := os.Remove(l.opts.Legacy); err != nil {
+	if err := l.fs.Remove(l.opts.Legacy); err != nil {
 		return err
 	}
-	return syncDir(filepath.Dir(l.opts.Legacy))
+	return l.fs.SyncDir(filepath.Dir(l.opts.Legacy))
 }
 
 // removeOrphans deletes segment files the manifest does not list: older
 // ones left by an interrupted drop, and an empty newer one left by an
 // interrupted roll. Anything else is damage.
 func (l *Log) removeOrphans(firsts []uint64) error {
-	segs, err := listSegments(l.dir)
+	segs, err := listSegments(l.fs, l.dir)
 	if err != nil {
 		return err
 	}
@@ -330,26 +332,26 @@ func (l *Log) removeOrphans(firsts []uint64) error {
 		switch {
 		case first < firsts[0]:
 		case first > firsts[len(firsts)-1]:
-			if st, err := os.Stat(path); err != nil || st.Size() != 0 {
+			if st, err := l.fs.Stat(path); err != nil || st.Size() != 0 {
 				return fmt.Errorf("%w: segment %s is past the end of the log", ErrCorrupt, segName(first))
 			}
 		default:
 			return fmt.Errorf("%w: segment %s is not in the manifest", ErrCorrupt, segName(first))
 		}
-		if err := os.Remove(path); err != nil {
+		if err := l.fs.Remove(path); err != nil {
 			return err
 		}
 		removed = true
 	}
 	if removed {
-		return syncDir(l.dir)
+		return l.fs.SyncDir(l.dir)
 	}
 	return nil
 }
 
 // listSegments returns the first index of every segment file in dir, in order.
-func listSegments(dir string) ([]uint64, error) {
-	entries, err := os.ReadDir(dir)
+func listSegments(fsys FS, dir string) ([]uint64, error) {
+	entries, err := fsys.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +370,12 @@ func listSegments(dir string) ([]uint64, error) {
 // skipped, as Open would drop it. It is meant for tools and tests that look
 // at a log no process is appending to.
 func Read(dir string, apply func(index uint64, payload []byte) error) (uint64, error) {
-	firsts, err := readManifest(dir)
+	return ReadFS(OSFS{}, dir, apply)
+}
+
+// ReadFS is Read on the file system fsys.
+func ReadFS(fsys FS, dir string, apply func(index uint64, payload []byte) error) (uint64, error) {
+	firsts, err := readManifest(fsys, dir)
 	if err != nil {
 		return 0, err
 	}
@@ -377,7 +384,7 @@ func Read(dir string, apply func(index uint64, payload []byte) error) (uint64, e
 		if first != next {
 			return 0, fmt.Errorf("%w: segment %s should start at record %d", ErrCorrupt, segName(first), next)
 		}
-		f, err := os.Open(filepath.Join(dir, segName(first)))
+		f, err := fsys.OpenFile(filepath.Join(dir, segName(first)), os.O_RDONLY, 0)
 		if err != nil {
 			return 0, fmt.Errorf("%w: segment %s: %v", ErrCorrupt, segName(first), err)
 		}
@@ -399,7 +406,8 @@ func Read(dir string, apply func(index uint64, payload []byte) error) (uint64, e
 // where the intact prefix ends. It knows nothing of seals. A torn final record is not an error; any other damage is
 // ErrCorrupt, as is an error returned by apply.
 func Replay(r io.Reader, apply func(payload []byte) error) (int64, error) {
-	br := bufio.NewReaderSize(r, MaxRecord+16)
+	br := getReader(r)
+	defer putReader(br)
 	var offset int64
 	for {
 		line, err := br.ReadSlice('\n')
@@ -544,7 +552,7 @@ func (l *Log) startSegment(first uint64) error {
 		return err
 	}
 	l.f = nil
-	osf, err := os.OpenFile(filepath.Join(l.dir, segName(first)), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	osf, err := l.fs.OpenFile(filepath.Join(l.dir, segName(first)), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
@@ -552,14 +560,14 @@ func (l *Log) startSegment(first uint64) error {
 	if err := l.f.Sync(); err != nil {
 		return err
 	}
-	if err := syncDir(l.dir); err != nil {
+	if err := l.fs.SyncDir(l.dir); err != nil {
 		return err
 	}
 	firsts := make([]uint64, 0, len(l.segs)+1)
 	for _, s := range l.segs {
 		firsts = append(firsts, s.first)
 	}
-	if err := writeManifest(l.dir, append(firsts, first), l.opts.WrapFile); err != nil {
+	if err := writeManifest(l.fs, l.dir, append(firsts, first), l.opts.WrapFile); err != nil {
 		return err
 	}
 	l.segs = append(l.segs, segment{first: first})
@@ -589,7 +597,7 @@ func (l *Log) DropBefore(index uint64) (int, error) {
 	for _, s := range l.segs[k:] {
 		firsts = append(firsts, s.first)
 	}
-	if err := writeManifest(l.dir, firsts, l.opts.WrapFile); err != nil {
+	if err := writeManifest(l.fs, l.dir, firsts, l.opts.WrapFile); err != nil {
 		if errors.Is(err, errAfterRename) {
 			l.broken = err
 			return 0, fmt.Errorf("%w: %v", ErrBroken, err)
@@ -601,11 +609,11 @@ func (l *Log) DropBefore(index uint64) (int, error) {
 	var firstErr error
 	for _, s := range dropped {
 		l.size -= s.size
-		if err := os.Remove(filepath.Join(l.dir, segName(s.first))); err != nil && firstErr == nil {
+		if err := l.fs.Remove(filepath.Join(l.dir, segName(s.first))); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
-	if err := syncDir(l.dir); err != nil && firstErr == nil {
+	if err := l.fs.SyncDir(l.dir); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	// The manifest no longer lists them, so a file left behind is only space.
@@ -669,13 +677,4 @@ func (l *Log) Close() error {
 		l.lockf = nil
 	}
 	return err
-}
-
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
 }

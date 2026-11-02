@@ -32,15 +32,11 @@ func lock(f *os.File) error {
 // directory without a lock file has never been opened by a server that
 // could still be running; HoldLock then holds nothing.
 func HoldLock(dir string) (release func(), err error) {
-	f, err := os.Open(filepath.Join(dir, lockName))
+	f, err := OSFS{}.Lock(filepath.Join(dir, lockName), false)
 	if errors.Is(err, os.ErrNotExist) {
 		return func() {}, nil
 	}
 	if err != nil {
-		return nil, err
-	}
-	if err := lock(f); err != nil {
-		f.Close()
 		return nil, err
 	}
 	return func() { f.Close() }, nil
