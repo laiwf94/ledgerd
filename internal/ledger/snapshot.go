@@ -796,7 +796,7 @@ func readSnapshot(path string) (*snapshot, *state, error) {
 			r.fail("account %s appears twice", a.ID)
 			break
 		}
-		st.accounts[a.ID] = a
+		st.addAccount(a)
 		r.ids[a.ID] = a.ID
 	}
 	for k := uint64(0); k < nTransfers && r.err == nil; k++ {

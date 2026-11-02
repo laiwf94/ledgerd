@@ -291,7 +291,7 @@ snapshot at the head; a 10,000-entry tail after the snapshot adds about
 0.15 s of replay (`BenchmarkRecovery`). Most of what remains grows with the
 ledger, not the tail: decoding the 157 MB snapshot (about 1.7 s, much of it
 building maps and garbage collection) and the startup invariant check (about
-0.75 s). Both shrink once state lives on disk rather than wholly in memory.
+0.75 s, measured before the checker moved to a frozen view). Both shrink once state lives on disk rather than wholly in memory.
 
 ### Checking a data directory offline
 
@@ -424,10 +424,31 @@ a reversal. Dates are UTC.
 6. every transfer's posted and reversed amounts agree with its postings and
    its reversals.
 
-The checker reads under the shared lock and is linear in the journal size,
-so on a large ledger it delays commits while it runs. It is an operator tool;
-at scale it runs against a replica (see
-[Past a single writer](#past-a-single-writer)).
+The checker is linear in the journal size, but commits do not wait for it.
+It checks a frozen, copy-on-write view of the committed state as of the
+journal head when it started, and reports that head
+(`checked_through_seq`). Taking the view costs O(1) under the write lock:
+the journal and the list of account IDs are append-only, so their prefixes
+need no copy and no lock. What a commit changes in place, an account's
+totals, version and history length, or which version of a transfer the map
+points at, it first saves into the view, once per account or transfer, while
+a check runs. Committed transfers are never modified, so saving one is
+saving a pointer. The checker reads accounts and transfers through the view
+in chunks of 1,024 under the shared lock and does all the folding and
+comparing outside it, so a commit waits for one chunk at most. Transfers are
+enumerated from the journal prefix (each is created by exactly one entry),
+which also checks that the transfer map and the journal agree. One check
+runs at a time; the extra memory is the saved copies of what was touched
+during the check, plus the per-account working set the check always needed.
+
+On a ledger of 10 million entries over 100,000 accounts (4-vCPU 2.1 GHz
+Xeon virtual machine, in memory), a full check takes 9.7 s. Single
+transfers committed back to back during it took p50 15 µs, p99 274 µs and
+at most 2.9 ms (p99 57 µs on an idle ledger), and 435,781 of them finished
+while it ran. The previous checker held the shared lock for the whole scan,
+14.8 s on the same ledger, and a transfer submitted at its start waited for
+all of it (`TestCommitLatencyStaysFlatDuringAudit`, with
+`LEDGERD_AUDIT_ENTRIES=10000000`; CI runs it at 200,000 entries).
 
 ## Checking the ledger against an independent model
 
