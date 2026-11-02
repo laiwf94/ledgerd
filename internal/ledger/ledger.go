@@ -88,6 +88,9 @@ type Ledger struct {
 	mu sync.RWMutex // guards st for readers; the writer holds it only to commit
 	st *state
 
+	auditMu   sync.Mutex        // one invariant check at a time
+	auditStep func(step string) // tests: called while the checker holds no lock
+
 	queue   chan *request
 	quit    chan struct{}
 	done    chan struct{}

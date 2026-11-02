@@ -10,6 +10,10 @@ import (
 // unbounded response.
 const maxViolations = 100
 
+// auditChunk is how many accounts or transfers the checker reads per hold of
+// the read lock. A commit waits for at most one chunk, never for a scan.
+var auditChunk = 1024
+
 // wide is a 128-bit two's-complement accumulator. Sums across many accounts
 // can exceed an int64 even though every single total fits.
 type wide struct {
@@ -26,6 +30,102 @@ func (w *wide) add(v int64) {
 	w.lo = lo
 }
 
+// frozen is a copy-on-write view of the committed state at one journal head.
+// Taking it costs O(1): the journal and the list of account IDs are
+// append-only, so their prefixes stand for themselves. What commit changes
+// in place (an account's totals, version and history, or which version of a
+// transfer the map points at) it first saves here, once per account or
+// transfer, so the view keeps reading the values as of head. Reading live
+// values that have no saved copy needs the ledger's read lock; the prefixes
+// need no lock at all.
+type frozen struct {
+	st        *state
+	head      uint64
+	entries   []Entry  // st.entries[:head]
+	ids       []string // st.order as of head
+	open      int
+	transfers int
+	accounts  map[string]accountImage
+	replaced  map[string]*Transfer
+}
+
+// accountImage is what commit changes in place on an account.
+type accountImage struct {
+	bal     Balance
+	version uint64
+	rows    []row
+}
+
+func image(a *account) accountImage {
+	return accountImage{bal: a.bal, version: a.version, rows: a.rows[:len(a.rows):len(a.rows)]}
+}
+
+// keepAccount saves a's values before commit changes them for the first time
+// since the view was taken. The caller holds the write lock.
+func (v *frozen) keepAccount(a *account) {
+	if _, ok := v.accounts[a.ID]; !ok {
+		v.accounts[a.ID] = image(a)
+	}
+}
+
+// keepTransfer saves the version of a transfer the view sees before commit
+// replaces it for the first time. The caller holds the write lock.
+func (v *frozen) keepTransfer(tr *Transfer) {
+	if _, ok := v.replaced[tr.ID]; !ok {
+		v.replaced[tr.ID] = tr
+	}
+}
+
+// account returns an account's definition and its values as of head. The
+// caller holds the read lock.
+func (v *frozen) account(id string) (*account, accountImage, bool) {
+	a, ok := v.st.accounts[id]
+	if !ok {
+		return nil, accountImage{}, false
+	}
+	if im, ok := v.accounts[id]; ok {
+		return a, im, true
+	}
+	return a, image(a), true
+}
+
+// transfer returns a transfer as of head. The caller holds the read lock.
+func (v *frozen) transfer(id string) (*Transfer, bool) {
+	if tr, ok := v.replaced[id]; ok {
+		return tr, true
+	}
+	tr, ok := v.st.transfers[id]
+	if !ok || len(tr.Entries) == 0 || tr.Entries[0].Seq > v.head {
+		return nil, false // created after the view was taken
+	}
+	return tr, true
+}
+
+// freeze takes a view of the committed state; commits made until thaw save
+// what they overwrite into it.
+func (l *Ledger) freeze() *frozen {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st := l.st
+	n, na := len(st.entries), len(st.order)
+	v := &frozen{st: st, head: uint64(n), entries: st.entries[:n:n], ids: st.order[:na:na], open: st.open,
+		transfers: len(st.transfers), accounts: map[string]accountImage{}, replaced: map[string]*Transfer{}}
+	st.view = v
+	return v
+}
+
+func (l *Ledger) thaw(v *frozen) {
+	l.mu.Lock()
+	v.st.view = nil
+	l.mu.Unlock()
+}
+
+func (l *Ledger) step(name string) {
+	if l.auditStep != nil {
+		l.auditStep(name)
+	}
+}
+
 // CheckInvariants verifies the whole ledger and returns a description of
 // each violation (empty when everything holds):
 //
@@ -39,18 +139,36 @@ func (w *wide) add(v int64) {
 //  6. every transfer's posted and reversed amounts are consistent with its
 //     postings and its reversals.
 //
-// It reads the committed state under the read lock, so it can run while the
-// ledger serves traffic. Cost is linear in the journal size.
+// It checks a frozen view of the committed state (see frozen), so commits
+// continue while it runs: they wait for at most one chunk of auditChunk
+// lookups, never for the scan. Cost is linear in the journal size.
 func (l *Ledger) CheckInvariants() []string {
 	_, v := l.Audit()
 	return v
 }
 
+// acctCheck is one account as of the view's head, with the fold of the
+// journal entries that touch it.
+type acctCheck struct {
+	id      string
+	cur     string
+	normal  Direction
+	nonNeg  bool
+	nonPos  bool
+	bal     Balance
+	version uint64
+	rows    []row
+	folded  Balance
+}
+
 // Audit is CheckInvariants that also returns the journal head it checked.
 func (l *Ledger) Audit() (head uint64, violations []string) {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	st := l.st
+	l.auditMu.Lock()
+	defer l.auditMu.Unlock()
+	v := l.freeze()
+	defer l.thaw(v)
+	l.step("frozen")
+
 	var out []string
 	bad := func(format string, args ...any) {
 		if len(out) < maxViolations {
@@ -58,17 +176,47 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 		}
 	}
 
-	folded := map[string]*Balance{}
-	for i, e := range st.entries {
+	// Accounts as of head, read in chunks under the read lock.
+	ids := append([]string(nil), v.ids...)
+	sort.Strings(ids)
+	accts := make([]acctCheck, 0, len(ids))
+	for start := 0; start < len(ids); start += auditChunk {
+		end := min(start+auditChunk, len(ids))
+		l.mu.RLock()
+		for _, id := range ids[start:end] {
+			a, im, ok := v.account(id)
+			if !ok {
+				bad("account %s is listed but missing", id)
+				continue
+			}
+			accts = append(accts, acctCheck{id: id, cur: a.Currency, normal: a.NormalBalance, nonNeg: a.NonNegative,
+				nonPos: a.NonPositive, bal: im.bal, version: im.version, rows: im.rows})
+		}
+		l.mu.RUnlock()
+		l.step("accounts")
+	}
+	index := make(map[string]int, len(accts))
+	for i := range accts {
+		index[accts[i].id] = i
+	}
+
+	// The journal prefix never changes, so it needs no lock.
+	var tids []string
+	for i, e := range v.entries {
 		if e.Seq != uint64(i+1) {
 			bad("entry %d has sequence %d", i+1, e.Seq)
 		}
+		if e.Kind == KindPosted || e.Kind == KindPending || e.Kind == KindReversal {
+			tids = append(tids, e.TransferID)
+		}
 		var dp, cp, dq, cq wide
 		for _, ln := range e.Lines {
-			b := folded[ln.Account]
-			if b == nil {
+			var b *Balance
+			k, ok := index[ln.Account]
+			if ok {
+				b = &accts[k].folded
+			} else {
 				b = &Balance{}
-				folded[ln.Account] = b
 			}
 			if ln.Direction == Debit {
 				dp.add(ln.Posted)
@@ -81,7 +229,7 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 				b.CreditsPosted += ln.Posted
 				b.CreditsPending += ln.Pending
 			}
-			if a, ok := st.accounts[ln.Account]; !ok || a.Currency != e.Currency {
+			if !ok || accts[k].cur != e.Currency {
 				bad("entry %d posts to %s, which does not exist or holds another currency", e.Seq, ln.Account)
 			}
 		}
@@ -92,40 +240,32 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 
 	type totals struct{ dp, cp, dq, cq wide }
 	byCurrency := map[string]*totals{}
-	ids := make([]string, 0, len(st.accounts))
-	for id := range st.accounts {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
-		a := st.accounts[id]
-		t := byCurrency[a.Currency]
+	for i := range accts {
+		a := &accts[i]
+		id := a.id
+		t := byCurrency[a.cur]
 		if t == nil {
 			t = &totals{}
-			byCurrency[a.Currency] = t
+			byCurrency[a.cur] = t
 		}
 		t.dp.add(a.bal.DebitsPosted)
 		t.cp.add(a.bal.CreditsPosted)
 		t.dq.add(a.bal.DebitsPending)
 		t.cq.add(a.bal.CreditsPending)
 
-		var f Balance
-		if p := folded[id]; p != nil {
-			f = *p
-		}
-		if f != a.bal {
-			bad("account %s balance %+v does not match its journal entries %+v", id, a.bal, f)
+		if a.folded != a.bal {
+			bad("account %s balance %+v does not match its journal entries %+v", id, a.bal, a.folded)
 		}
 		if a.version != uint64(len(a.rows)) {
 			bad("account %s version %d but %d entries", id, a.version, len(a.rows))
 		}
 		var run Balance
 		for _, r := range a.rows {
-			if r.seq == 0 || r.seq > st.head() || r.line >= len(st.entries[r.seq-1].Lines) || st.entries[r.seq-1].Lines[r.line].Account != id {
+			if r.seq == 0 || r.seq > v.head || r.line >= len(v.entries[r.seq-1].Lines) || v.entries[r.seq-1].Lines[r.line].Account != id {
 				bad("account %s has a history row that points at the wrong entry", id)
 				break
 			}
-			ln := st.entries[r.seq-1].Lines[r.line]
+			ln := v.entries[r.seq-1].Lines[r.line]
 			if ln.Direction == Debit {
 				run.DebitsPosted += ln.Posted
 				run.DebitsPending += ln.Pending
@@ -142,11 +282,11 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 			bad("account %s has a negative total", id)
 		}
 
-		v := a.bal.View(a.NormalBalance)
-		if a.NonNegative && v.Available < 0 {
-			bad("account %s is non_negative but its available balance is %d", id, v.Available)
+		view := a.bal.View(a.normal)
+		if a.nonNeg && view.Available < 0 {
+			bad("account %s is non_negative but its available balance is %d", id, view.Available)
 		}
-		if ip, iq, dp, _ := a.bal.sides(a.NormalBalance); a.NonPositive && ip+iq-dp > 0 {
+		if ip, iq, dp, _ := a.bal.sides(a.normal); a.nonPos && ip+iq-dp > 0 {
 			bad("account %s is non_positive but its balance including pending is %d", id, ip+iq-dp)
 		}
 	}
@@ -159,90 +299,144 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 		}
 	}
 
+	// Transfers: every one the view holds was created by exactly one entry
+	// in the journal prefix, so the prefix lists them without a lock.
+	sort.Strings(tids)
+	n := 0
+	for i, id := range tids {
+		if i == 0 || id != tids[i-1] {
+			tids[n] = id
+			n++
+		} else {
+			bad("transfer %s is created by more than one journal entry", id)
+		}
+	}
+	tids = tids[:n]
+	if len(tids) != v.transfers {
+		bad("the ledger holds %d transfers but the journal creates %d", v.transfers, len(tids))
+	}
+	type reversedSums struct {
+		orig *Transfer
+		sums []int64 // amounts sent back per posting
+	}
 	reserved := map[string]*Balance{}
 	open := 0
-	reversedBy := map[string][]int64{} // original id -> amounts sent back per posting
-	tids := make([]string, 0, len(st.transfers))
-	for id := range st.transfers {
-		tids = append(tids, id)
-	}
-	sort.Strings(tids)
-	for _, id := range tids {
-		tr := st.transfers[id]
-		if tr.State == StatePending {
-			open++
+	reversedBy := map[string]*reversedSums{} // original id -> what its reversals sent back
+	withReversed := map[string]*Transfer{}   // transfers that say some amount was reversed
+	type pair struct{ tr, orig *Transfer }
+	chunk := make([]pair, 0, auditChunk)
+	for start := 0; start < len(tids); start += auditChunk {
+		end := min(start+auditChunk, len(tids))
+		chunk = chunk[:0]
+		l.mu.RLock()
+		for _, id := range tids[start:end] {
+			var p pair
+			p.tr, _ = v.transfer(id)
+			if p.tr != nil && p.tr.Reverses != "" {
+				p.orig, _ = v.transfer(p.tr.Reverses)
+			}
+			chunk = append(chunk, p)
 		}
-		for _, p := range tr.Postings {
-			if p.Posted < 0 || p.Posted > p.Amount || p.Reversed < 0 || p.Reversed > p.Posted {
-				bad("transfer %s posting to %s has inconsistent amounts", id, p.Account)
-			}
-			if tr.State != StatePosted && p.Posted != 0 {
-				bad("transfer %s is %s but has posted amounts", id, tr.State)
-			}
-			if tr.State == StatePending {
-				b := reserved[p.Account]
-				if b == nil {
-					b = &Balance{}
-					reserved[p.Account] = b
-				}
-				if p.Direction == Debit {
-					b.DebitsPending += p.Amount
-				} else {
-					b.CreditsPending += p.Amount
-				}
-			}
-		}
-		if tr.Reverses != "" {
-			orig, ok := st.transfers[tr.Reverses]
-			if !ok {
-				bad("reversal %s points at missing transfer %s", id, tr.Reverses)
+		l.mu.RUnlock()
+		l.step("transfers")
+		for k, p := range chunk {
+			tr := p.tr
+			if tr == nil {
+				bad("the journal creates transfer %s, which does not exist", tids[start+k])
 				continue
 			}
-			sums := reversedBy[orig.ID]
-			if sums == nil {
-				sums = make([]int64, len(orig.Postings))
-				reversedBy[orig.ID] = sums
+			id := tr.ID
+			if tr.State == StatePending {
+				open++
 			}
 			for _, p := range tr.Postings {
-				found := false
-				for i, op := range orig.Postings {
-					if op.Account == p.Account && op.Direction == p.Direction.flip() {
-						sums[i] += p.Amount
-						found = true
+				if p.Posted < 0 || p.Posted > p.Amount || p.Reversed < 0 || p.Reversed > p.Posted {
+					bad("transfer %s posting to %s has inconsistent amounts", id, p.Account)
+				}
+				if tr.State != StatePosted && p.Posted != 0 {
+					bad("transfer %s is %s but has posted amounts", id, tr.State)
+				}
+				if p.Reversed != 0 {
+					withReversed[id] = tr
+				}
+				if tr.State == StatePending {
+					b := reserved[p.Account]
+					if b == nil {
+						b = &Balance{}
+						reserved[p.Account] = b
+					}
+					if p.Direction == Debit {
+						b.DebitsPending += p.Amount
+					} else {
+						b.CreditsPending += p.Amount
 					}
 				}
-				if !found {
-					bad("reversal %s posts to %s, which is not in %s", id, p.Account, orig.ID)
+			}
+			if tr.Reverses != "" {
+				orig := p.orig
+				if orig == nil {
+					bad("reversal %s points at missing transfer %s", id, tr.Reverses)
+					continue
+				}
+				r := reversedBy[orig.ID]
+				if r == nil {
+					r = &reversedSums{orig: orig, sums: make([]int64, len(orig.Postings))}
+					reversedBy[orig.ID] = r
+				}
+				for _, p := range tr.Postings {
+					found := false
+					for i, op := range orig.Postings {
+						if op.Account == p.Account && op.Direction == p.Direction.flip() {
+							r.sums[i] += p.Amount
+							found = true
+						}
+					}
+					if !found {
+						bad("reversal %s posts to %s, which is not in %s", id, p.Account, orig.ID)
+					}
 				}
 			}
 		}
 	}
-	if open != st.open {
-		bad("open pending count is %d but %d transfers are pending", st.open, open)
+	if open != v.open {
+		bad("open pending count is %d but %d transfers are pending", v.open, open)
 	}
-	for _, id := range ids {
-		a := st.accounts[id]
+	for i := range accts {
+		a := &accts[i]
 		var r Balance
-		if p := reserved[id]; p != nil {
+		if p := reserved[a.id]; p != nil {
 			r = *p
 		}
 		if a.bal.DebitsPending != r.DebitsPending || a.bal.CreditsPending != r.CreditsPending {
 			bad("account %s reserves %d/%d (debit/credit) but open pending transfers hold %d/%d",
-				id, a.bal.DebitsPending, a.bal.CreditsPending, r.DebitsPending, r.CreditsPending)
+				a.id, a.bal.DebitsPending, a.bal.CreditsPending, r.DebitsPending, r.CreditsPending)
 		}
 	}
-	for _, id := range tids {
-		tr := st.transfers[id]
-		sums := reversedBy[id]
+	// Only transfers that were reversed or say they were can disagree.
+	rids := make([]string, 0, len(withReversed)+len(reversedBy))
+	for id := range withReversed {
+		rids = append(rids, id)
+	}
+	for id := range reversedBy {
+		if _, ok := withReversed[id]; !ok {
+			rids = append(rids, id)
+		}
+	}
+	sort.Strings(rids)
+	for _, id := range rids {
+		tr, r := withReversed[id], reversedBy[id]
+		if tr == nil {
+			tr = r.orig
+		}
 		for i, p := range tr.Postings {
 			var want int64
-			if sums != nil {
-				want = sums[i]
+			if r != nil && i < len(r.sums) {
+				want = r.sums[i]
 			}
 			if p.Reversed != want {
 				bad("transfer %s posting to %s says %d reversed, its reversals add up to %d", id, p.Account, p.Reversed, want)
 			}
 		}
 	}
-	return st.head(), out
+	return v.head, out
 }

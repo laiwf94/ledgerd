@@ -63,7 +63,9 @@ Reconciliation takes a bank or processor statement as CSV and reports what
 matched, what matched by reference but with a different amount, and what is
 missing on either side. An invariant checker (debits equal credits per
 currency, every balance equals the fold of its entries, limits hold,
-reservations match open pending transfers) runs at startup and on demand.
+reservations match open pending transfers) runs at startup and on demand;
+it checks a frozen copy-on-write view of the ledger, so commits keep going
+while it scans.
 `ledgerd verify` checks a stopped server's data directory offline: every
 checksum in every segment and snapshot, segment continuity, every invariant,
 and that replaying the log reproduces each snapshot exactly. It exits 0 for
@@ -136,6 +138,7 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 | Snapshots | A snapshot plus the log after it must rebuild exactly the state (accounts, history rows, transfers, journal, expiries, idempotency results) that replaying the whole log does, across random workloads, crashes mid-snapshot, concurrent load and dropped log segments. A snapshot cut at every byte or with a flipped bit in any byte is refused, and recovery falls back to an older snapshot or the log. |
 | Segments | Every byte of a sealed segment is cut and bit-flipped and must be refused; a missing, unlisted or out-of-order segment and a damaged manifest stop startup; a crash at each step of sealing, dropping and adopting an old single-file log reopens to exactly the acknowledged records. The reference-model test runs with segments of 256 bytes to 4 KiB, so it rolls and drops segments and crashes across them. |
 | Offline verify | `ledgerd verify` is run on sound ledgers (with and without dropped segments), on each kind of crash debris the server repairs, and on each kind of damage it refuses: flipped bytes, missing segments, lost snapshots, a snapshot rewritten with valid checksums that disagrees with the log or breaks an invariant, and a newest snapshot the log does not mark. Each must get the right verdict, a repairable directory must then open to the same head, and verify must never change a file. |
+| Invariant checker | Every kind of damage is reported, including damage only a copy saved for the check still holds. Transfers, reservations, captures, voids, reversals and new accounts committed at every point the checker pauses must leave it reporting the head it froze and no violation, and checks run back to back under a concurrent mixed workload must all be clean. On a large ledger, commit latency during a check must stay a small fraction of the check's duration (a commit that waited for the scan fails it). |
 | Storage failures | Injected write and fsync errors: the ledger stops accepting writes, keeps serving reads, and after a restart a keyed retry reports what actually reached the disk. |
 | Idempotency | Replays across restarts, errors replayed, key reuse, scope per API key, retention expiry, concurrent duplicates held in flight by a blocked fsync. |
 | Reconciliation | The amount-and-date pass is compared with a maximum bipartite matching on random inputs; a worst case of 10,000 lines against 100,000 identical movements must stay fast. |

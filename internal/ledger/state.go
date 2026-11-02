@@ -25,7 +25,12 @@ type state struct {
 	transfers map[string]*Transfer
 	entries   []Entry // entries[i].Seq == i+1
 	expiries  expiryHeap
-	open      int // pending transfers
+	open      int      // pending transfers
+	order     []string // account IDs in the order they were added; append-only
+
+	// view is set while the invariant checker scans a frozen copy of the
+	// state. commit saves into it whatever it is about to overwrite.
+	view *frozen
 }
 
 func newState() *state {
@@ -33,6 +38,12 @@ func newState() *state {
 }
 
 func (s *state) head() uint64 { return uint64(len(s.entries)) }
+
+// addAccount adds a new account.
+func (s *state) addAccount(a *account) {
+	s.accounts[a.ID] = a
+	s.order = append(s.order, a.ID)
+}
 
 // expiry schedules a pending transfer's timeout. Entries are removed lazily:
 // one whose transfer is no longer pending is skipped when it surfaces.
@@ -123,11 +134,15 @@ func (t *txn) putTransfer(tr *Transfer) {
 }
 
 func (t *txn) commit() {
+	v := t.st.view
 	for id, c := range t.accounts {
 		if a, ok := t.st.accounts[id]; ok {
+			if v != nil {
+				v.keepAccount(a)
+			}
 			a.bal, a.version = c.bal, c.version
 		} else {
-			t.st.accounts[id] = c
+			t.st.addAccount(c)
 		}
 	}
 	for _, r := range t.rows {
@@ -135,6 +150,9 @@ func (t *txn) commit() {
 		a.rows = append(a.rows, r.row)
 	}
 	for _, id := range t.order {
+		if old, ok := t.st.transfers[id]; ok && v != nil {
+			v.keepTransfer(old)
+		}
 		t.st.transfers[id] = t.transfers[id]
 	}
 	t.st.entries = append(t.st.entries, t.entries...)
