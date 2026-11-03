@@ -33,6 +33,11 @@ const (
 // the directory may hold either version.
 var errAfterRename = errors.New("manifest renamed but the directory fsync failed")
 
+// EncodeManifest returns the manifest of a log whose segments start at the
+// given record numbers, oldest first. Tools and tests use it to assemble a
+// log directory from segment files.
+func EncodeManifest(firsts []uint64) []byte { return encodeManifest(firsts) }
+
 func encodeManifest(firsts []uint64) []byte {
 	b := []byte(manifestMagic + "\n")
 	for _, f := range firsts {

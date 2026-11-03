@@ -749,7 +749,13 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 		return nil, nil, err
 	}
 	defer f.Close()
-	r := &snapReader{r: bufio.NewReaderSize(f, 1<<20), ids: map[string]string{}, syms: map[string]string{}}
+	// A small snapshot gets a small buffer: allocating and clearing a
+	// megabyte would cost more than reading it.
+	bufSize := 1 << 20
+	if fi, err := f.Stat(); err == nil && fi.Size() < int64(bufSize) {
+		bufSize = max(int(fi.Size()), 16)
+	}
+	r := &snapReader{r: bufio.NewReaderSize(f, bufSize), ids: map[string]string{}, syms: map[string]string{}}
 	var magic [len(snapMagic)]byte
 	if _, err := io.ReadFull(r.r, magic[:]); err != nil || string(magic[:]) != snapMagic {
 		return nil, nil, fmt.Errorf("%w: not a snapshot file", errSnapshot)

@@ -231,6 +231,18 @@ every byte offset and recovers each prefix: the result must equal the
 state after some acknowledged prefix, never go backwards as the offset grows,
 and satisfy every invariant.
 
+A second crash test does the same across segments and snapshots. It writes
+a workload with 768-byte segments and a snapshot every three records, keeps
+every segment and snapshot file the run produced, and rebuilds the data
+directory as a crash would leave it with the log cut at every byte: inside
+a record, inside a seal, right after a seal before the next segment exists,
+and in a new, empty segment. Each cut is recovered three ways: from the log
+alone, from the two newest snapshots the cut log has records for with the
+segments before them dropped, and with the newest of those never renamed
+(a half-written temporary file in its place) and the two before it present.
+The log alone must recover an acknowledged state that never goes backwards;
+each version with snapshots must recover exactly what the log alone does.
+
 ### Power loss
 
 A truncated log is only one thing a power cut can leave. An fsync covers one
@@ -274,6 +286,23 @@ Rebello et al., *Can Applications Recover from fsync Failures?*). A restart
 recovers from what is really on disk, and clients learn the outcome of the
 ambiguous requests by retrying with their idempotency keys. The tests inject
 both failures and check exactly that.
+
+They also fail each step of a segment roll in turn (writing the seal,
+fsyncing it, creating the next segment, fsyncing it, fsyncing the
+directory, writing the manifest, renaming it and fsyncing the directory
+after the rename). The batch that needed the new segment is refused, the
+ledger stops, and after a restart the keyed retry runs once, the log rolls
+again and `ledgerd verify` reports the directory sound. Each step of
+writing a snapshot (creating the temporary file, writing it, fsyncing it,
+renaming it, fsyncing the directory, pruning old snapshots, dropping
+segments) is failed the same way. A snapshot failure is not fatal: the
+ledger keeps accepting writes, drops no segment on the strength of the
+failed snapshot, takes the next one as usual and restarts to the same state.
+Finally the power is cut on faultfs right before each of those snapshot
+steps, including between the rename and the directory fsync, where the
+rename may or may not survive and the temporary file's own entry was never
+synced. Whatever comes back opens to exactly the state acknowledged before
+the cut, takes new snapshots past the one cut short and restarts cleanly.
 
 ### Snapshots
 
