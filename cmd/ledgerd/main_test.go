@@ -159,6 +159,28 @@ func TestRunErrors(t *testing.T) {
 	stop()
 }
 
+func TestBadSecretsFailBeforeStorageIsTouched(t *testing.T) {
+	cases := map[string]map[string]string{
+		"short key":   {"LEDGERD_API_KEYS": "short"},
+		"short admin": {"LEDGERD_API_KEYS": key, "LEDGERD_ADMIN_TOKEN": "short"},
+		"admin reuse": {"LEDGERD_API_KEYS": key, "LEDGERD_ADMIN_TOKEN": key},
+	}
+	for name, e := range cases {
+		dir := filepath.Join(t.TempDir(), "data")
+		e["LEDGERD_DATA_DIR"] = dir
+		var logs bytes.Buffer
+		if err := run(context.Background(), env(e), &logs, nil); err == nil || !strings.HasPrefix(err.Error(), "api: ") {
+			t.Errorf("%s: err = %v, want an api configuration error", name, err)
+		}
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("%s: data directory was touched (stat err = %v)", name, err)
+		}
+		if logs.Len() != 0 {
+			t.Errorf("%s: unexpected log output: %s", name, logs.String())
+		}
+	}
+}
+
 func TestSnapshotsCanBeTurnedOff(t *testing.T) {
 	c, err := loadConfig(env(map[string]string{"LEDGERD_API_KEYS": "k", "LEDGERD_SNAPSHOT_EVERY": "0"}))
 	if err != nil || c.snapEvery >= 0 {

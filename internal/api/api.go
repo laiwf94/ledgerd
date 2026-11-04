@@ -68,30 +68,47 @@ type Server struct {
 }
 
 // New builds a server. It returns an error for unsafe configuration.
+// CheckSecrets reports whether the API keys and admin token are acceptable to
+// New. Callers can run it before opening storage so a bad configuration fails
+// without touching the data directory.
+func CheckSecrets(apiKeys []string, adminToken string) error {
+	if len(apiKeys) == 0 {
+		return errors.New("api: at least one API key is required")
+	}
+	for _, k := range apiKeys {
+		if len(k) < minSecretLength {
+			return fmt.Errorf("api: API keys must be at least %d characters", minSecretLength)
+		}
+	}
+	if adminToken == "" {
+		return nil
+	}
+	if len(adminToken) < minSecretLength {
+		return fmt.Errorf("api: the admin token must be at least %d characters", minSecretLength)
+	}
+	sum := sha256.Sum256([]byte(adminToken))
+	for _, k := range apiKeys {
+		other := sha256.Sum256([]byte(k))
+		if subtle.ConstantTimeCompare(sum[:], other[:]) == 1 {
+			return errors.New("api: the admin token must differ from every API key")
+		}
+	}
+	return nil
+}
+
 func New(cfg Config) (*Server, error) {
 	if cfg.Ledger == nil {
 		return nil, errors.New("api: a ledger is required")
 	}
-	if len(cfg.APIKeys) == 0 {
-		return nil, errors.New("api: at least one API key is required")
+	if err := CheckSecrets(cfg.APIKeys, cfg.AdminToken); err != nil {
+		return nil, err
 	}
 	s := &Server{l: cfg.Ledger, log: cfg.Logger, m: cfg.Metrics, timeout: cfg.Timeout, recon: make(chan struct{}, MaxConcurrentReconciles)}
 	for _, k := range cfg.APIKeys {
-		if len(k) < minSecretLength {
-			return nil, fmt.Errorf("api: API keys must be at least %d characters", minSecretLength)
-		}
 		s.keys = append(s.keys, sha256.Sum256([]byte(k)))
 	}
 	if cfg.AdminToken != "" {
-		if len(cfg.AdminToken) < minSecretLength {
-			return nil, fmt.Errorf("api: the admin token must be at least %d characters", minSecretLength)
-		}
 		sum := sha256.Sum256([]byte(cfg.AdminToken))
-		for _, k := range s.keys {
-			if subtle.ConstantTimeCompare(sum[:], k[:]) == 1 {
-				return nil, errors.New("api: the admin token must differ from every API key")
-			}
-		}
 		s.admin = &sum
 	}
 	if s.log == nil {
