@@ -131,6 +131,10 @@ func run(ctx context.Context, getenv func(string) string, logOut io.Writer, read
 	if err != nil {
 		return err
 	}
+	// Reject bad secrets before opening storage, which can take seconds to recover.
+	if err := api.CheckSecrets(cfg.apiKeys, cfg.adminToken); err != nil {
+		return err
+	}
 	log := slog.New(slog.NewJSONHandler(logOut, &slog.HandlerOptions{Level: cfg.logLevel, ReplaceAttr: utcTime}))
 	if cfg.dataDir == "" {
 		log.Warn("LEDGERD_DATA_DIR not set; the ledger lives in memory and is lost on exit")
