@@ -100,6 +100,14 @@ To check a data directory while the server is stopped (a backup or a copy works 
 $ go run ./cmd/ledgerd verify ./data          # or -json for the full report
 ```
 
+To move or restore a server, copy its whole data directory while no server
+has it open (after a stop, or after the process or machine died), run
+`ledgerd verify` on the copy (0 or 2 means every acknowledged write is
+there) and start `ledgerd` on it. Clients then retry unanswered requests
+with the same `Idempotency-Key`. A running server's directory is not a
+consistent copy. The file formats are documented in
+[docs/DESIGN.md](docs/DESIGN.md#on-disk-formats).
+
 Configuration is environment variables, listed in
 [cmd/ledgerd/main.go](cmd/ledgerd/main.go).
 
@@ -138,6 +146,7 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 | Power loss | The log and snapshots run on an in-memory file system that, on a simulated power cut, keeps what was synced plus a random selection of unsynced writes and directory changes: dropped, torn, reordered. The log survives thousands of cuts inside Open, appends, rolls, drops and legacy adoption with every acknowledged record intact; the reference-model workload survives thousands more mid-command, mid-snapshot and mid-drop, with every acknowledged command and result intact and the model agreeing on every balance. |
 | Snapshots | A snapshot plus the log after it must rebuild exactly the state (accounts, history rows, transfers, journal, expiries, idempotency results) that replaying the whole log does, across random workloads, crashes mid-snapshot, concurrent load and dropped log segments. A snapshot cut at every byte or with a flipped bit in any byte is refused, and recovery falls back to an older snapshot or the log. |
 | Segments | Every byte of a sealed segment is cut and bit-flipped and must be refused; a missing, unlisted or out-of-order segment and a damaged manifest stop startup; a crash at each step of sealing, dropping and adopting an old single-file log reopens to exactly the acknowledged records. The reference-model test runs with segments of 256 bytes to 4 KiB, so it rolls and drops segments and crashes across them. |
+| Kill and restore | The real binary is loaded by 8 concurrent clients and killed with `SIGKILL` three times, each time once it has written a snapshot and dropped segments. Its directory is copied, `ledgerd verify` must pass on the copy, and the next server runs on the copy: every acknowledged request resent with its key must replay its original answer, every balance must equal the acknowledged history, and after a clean stop the copy verifies as sound and restarts to the same balances. |
 | Offline verify | `ledgerd verify` is run on sound ledgers (with and without dropped segments), on each kind of crash debris the server repairs, and on each kind of damage it refuses: flipped bytes, missing segments, lost snapshots, a snapshot rewritten with valid checksums that disagrees with the log or breaks an invariant, and a newest snapshot the log does not mark. Each must get the right verdict, a repairable directory must then open to the same head, and verify must never change a file. |
 | Invariant checker | Every kind of damage is reported, including damage only a copy saved for the check still holds. Transfers, reservations, captures, voids, reversals and new accounts committed at every point the checker pauses must leave it reporting the head it froze and no violation, and checks run back to back under a concurrent mixed workload must all be clean. On a large ledger, commit latency during a check must stay a small fraction of the check's duration (a commit that waited for the scan fails it). |
 | Storage failures | Injected write and fsync errors, also at each step of a segment roll: the ledger stops accepting writes, keeps serving reads, and after a restart a keyed retry reports what actually reached the disk. A failure or power cut at any step of a snapshot write (including between the rename and the directory fsync) loses nothing and drops no segment early. |
@@ -176,8 +185,9 @@ about 390,000 transfers/s, and a balance-as-of read takes 0.11 µs.
 
 The design notes in [docs/DESIGN.md](docs/DESIGN.md) cover the data model,
 the writer and group commit, the log format and recovery, idempotency,
-reconciliation, the invariants, the reference-model test, limits, security
-and what would change to run this across many machines. The code is laid
+reconciliation, the invariants, the reference-model test, limits, security,
+the on-disk formats and what would change to run this across many machines.
+Changes are listed in [CHANGELOG.md](CHANGELOG.md). The code is laid
 out as follows:
 
 ```text
