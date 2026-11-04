@@ -397,6 +397,116 @@ The verdict is one of three exit codes:
 and problem; each snapshot with its head, the log record that marks it and
 whether it matched; and the replayed head and counts.
 
+### On-disk formats
+
+A data directory holds:
+
+```text
+<data>/
+  snapshot-00000000000000000041.snap       newest two snapshots, named by snapshot number
+  snapshot-00000000000000000042.snap
+  snapshot-00000000000000000043.snap.tmp   only while a snapshot is being written
+  wal/
+    LOCK                                   flock target; holds no data
+    MANIFEST                               which segments make up the log
+    MANIFEST.tmp                           only while the manifest is replaced
+    00000000000000048211.seg               sealed segment (records 48211 ...)
+    00000000000000052977.seg               newest segment, takes appends
+```
+
+Every name is fixed width, so sorting names sorts by number. All checksums
+are CRC-32C (Castagnoli); in text files they are 8 lower-case hex digits.
+
+**Segment** (`wal/<first record, 20 digits>.seg`). Text, one record per line,
+then a footer once sealed:
+
+```text
+<crc32c of json> <json record>\n          repeated
+#seal <first> <records> <bytes> <crc32c of the first <bytes> bytes> <crc32c of this line up to here>\n
+```
+
+A record is a JSON object with `"t"` naming its type and only the fields
+that type uses. Unknown fields are refused.
+
+| `t` | Fields | Written when |
+|---|---|---|
+| `header` | `v` (log format version, 1) | first record of a new log |
+| `cmd` | `time`, `cmd` (the command as accepted), `seq` (last entry it produced, if any), `id` (the ID it generated for a new transfer or reversal), `idem` (`scope`, `key`, request `hash`) if it had a key | a command is accepted |
+| `reject` | `time`, `idem`, `err` (`code`, `message`) | a command with an idempotency key is refused |
+| `expire` | `time`, `id`, `seq` | a pending transfer times out |
+| `snapshot` | `time`, `snap` (snapshot number), `seq` (journal head) | a snapshot is taken |
+
+**Manifest** (`wal/MANIFEST`). Text:
+
+```text
+ledgerd-wal 1
+<first record of each segment, oldest first, one per line>
+crc <crc32c of every line above>
+```
+
+**Snapshot** (`snapshot-<number, 20 digits>.snap`). Binary:
+
+```text
+"LDGSNAP1"
+frame*      uint32 big-endian payload length | uint32 big-endian crc32c of payload | payload
+```
+
+A payload is a run of whole items; a frame is closed once it passes 64 KiB,
+and a reader refuses one over 4 MiB. Inside items, `u` is an unsigned
+varint, `i` a signed (zig-zag) varint, `str` a `u` length then bytes, `bool`
+one byte 0 or 1, `time` a `bool` (set) then, if set, `i` Unix seconds and
+`u` nanoseconds, and `meta` a `u` count then key and value `str` pairs in key
+order. Items, in file order:
+
+| Tag | Item | Fields |
+|---|---|---|
+| `H` | header, first | `u` format version (1), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys |
+| `A` | account, by ID | `str` ID, `str` currency, `i` exponent, `str` normal balance, `bool` non-negative, `bool` non-positive, `meta`, `time` created; `i` debits posted, credits posted, debits pending, credits pending; `u` version |
+| `T` | transfer, by ID | `str` ID, state, currency; `u` posting count then per posting `str` account, `str` direction, `i` amount, posted, reversed; `str` reference, `meta`, `time` created, `time` expires, `str` reverses; `u` count then `str` reversal IDs; `u` count then per entry `u` sequence, `str` kind |
+| `E` | journal entry, by sequence from 1 | `u` sequence, `time`, `str` kind, transfer ID, currency; `u` line count then per line `str` account, `str` direction, `i` posted, `i` pending |
+| `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result); then if flagged: `str` code and message; an account as in `A` with `u` version, the four totals and `u` as-of sequence; a transfer as in `T`; finally `i` count of reservations expired |
+| `Z` | footer, alone in the last frame | `u` number of frames before it |
+
+Each format carries a version: the log's `header` record, the manifest's
+first line and the snapshot's `H` item. A reader refuses a version it does
+not know, so a changed layout must come with a new version number.
+
+### Restoring a copied directory
+
+A data directory is self-contained, so restoring a server is copying its
+directory to another place or machine and starting `ledgerd` on the copy.
+The copy must be taken while no server has the directory open (after a
+clean stop, or after the process or machine has died): the log, manifest
+and snapshots are written at different moments, so a copy taken under a
+running server can mix files from different points in time. Online backups
+come with the operations work later in the roadmap. Then:
+
+1. Run `ledgerd verify` on the copy. `0` or `2` means it holds every
+   acknowledged write; `1` means it does not, so restore an older copy.
+2. Start `ledgerd` on the copy. Startup completes any interrupted roll,
+   drop or snapshot and removes the debris.
+3. Clients retry every request that did not get an answer with the same
+   `Idempotency-Key`. A request that reached the log replays its original
+   answer; one that did not runs now. Either way it applies exactly once.
+
+The end-to-end test (`cmd/ledgerd/e2e_test.go`) does exactly this with the
+real binary. Each of three rounds runs a `ledgerd` process with 4 KiB
+segments and a snapshot every 500 records, loads it from 8 concurrent
+clients with transfers, holds that are posted or voided, and reversals, and
+sends it `SIGKILL` once it has written a new snapshot and dropped segments,
+which is usually while the next snapshot, roll or drop is in progress. The
+directory is copied, `ledgerd verify` must exit 0 or 2 on the copy, and the
+next round's server starts on the copy. That server must replay every
+acknowledged request, with the same transfer ID, when it is resent with its
+key; the request each client had in flight is resent and may be either a
+replay or new. Every account's four totals must then equal the totals
+folded from the acknowledged history, and the invariant checker must be
+clean. After the last round the copy is stopped cleanly, `verify` must
+report it sound, and a restart must give the same balances. Across runs the
+kills left torn tails, half-written snapshots, interrupted rolls, leftover
+manifests and segments an interrupted drop had not yet removed, all
+reported as repairable.
+
 ## Retrying with an idempotency key
 
 The semantics are Stripe's
