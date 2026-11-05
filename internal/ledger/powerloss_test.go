@@ -321,7 +321,7 @@ func runPowerModel(t *testing.T, seed int64, cuts int, seen map[string]int, stat
 			armed = true
 		}
 	}
-	if v := l.CheckInvariants(); len(v) > 0 {
+	if v := allChecks(l); len(v) > 0 {
 		t.Fatal(v)
 	}
 	if _, err := wal.SegmentPathsFS(fsys, dir+"/"+walDir); err != nil {

@@ -554,6 +554,50 @@ and pending change and the running balance after it. Committed transfers are
 immutable objects (a change publishes a new copy), so `GET /v1/transfers/{id}`
 hands out a pointer without copying or holding a lock while it encodes.
 
+### Secondary indexes
+
+Reads that are not by ID go through ordered secondary indexes
+(`internal/ledger/index.go`): accounts by currency and by metadata
+`key=value` pair, and transfers by state, currency, posting account,
+reference and metadata pair, plus every account and every transfer. Each
+index maps a key to an ordered set. Accounts are ordered by ID. A transfer
+is identified by the sequence number of the journal entry that created it,
+which is unique, never changes and survives restarts, so a member costs
+8 bytes and sets come out in creation order; the entry at that sequence
+names the transfer.
+
+A set is a list of sorted chunks of at most 256 keys. Appending past the
+last key, which is how transfers arrive, fills the last chunk and then
+starts a new one, so sets built in order are packed full; inserting or
+removing elsewhere moves at most one chunk's keys, a chunk that fills splits
+in two, and one that falls below a quarter full merges into a neighbour.
+
+`txn.commit` updates the indexes with everything it publishes, under the
+write lock, so a reader holding the read lock sees indexes that agree with
+the accounts and transfers. Only a transfer's state can change after it is
+created (its currency, accounts, reference and metadata are fixed), so a
+post, void or expiry moves one member between two state sets. Replay goes
+through the same commit, so the log rebuilds the indexes as it replays.
+
+Snapshots do not store the indexes: an index read from disk could not be
+trusted without checking each member against its record, which costs the
+same as building it. Loading a snapshot rebuilds them from the accounts (in
+ID order, as stored) and the transfers (in the order of the entries that
+created them), so every member is an append and nothing is sorted; the
+three groups of transfer indexes, which share no sets, are filled on three
+goroutines. On the 4-vCPU 2.1 GHz Xeon VM, rebuilding the indexes of 1
+million entries (955,224 transfers over 10,000 accounts) takes about
+0.28 s and they take 47 bytes of heap per transfer (`BenchmarkIndexes`).
+Keeping them up to date costs about 1.5% of the CPU on the in-memory
+commit path.
+
+`Ledger.CheckIndexes` compares every index with one built by a full scan.
+The tests run it wherever they check invariants (the reference model,
+crash, power-cut and recovery tests), `ledgerd verify` runs it on the
+replayed state, and verify's comparison of a snapshot with the log covers
+the indexes too. Unlike the invariant checker it holds the read lock for
+the whole scan, so it is for tests and offline checks.
+
 ## Matching a bank statement
 
 `POST /v1/accounts/{id}/reconcile` takes a CSV statement

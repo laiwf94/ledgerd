@@ -847,7 +847,7 @@ func compare(t *testing.T, round int, l *Ledger, m *model) {
 	if s := l.Stats(); s.Accounts != len(m.accts) || s.Transfers != len(m.xfers) || s.OpenPending != open {
 		t.Fatalf("round %d: stats %+v, model has %d accounts %d transfers %d open", round, s, len(m.accts), len(m.xfers), open)
 	}
-	if v := l.CheckInvariants(); len(v) > 0 {
+	if v := allChecks(l); len(v) > 0 {
 		t.Fatalf("round %d: invariants broken: %v", round, v)
 	}
 }

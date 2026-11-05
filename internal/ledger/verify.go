@@ -353,6 +353,9 @@ func stateDiff(l *Ledger, s *snapshot, st *state) string {
 	case !reflect.DeepEqual(liveExpiries(l.st), liveExpiries(st)):
 		return "the pending transfer timeouts differ"
 	}
+	if d := indexDiff(l.st.ix, st.ix); d != "" {
+		return "secondary indexes differ: " + d
+	}
 	for _, q := range s.idem {
 		e, ok := l.idem[q.id]
 		if !ok || !reflect.DeepEqual(*e, q.e) {
@@ -414,6 +417,9 @@ func (v *verifier) finish(res *passResult) {
 			for _, b := range bad {
 				v.damage("replayed state breaks an invariant: %s", b)
 			}
+		}
+		for _, b := range l.CheckIndexes() {
+			v.damage("replayed state has a bad secondary index: %s", b)
 		}
 		r.Head, r.Accounts, r.Transfers, r.OpenPending = l.st.head(), len(l.st.accounts), len(l.st.transfers), l.st.open
 	}

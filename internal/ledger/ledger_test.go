@@ -123,7 +123,7 @@ func (e *env) wantBalance(id string, posted, pending, available int64) {
 
 func (e *env) invariants() {
 	e.t.Helper()
-	if v := e.l.CheckInvariants(); len(v) > 0 {
+	if v := allChecks(e.l); len(v) > 0 {
 		e.t.Fatalf("invariants broken: %v", v)
 	}
 }

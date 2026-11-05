@@ -8,6 +8,21 @@ current formats.
 
 ## Unreleased
 
+### Listings, indexes and account lifecycle (#25)
+
+#### Added
+
+- Ordered secondary indexes of accounts (by currency and metadata pair) and
+  transfers (by state, currency, account, reference and metadata pair),
+  kept up to date on every commit and rebuilt when a snapshot loads, in
+  about 0.28 s for 1 million entries at 47 bytes per transfer.
+  `ledgerd verify` checks them against a full scan. The listing endpoints
+  that use them come later this week.
+
+#### Changed
+
+- A snapshot listing a transfer with no journal entries is refused.
+
 ### Fast recovery and storage safety (#24)
 
 #### Added
