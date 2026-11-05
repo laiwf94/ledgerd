@@ -313,8 +313,10 @@ func runPowerModel(t *testing.T, seed int64, cuts int, seen map[string]int, stat
 		release()
 
 		// Sometimes the power goes between rounds: during a snapshot still
-		// being written or segments being dropped in the background.
-		if !armed && r.Intn(6) == 0 {
+		// being written or segments being dropped in the background. Only
+		// while cuts remain, so a later round recovers from it; one armed
+		// after the last round could fire before the final checks.
+		if !armed && done < cuts && r.Intn(6) == 0 {
 			fsys.CutAfter(r.Intn(12))
 			armed = true
 		}
