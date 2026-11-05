@@ -137,6 +137,14 @@ func sameState(t testing.TB, what string, a, b *Ledger) {
 	if a.st.open != b.st.open {
 		t.Fatalf("%s: open pending %d and %d", what, a.st.open, b.st.open)
 	}
+	if d := indexDiff(a.st.ix, b.st.ix); d != "" {
+		t.Fatalf("%s: secondary indexes differ: %s", what, d)
+	}
+	for _, l := range []*Ledger{a, b} {
+		if v := checkIndexes(l.st); len(v) > 0 {
+			t.Fatalf("%s: indexes disagree with a full scan: %v", what, v)
+		}
+	}
 	if ea, eb := liveExpiries(a.st), liveExpiries(b.st); !reflect.DeepEqual(ea, eb) {
 		t.Fatalf("%s: expiry schedules differ: %v and %v", what, ea, eb)
 	}

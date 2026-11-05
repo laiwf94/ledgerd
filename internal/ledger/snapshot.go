@@ -810,6 +810,10 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 			r.fail("transfer %q appears twice or is not a valid ID", t.ID)
 			break
 		}
+		if len(t.Entries) == 0 {
+			r.fail("transfer %s lists no entries", t.ID)
+			break
+		}
 		for _, ref := range t.Entries {
 			if ref.Seq == 0 || ref.Seq > nEntries || owner[ref.Seq-1] != nil {
 				r.fail("transfer %s lists entry %d, which is out of range or listed twice", t.ID, ref.Seq)
@@ -872,6 +876,15 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 		st.entries = append(st.entries, e)
 	}
 	if r.err == nil {
+		// The indexes, rebuilt in order: the accounts went in as they were
+		// read, sorted by ID; transfers go in by the entry that created them.
+		created := make([]*Transfer, 0, len(st.transfers))
+		for k, tr := range owner {
+			if createdAt(tr) == uint64(k+1) {
+				created = append(created, tr)
+			}
+		}
+		st.ix.addTransfers(created)
 		for id, a := range st.accounts {
 			var f Balance
 			if b := folded[id]; b != nil {

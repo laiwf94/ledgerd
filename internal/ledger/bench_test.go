@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -211,4 +213,64 @@ func BenchmarkRecovery(b *testing.B) {
 			b.ReportMetric(float64(c.head), "entries")
 		})
 	}
+}
+
+// BenchmarkIndexes rebuilds the secondary indexes of a ledger of 1 million
+// journal entries the way readSnapshot does (accounts in ID order, transfers
+// in journal order, three groups of indexes in parallel) and reports the
+// heap they take per transfer.
+// The bulk-loaded transfers have no references or metadata, so each costs
+// one member in the all-transfers, state, currency and two account sets.
+//
+//	go test -run=^$ -bench=Indexes -benchtime=5x ./internal/ledger/
+func BenchmarkIndexes(b *testing.B) {
+	l, err := Open(Options{SweepInterval: -1})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer l.Close()
+	bulkLoad(b, l, 1_000_000)
+	st := l.st
+	ids := slices.Clone(st.order)
+	slices.Sort(ids)
+	// readSnapshot knows each entry's transfer without a map lookup.
+	owner := make([]*Transfer, st.head())
+	for _, tr := range st.transfers {
+		for _, ref := range tr.Entries {
+			owner[ref.Seq-1] = tr
+		}
+	}
+	rebuild := func() *indexes {
+		ix := newIndexes()
+		for _, id := range ids {
+			ix.addAccount(&st.accounts[id].Account)
+		}
+		created := make([]*Transfer, 0, len(st.transfers))
+		for k, tr := range owner {
+			if createdAt(tr) == uint64(k+1) {
+				created = append(created, tr)
+			}
+		}
+		ix.addTransfers(created)
+		return ix
+	}
+	var keep *indexes
+	var before, after runtime.MemStats
+	for b.Loop() {
+		b.StopTimer()
+		keep = nil
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		b.StartTimer()
+		keep = rebuild()
+		b.StopTimer()
+		runtime.GC()
+		runtime.ReadMemStats(&after)
+		b.StartTimer()
+	}
+	if d := indexDiff(keep, st.ix); d != "" {
+		b.Fatal(d)
+	}
+	b.ReportMetric(float64(after.HeapAlloc-before.HeapAlloc)/float64(len(st.transfers)), "heap-B/transfer")
+	b.ReportMetric(float64(len(st.transfers)), "transfers")
 }

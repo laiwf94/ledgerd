@@ -127,7 +127,7 @@ func TestCrashAtEveryByte(t *testing.T) {
 			t.Fatalf("offset %d: recovered an older state (%d) than a shorter prefix did (%d)", off, i, last)
 		}
 		last = i
-		if v := l.CheckInvariants(); len(v) > 0 {
+		if v := allChecks(l); len(v) > 0 {
 			t.Fatalf("offset %d: %v", off, v)
 		}
 	}

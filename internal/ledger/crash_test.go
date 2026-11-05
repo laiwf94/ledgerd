@@ -974,7 +974,7 @@ func runSnapshotCut(t *testing.T, seed int64, dir string, match func(op, path st
 	if got := digest(l3); got != after {
 		t.Fatalf("seed %d: reopen changed the state", seed)
 	}
-	if v := l3.CheckInvariants(); len(v) > 0 {
+	if v := allChecks(l3); len(v) > 0 {
 		t.Fatalf("seed %d: %v", seed, v)
 	}
 }
