@@ -146,6 +146,17 @@ func settle(t testing.TB, l *Ledger) {
 	l.snapIdle <- struct{}{}
 }
 
+// lastSnapshot returns the number of the newest snapshot the writer has
+// marked. It reads it while holding the snapshot token: markSnapshot writes
+// lastSnap only while the token is held, and the token comes back by a
+// channel send, so this read is ordered after the write. Even after settle
+// the writer may start one more snapshot, so a plain read would race.
+func lastSnapshot(l *Ledger) uint64 {
+	<-l.snapIdle
+	defer func() { l.snapIdle <- struct{}{} }()
+	return l.lastSnap
+}
+
 // crashSeg is one segment of a finished log, parsed.
 type crashSeg struct {
 	first  uint64
@@ -747,7 +758,7 @@ func TestSnapshotStorageFailures(t *testing.T) {
 			e.opts.Logger = slog.New(slog.NewJSONHandler(new(bytes.Buffer), nil))
 			e.open()
 			e.standard()
-			for e.l.mSegDropped.Value() == 0 || e.l.lastSnap < 3 {
+			for e.l.mSegDropped.Value() == 0 || lastSnapshot(e.l) < 3 {
 				e.do(move(dr("equity", 1), cr("alice", 1)))
 				settle(t, e.l)
 			}
@@ -948,7 +959,7 @@ func runSnapshotCut(t *testing.T, seed int64, dir string, match func(op, path st
 		}
 	}
 	settle(t, l2)
-	if l2.lastSnap <= snapNum {
+	if lastSnapshot(l2) <= snapNum {
 		t.Fatalf("seed %d: no snapshot after %d", seed, snapNum)
 	}
 	after := digest(l2)
