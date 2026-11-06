@@ -53,6 +53,10 @@ type Config struct {
 	Logger     *slog.Logger
 	Metrics    *metrics.Registry
 	Timeout    time.Duration
+	// CursorSecret signs listing cursors. When empty the signing key is
+	// derived from the API keys, so cursors survive restarts but stop
+	// working when the key set changes.
+	CursorSecret string
 }
 
 // Server is the HTTP API.
@@ -65,6 +69,7 @@ type Server struct {
 	timeout time.Duration
 	mux     *http.ServeMux
 	recon   chan struct{}
+	cursors cursorCodec
 }
 
 // New builds a server. It returns an error for unsafe configuration.
@@ -103,7 +108,11 @@ func New(cfg Config) (*Server, error) {
 	if err := CheckSecrets(cfg.APIKeys, cfg.AdminToken); err != nil {
 		return nil, err
 	}
-	s := &Server{l: cfg.Ledger, log: cfg.Logger, m: cfg.Metrics, timeout: cfg.Timeout, recon: make(chan struct{}, MaxConcurrentReconciles)}
+	if cfg.CursorSecret != "" && len(cfg.CursorSecret) < minSecretLength {
+		return nil, fmt.Errorf("api: the cursor secret must be at least %d characters", minSecretLength)
+	}
+	s := &Server{l: cfg.Ledger, log: cfg.Logger, m: cfg.Metrics, timeout: cfg.Timeout, recon: make(chan struct{}, MaxConcurrentReconciles),
+		cursors: newCursorCodec(cfg.CursorSecret, cfg.APIKeys)}
 	for _, k := range cfg.APIKeys {
 		s.keys = append(s.keys, sha256.Sum256([]byte(k)))
 	}
@@ -126,6 +135,7 @@ func New(cfg Config) (*Server, error) {
 	s.route("GET /readyz", s.readyz, authNone)
 	s.route("GET /metrics", s.metricsHandler, authKey)
 	s.route("POST /v1/accounts", s.createAccount, authKey)
+	s.route("GET /v1/accounts", s.listAccounts, authKey)
 	s.route("GET /v1/accounts/{id}", s.getAccount, authKey)
 	s.route("GET /v1/accounts/{id}/statement", s.statement, authKey)
 	s.route("POST /v1/accounts/{id}/reconcile", s.reconcile, authKey, recon.MaxBytes)

@@ -119,6 +119,7 @@ JSON bodies and an optional `Idempotency-Key` header.
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/accounts` | Open an account. |
+| `GET /v1/accounts` | List accounts in ID order with balances; `?currency=&metadata[key]=value&limit=&cursor=`. Pages carry `has_more` and an opaque, signed `next_cursor`. |
 | `GET /v1/accounts/{id}` | Account and balance; `?as_of_seq=N` for the balance after entry N. |
 | `GET /v1/accounts/{id}/statement` | Entries touching the account with running balances; `?after_seq=&limit=`. |
 | `POST /v1/accounts/{id}/reconcile` | Match a `text/csv` statement; `?window_days=&from=&to=`. Read only. |

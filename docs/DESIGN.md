@@ -598,6 +598,46 @@ replayed state, and verify's comparison of a snapshot with the log covers
 the indexes too. Unlike the invariant checker it holds the read lock for
 the whole scan, so it is for tests and offline checks.
 
+### Listing accounts
+
+`GET /v1/accounts` pages through accounts in ID order (`Ledger.ListAccounts`,
+`internal/ledger/list.go`). Filters are `currency=` and any number (up to 8)
+of `metadata[key]=value` pairs, and an account must match all of them. The
+listing walks the smallest index set that every match must be in (all
+accounts, the currency's set, or a metadata pair's set) and checks the other
+filters on each account; a filter value no account has answers at once with
+an empty page.
+
+A page is read under one read lock, so every balance on it is as of the same
+journal entry, returned as `as_of_seq`. It resumes after the last ID the
+previous page examined. Accounts are never deleted and their ID, currency
+and metadata never change, so a walk that runs while other clients write
+returns every matching account that existed when it began exactly once, in
+ID order; an account created during the walk appears if and only if its ID
+sorts after the position the walk had reached. `has_more` is exact when a
+page fills: the listing looks one match further before it answers.
+
+`limit` is 1 to 1,000 (default 100). One request examines at most
+`max(16 × limit, 4096)` candidates, so a combination of filters that rarely
+matches cannot hold the read lock for long: when the budget runs out the
+page comes back short, possibly empty, with `has_more` and a cursor to
+continue from. On the 4-vCPU 2.1 GHz Xeon VM, with 100,000 accounts, a page
+of 100 takes about 20 µs unfiltered and 17 µs by currency; two filters that
+match 100 accounts together out of 25,000 scan the full budget in about
+0.48 ms per page (`BenchmarkListAccounts`).
+
+The position is carried in an opaque cursor (`internal/api/cursor.go`): a
+version byte, the listing it belongs to, an 8-byte SHA-256 prefix of the
+canonical filter string, the position, and a 16-byte HMAC-SHA256 over all of
+it, base64url-encoded. A cursor edited by a client, used with different
+filters or for another listing, or signed with another key is refused with
+`invalid_argument`. The `limit` may change between pages. The signing key is
+`LEDGERD_CURSOR_SECRET` when it is set; otherwise it is derived from the set
+of API keys, so cursors survive restarts without more configuration and stop
+working (clients start the listing again) when the key set changes. Unknown
+or repeated query parameters are refused, so a misspelt filter is an error
+rather than a listing of everything.
+
 ## Matching a bank statement
 
 `POST /v1/accounts/{id}/reconcile` takes a CSV statement
@@ -702,6 +742,7 @@ crashes), so a passing run cannot be a vacuous one.
 | Statement CSV | 4 MiB, 10,000 lines | |
 | Reconciliation | 4 at once, period 366 days, window 31 days, 100,000 movements | Bounds memory per request. |
 | Statement page | 1,000 lines | |
+| Listing page | 1,000 accounts, 8 metadata filters, max(16 × limit, 4,096) candidates scanned | Bounds the time a listing holds the read lock. |
 | Log record | 1 MiB | The largest valid command encodes to well under this (tested). |
 | Batch | 1,024 commands per fsync | |
 | Request deadline | 5 s | A timed-out write may still commit; retry with the key to find out. |

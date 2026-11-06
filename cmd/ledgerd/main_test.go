@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -27,12 +29,12 @@ func TestLoadConfig(t *testing.T) {
 	}
 	c, err = loadConfig(env(map[string]string{"LEDGERD_API_KEYS": "k", "LEDGERD_ADDR": ":9", "LEDGERD_DATA_DIR": "/d",
 		"LEDGERD_ADMIN_TOKEN": "t", "LEDGERD_IDEMPOTENCY_TTL": "1h", "LEDGERD_MAX_BATCH": "1", "LEDGERD_LOG_LEVEL": "debug",
-		"LEDGERD_SNAPSHOT_EVERY": "500", "LEDGERD_SEGMENT_BYTES": "1048576"}))
+		"LEDGERD_SNAPSHOT_EVERY": "500", "LEDGERD_SEGMENT_BYTES": "1048576", "LEDGERD_CURSOR_SECRET": "cursor-secret-0123"}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.addr != ":9" || c.dataDir != "/d" || c.adminToken != "t" || c.idemTTL != time.Hour || c.maxBatch != 1 || c.logLevel.String() != "DEBUG" ||
-		c.snapEvery != 500 || c.segBytes != 1<<20 {
+		c.snapEvery != 500 || c.segBytes != 1<<20 || c.cursorKey != "cursor-secret-0123" {
 		t.Fatalf("overrides wrong: %+v", c)
 	}
 }
@@ -47,6 +49,7 @@ func TestLoadConfigErrors(t *testing.T) {
 		"LEDGERD_SNAPSHOT_EVERY must be":   {"LEDGERD_API_KEYS": "k", "LEDGERD_SNAPSHOT_EVERY": "-1"},
 		"LEDGERD_SEGMENT_BYTES must be":    {"LEDGERD_API_KEYS": "k", "LEDGERD_SEGMENT_BYTES": "4095"},
 		"LEDGERD_SEGMENT_BYTES must be ":   {"LEDGERD_API_KEYS": "k", "LEDGERD_SEGMENT_BYTES": "big"},
+		"LEDGERD_CURSOR_SECRET must be":    {"LEDGERD_API_KEYS": "k", "LEDGERD_CURSOR_SECRET": "short"},
 	}
 	for want, e := range cases {
 		if _, err := loadConfig(env(e)); err == nil || !strings.Contains(err.Error(), strings.TrimSpace(want)) {
@@ -185,5 +188,69 @@ func TestSnapshotsCanBeTurnedOff(t *testing.T) {
 	c, err := loadConfig(env(map[string]string{"LEDGERD_API_KEYS": "k", "LEDGERD_SNAPSHOT_EVERY": "0"}))
 	if err != nil || c.snapEvery >= 0 {
 		t.Fatalf("snapEvery = %d, %v", c.snapEvery, err)
+	}
+}
+
+// TestCursorsSurviveRestart pages through accounts across a restart: a
+// cursor signed with the key derived from the API keys still works, one
+// signed with an explicit secret works while that secret is configured, and
+// changing the secret makes old cursors fail cleanly.
+func TestCursorsSurviveRestart(t *testing.T) {
+	dir := t.TempDir()
+	e := map[string]string{"LEDGERD_API_KEYS": key, "LEDGERD_DATA_DIR": dir, "LEDGERD_ADDR": "127.0.0.1:0"}
+	addr, stop, _ := start(t, e)
+	for _, id := range []string{"a1", "a2", "a3"} {
+		if code, body := call(t, "POST", "http://"+addr+"/v1/accounts", `{"id":"`+id+`","currency":"USD","normal_balance":"debit"}`); code != 201 {
+			t.Fatalf("create %s: %d %s", id, code, body)
+		}
+	}
+	page := func(addr, cursor string) (int, map[string]any) {
+		t.Helper()
+		u := "http://" + addr + "/v1/accounts?limit=1"
+		if cursor != "" {
+			u += "&cursor=" + cursor
+		}
+		code, body := call(t, "GET", u, "")
+		var m map[string]any
+		if err := json.Unmarshal([]byte(body), &m); err != nil {
+			t.Fatalf("%s: %s", u, body)
+		}
+		return code, m
+	}
+	ids := func(m map[string]any) (out []string) {
+		for _, a := range m["accounts"].([]any) {
+			out = append(out, a.(map[string]any)["id"].(string))
+		}
+		return out
+	}
+	_, first := page(addr, "")
+	cur := first["next_cursor"].(string)
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	addr, stop, _ = start(t, e)
+	code, second := page(addr, cur)
+	if code != 200 || fmt.Sprint(ids(first), ids(second)) != "[a1] [a2]" {
+		t.Fatalf("after restart: %d %v then %v", code, ids(first), ids(second))
+	}
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	e["LEDGERD_CURSOR_SECRET"] = "cursor-secret-0123456"
+	addr, stop, _ = start(t, e)
+	if code, m := page(addr, cur); code != 400 || !strings.Contains(fmt.Sprint(m["error"]), "cursor is invalid") {
+		t.Fatalf("cursor from the old key: %d %v", code, m)
+	}
+	_, first = page(addr, "")
+	cur = first["next_cursor"].(string)
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	addr, stop, _ = start(t, e)
+	defer stop()
+	if code, m := page(addr, cur); code != 200 || fmt.Sprint(ids(m)) != "[a2]" {
+		t.Fatalf("cursor under the same secret after restart: %d %v", code, m)
 	}
 }

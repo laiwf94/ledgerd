@@ -9,6 +9,7 @@
 //	LEDGERD_DATA_DIR         directory for the log; empty keeps data in memory only
 //	LEDGERD_API_KEYS         comma-separated bearer keys, each at least 16 characters (required)
 //	LEDGERD_ADMIN_TOKEN      bearer token for /v1/admin; when unset, admin endpoints answer loopback clients only
+//	LEDGERD_CURSOR_SECRET    signs listing cursors, at least 16 characters; when unset the key is derived from LEDGERD_API_KEYS
 //	LEDGERD_IDEMPOTENCY_TTL  how long idempotency keys are kept, e.g. 24h (default 24h, at most 720h)
 //	LEDGERD_MAX_BATCH        most commands sharing one fsync (default 1024; 1 disables group commit)
 //	LEDGERD_SNAPSHOT_EVERY   log records between snapshots (default 100000; 0 disables snapshots)
@@ -53,6 +54,7 @@ type config struct {
 	dataDir    string
 	apiKeys    []string
 	adminToken string
+	cursorKey  string
 	idemTTL    time.Duration
 	maxBatch   int
 	snapEvery  int
@@ -78,6 +80,10 @@ func loadConfig(getenv func(string) string) (config, error) {
 		return c, errors.New("LEDGERD_API_KEYS is required (comma-separated, each at least 16 characters)")
 	}
 	c.adminToken = getenv("LEDGERD_ADMIN_TOKEN")
+	c.cursorKey = getenv("LEDGERD_CURSOR_SECRET")
+	if c.cursorKey != "" && len(c.cursorKey) < 16 {
+		return c, errors.New("LEDGERD_CURSOR_SECRET must be at least 16 characters")
+	}
 	if v := getenv("LEDGERD_IDEMPOTENCY_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil || d < time.Minute || d > maxIdempotencyTTL {
@@ -151,7 +157,8 @@ func run(ctx context.Context, getenv func(string) string, logOut io.Writer, read
 	log.Info("recovered", "head", stats.Head, "accounts", stats.Accounts, "transfers", stats.Transfers,
 		"open_pending", stats.OpenPending, "log_bytes", stats.LogBytes, "log_segments", stats.LogSegments, "duration_ms", time.Since(start).Milliseconds())
 
-	srv, err := api.New(api.Config{Ledger: l, APIKeys: cfg.apiKeys, AdminToken: cfg.adminToken, Logger: log, Metrics: reg})
+	srv, err := api.New(api.Config{Ledger: l, APIKeys: cfg.apiKeys, AdminToken: cfg.adminToken, CursorSecret: cfg.cursorKey,
+		Logger: log, Metrics: reg})
 	if err != nil {
 		return err
 	}

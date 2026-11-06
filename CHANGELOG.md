@@ -16,8 +16,15 @@ current formats.
   transfers (by state, currency, account, reference and metadata pair),
   kept up to date on every commit and rebuilt when a snapshot loads, in
   about 0.28 s for 1 million entries at 47 bytes per transfer.
-  `ledgerd verify` checks them against a full scan. The listing endpoints
-  that use them come later this week.
+  `ledgerd verify` checks them against a full scan.
+- `GET /v1/accounts`: accounts in ID order with their balances, filtered by
+  `currency` and `metadata[key]=value` pairs, up to 1,000 per page. Pages
+  are consistent as of one journal entry (`as_of_seq`) and stable while
+  other clients write. Cursors are opaque, bound to their filters and
+  signed with HMAC-SHA256 using `LEDGERD_CURSOR_SECRET`, or a key derived
+  from the API keys when it is unset. Each request scans a bounded number
+  of candidates, so rare filter combinations return short pages instead of
+  holding the read lock.
 
 #### Changed
 
