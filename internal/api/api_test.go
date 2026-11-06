@@ -468,11 +468,12 @@ func TestConfigValidation(t *testing.T) {
 	}
 	defer l.Close()
 	cases := map[string]Config{
-		"no ledger":   {APIKeys: []string{apiKey}},
-		"no keys":     {Ledger: l},
-		"short key":   {Ledger: l, APIKeys: []string{"short"}},
-		"short admin": {Ledger: l, APIKeys: []string{apiKey}, AdminToken: "short"},
-		"admin reuse": {Ledger: l, APIKeys: []string{apiKey}, AdminToken: apiKey},
+		"no ledger":           {APIKeys: []string{apiKey}},
+		"no keys":             {Ledger: l},
+		"short key":           {Ledger: l, APIKeys: []string{"short"}},
+		"short admin":         {Ledger: l, APIKeys: []string{apiKey}, AdminToken: "short"},
+		"admin reuse":         {Ledger: l, APIKeys: []string{apiKey}, AdminToken: apiKey},
+		"short cursor secret": {Ledger: l, APIKeys: []string{apiKey}, CursorSecret: "short"},
 	}
 	for name, c := range cases {
 		if _, err := New(c); err == nil {
