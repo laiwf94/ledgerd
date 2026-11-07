@@ -25,6 +25,12 @@ current formats.
   from the API keys when it is unset. Each request scans a bounded number
   of candidates, so rare filter combinations return short pages instead of
   holding the read lock.
+- `GET /v1/transfers`: transfers in creation order, or newest first with
+  `order=desc`, filtered by `account`, `state`, `currency`, `reference` and
+  `metadata[key]=value` pairs, with the same signed cursors (bound to the
+  order too), limits and scan budget as accounts. Filtering by `reference`
+  is a direct lookup by external reference that reads only that
+  reference's index set.
 
 #### Changed
 

@@ -117,9 +117,16 @@ func TestCanonicalFilterIsUnambiguous(t *testing.T) {
 	}
 }
 
-// listAll pages through path (a listing with its filters) and returns every
-// account ID with the number of pages.
+// listAll pages through path (an account listing with its filters) and
+// returns every account ID with the number of pages.
 func (f *fixture) listAll(path string, limit int) ([]string, int) {
+	f.t.Helper()
+	return f.listItems(path, "accounts", limit)
+}
+
+// listItems pages through path and returns the id of every object listed
+// under key with the number of pages.
+func (f *fixture) listItems(path, key string, limit int) ([]string, int) {
 	f.t.Helper()
 	sep := "?"
 	if strings.Contains(path, "?") {
@@ -136,7 +143,7 @@ func (f *fixture) listAll(path string, limit int) ([]string, int) {
 			u += "&cursor=" + url.QueryEscape(cursor)
 		}
 		m := f.must(200, "GET", u, "")
-		for _, a := range m["accounts"].([]any) {
+		for _, a := range m[key].([]any) {
 			out = append(out, a.(map[string]any)["id"].(string))
 		}
 		next, _ := m["next_cursor"].(string)

@@ -638,6 +638,43 @@ working (clients start the listing again) when the key set changes. Unknown
 or repeated query parameters are refused, so a misspelt filter is an error
 rather than a listing of everything.
 
+### Listing transfers
+
+`GET /v1/transfers` pages through transfers in the order they were created
+(`Ledger.ListTransfers`), oldest first, or newest first with `order=desc`.
+Filters are `account=` (a posting on that account), `state=` (`pending`,
+`posted`, `voided` or `expired`), `currency=`, `reference=` and up to 8
+`metadata[key]=value` pairs; a transfer must match all of them. As with
+accounts, the listing walks the smallest index set every match must be in
+and checks the other filters on each transfer, and a filter value no
+transfer has answers at once with an empty page. A page holds whole
+transfers, as `GET /v1/transfers/{id}` returns them, and `as_of_seq`.
+
+The position is the sequence number of the journal entry that created the
+last transfer the page examined, the same 8-byte key the indexes order
+transfers by. Transfers are never deleted, and only their state changes
+after they are created, so a walk returns each transfer at most once and in
+order, and returns every transfer that existed when the walk began and
+matched its filters for the whole walk. A transfer whose state changes
+mid-walk is listed if it matched when its page was read: a hold posted
+during a `state=pending` walk may be missed by both that walk and a
+`state=posted` walk that had already passed it. Posted, voided and expired
+are final states, so walks of those never miss anything. An oldest-first
+walk reaches transfers created after it began; a newest-first walk starts
+at the head when its first page is read and never does. The order picks the
+cursor's listing kind, so a cursor from one order is refused by the other,
+and leaving `order` out is the same listing as `order=asc`. Limits and the
+scan budget are the same as for accounts.
+
+`reference=` is the lookup by external reference: the walk reads only the
+reference's own index set, so finding the transfers that carry a payout or
+invoice ID costs the number of such transfers, not a statement scan of
+their accounts. On the 4-vCPU 2.1 GHz Xeon VM with 200,000 transfers among
+1,000 accounts (`BenchmarkListTransfers`), a page of 100 takes about 17 µs
+unfiltered in either order, 7 µs for one account's transfers and 14 µs for
+pending ones (one in ten); a reference carried by 20 transfers is answered
+in about 1.2 µs.
+
 ## Matching a bank statement
 
 `POST /v1/accounts/{id}/reconcile` takes a CSV statement
@@ -742,7 +779,7 @@ crashes), so a passing run cannot be a vacuous one.
 | Statement CSV | 4 MiB, 10,000 lines | |
 | Reconciliation | 4 at once, period 366 days, window 31 days, 100,000 movements | Bounds memory per request. |
 | Statement page | 1,000 lines | |
-| Listing page | 1,000 accounts, 8 metadata filters, max(16 × limit, 4,096) candidates scanned | Bounds the time a listing holds the read lock. |
+| Listing page | 1,000 accounts or transfers, 8 metadata filters, max(16 × limit, 4,096) candidates scanned | Bounds the time a listing holds the read lock. |
 | Log record | 1 MiB | The largest valid command encodes to well under this (tested). |
 | Batch | 1,024 commands per fsync | |
 | Request deadline | 5 s | A timed-out write may still commit; retry with the key to find out. |
