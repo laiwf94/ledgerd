@@ -54,10 +54,11 @@ type accountImage struct {
 	bal     Balance
 	version uint64
 	rows    []row
+	life    []statusChange
 }
 
 func image(a *account) accountImage {
-	return accountImage{bal: a.bal, version: a.version, rows: a.rows[:len(a.rows):len(a.rows)]}
+	return accountImage{bal: a.bal, version: a.version, rows: a.rows[:len(a.rows):len(a.rows)], life: a.life}
 }
 
 // keepAccount saves a's values before commit changes them for the first time
@@ -137,7 +138,10 @@ func (l *Ledger) step(name string) {
 //  5. every account's pending totals equal the open pending transfers'
 //     postings to it, and the open count matches;
 //  6. every transfer's posted and reversed amounts are consistent with its
-//     postings and its reversals.
+//     postings and its reversals;
+//  7. every account's status history follows the life-cycle rules, no entry
+//     moved money through an account while it was frozen or closed, and a
+//     closed account has a zero balance.
 //
 // It checks a frozen view of the committed state (see frozen), so commits
 // continue while it runs: they wait for at most one chunk of auditChunk
@@ -158,7 +162,31 @@ type acctCheck struct {
 	bal     Balance
 	version uint64
 	rows    []row
+	life    []statusChange
 	folded  Balance
+}
+
+// lifeProblem checks an account's status history: each change is allowed
+// from the one before, sequences never go back or past head, and
+// a closed account holds nothing. Times are not compared: the wall clock may
+// step back between batches.
+func lifeProblem(a *acctCheck, head uint64, bad func(string, ...any)) {
+	from := StatusOpen
+	var seq uint64
+	for _, c := range a.life {
+		if !validStatus(c.status) || !transitionAllowed(from, c.status) {
+			bad("account %s goes from %s to %q", a.id, from, c.status)
+			return
+		}
+		if c.seq < seq || c.seq > head {
+			bad("account %s has a status change out of order", a.id)
+			return
+		}
+		from, seq = c.status, c.seq
+	}
+	if from == StatusClosed && (a.bal.DebitsPosted != a.bal.CreditsPosted || a.bal.DebitsPending != 0 || a.bal.CreditsPending != 0) {
+		bad("account %s is closed but holds %+v", a.id, a.bal)
+	}
 }
 
 // Audit is CheckInvariants that also returns the journal head it checked.
@@ -190,7 +218,7 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 				continue
 			}
 			accts = append(accts, acctCheck{id: id, cur: a.Currency, normal: a.NormalBalance, nonNeg: a.NonNegative,
-				nonPos: a.NonPositive, bal: im.bal, version: im.version, rows: im.rows})
+				nonPos: a.NonPositive, bal: im.bal, version: im.version, rows: im.rows, life: im.life})
 		}
 		l.mu.RUnlock()
 		l.step("accounts")
@@ -277,7 +305,15 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 				bad("account %s running balance after entry %d is wrong", id, r.seq)
 				break
 			}
+			if c := statusAt(a.life, r.seq-1); c != nil {
+				k := v.entries[r.seq-1].Kind
+				if c.status == StatusClosed || (c.status == StatusFrozen && k != KindVoidPending && k != KindExpirePending) {
+					bad("account %s was %s when entry %d (%s) touched it", id, c.status, r.seq, k)
+					break
+				}
+			}
 		}
+		lifeProblem(a, v.head, bad)
 		if a.bal.DebitsPosted < 0 || a.bal.CreditsPosted < 0 || a.bal.DebitsPending < 0 || a.bal.CreditsPending < 0 {
 			bad("account %s has a negative total", id)
 		}

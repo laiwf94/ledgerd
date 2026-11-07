@@ -49,8 +49,10 @@ import (
 )
 
 const (
-	snapMagic      = "LDGSNAP1"
-	snapVersion    = 1
+	snapMagic = "LDGSNAP1"
+	// snapVersion is the format written. Version 1, which lacks account
+	// status, is still read: every account in it is open.
+	snapVersion    = 2
 	snapPrefix     = "snapshot-"
 	snapSuffix     = ".snap"
 	snapTmpSuffix  = ".tmp"
@@ -67,6 +69,10 @@ const (
 
 var snapCRC = crc32.MakeTable(crc32.Castagnoli)
 
+// snapWriteVersion is the format writeSnapshot produces. Tests set it to 1 to
+// prove older files still load.
+var snapWriteVersion uint64 = snapVersion
+
 // errSnapshot marks a snapshot file that cannot be used.
 var errSnapshot = errors.New("invalid snapshot")
 
@@ -76,6 +82,7 @@ type snapAccount struct {
 	Account
 	bal     Balance
 	version uint64
+	life    []statusChange
 }
 
 type snapIdem struct {
@@ -107,7 +114,7 @@ func (l *Ledger) capture(num uint64, now time.Time) *snapshot {
 		transfers: make([]*Transfer, 0, len(st.transfers)),
 		entries:   st.entries[:len(st.entries):len(st.entries)]}
 	for _, a := range st.accounts {
-		s.accounts = append(s.accounts, snapAccount{Account: a.Account, bal: a.bal, version: a.version})
+		s.accounts = append(s.accounts, snapAccount{Account: a.Account, bal: a.bal, version: a.version, life: a.life})
 	}
 	for _, tr := range st.transfers {
 		s.transfers = append(s.transfers, tr)
@@ -145,7 +152,7 @@ func writeSnapshot(fsys wal.FS, dir string, s *snapshot) (int64, error) {
 		fsys.Remove(tmp)
 		return 0, err
 	}
-	w := &snapWriter{w: bufio.NewWriterSize(f, 1<<20)}
+	w := &snapWriter{ver: snapWriteVersion, w: bufio.NewWriterSize(f, 1<<20)}
 	if _, err := w.w.WriteString(snapMagic); err != nil {
 		return fail(err)
 	}
@@ -234,6 +241,7 @@ func scanSnapshots(fsys wal.FS, dir string) (nums []uint64, tmps []string, err e
 
 // snapWriter frames items as they are encoded.
 type snapWriter struct {
+	ver    uint64 // format version to write
 	w      *bufio.Writer
 	buf    []byte
 	frames uint64
@@ -351,7 +359,7 @@ func (w *snapWriter) transfer(t *Transfer) {
 
 func (w *snapWriter) encode(s *snapshot) error {
 	w.tag(snapItemHeader)
-	w.u(snapVersion)
+	w.u(w.ver)
 	w.u(s.num)
 	w.u(s.head)
 	w.when(s.time)
@@ -366,6 +374,15 @@ func (w *snapWriter) encode(s *snapshot) error {
 		w.account(&a.Account)
 		w.balance(a.bal)
 		w.u(a.version)
+		if w.ver >= 2 {
+			w.u(uint64(len(a.life)))
+			for _, c := range a.life {
+				w.u(c.seq)
+				w.when(c.at)
+				w.str(string(c.status))
+				w.str(c.reason)
+			}
+		}
 		w.item()
 	}
 	for _, t := range s.transfers {
@@ -415,6 +432,11 @@ func (w *snapWriter) encode(s *snapshot) error {
 			w.u(a.Version)
 			w.balance(a.Balance.Balance)
 			w.u(a.AsOfSeq)
+			if w.ver >= 2 {
+				w.str(string(a.Status))
+				w.str(a.StatusReason)
+				w.when(a.StatusChangedAt)
+			}
 		}
 		if t := q.e.out.Transfer; t != nil {
 			w.transfer(t)
@@ -440,6 +462,7 @@ type snapReader struct {
 	p      []byte // unread part of frame
 	frames uint64
 	err    error
+	ver    uint64            // format version from the header
 	ids    map[string]string // interned account IDs
 	syms   map[string]string // interned currency codes
 
@@ -630,6 +653,46 @@ func (r *snapReader) kind() EntryKind {
 	return ""
 }
 
+var snapStatuses = []AccountStatus{StatusOpen, StatusFrozen, StatusClosed}
+
+func (r *snapReader) status() AccountStatus {
+	b := r.raw()
+	for _, s := range snapStatuses {
+		if string(b) == string(s) {
+			return s
+		}
+	}
+	r.fail("bad account status %q", b)
+	return ""
+}
+
+// life reads an account's status changes, which must follow the life-cycle
+// rules in journal order and lie within the snapshot.
+func (r *snapReader) life(id string, head uint64) []statusChange {
+	if r.ver < 2 {
+		return nil
+	}
+	n := r.count(4)
+	if n == 0 {
+		return nil
+	}
+	out := make([]statusChange, n)
+	from := StatusOpen
+	var seq uint64
+	for j := range out {
+		c := statusChange{seq: r.u(), at: r.when(), status: r.status(), reason: r.str()}
+		if r.err != nil {
+			return nil
+		}
+		if c.seq < seq || c.seq > head || !transitionAllowed(from, c.status) {
+			r.fail("account %s has a status history that breaks the life-cycle rules", id)
+			return nil
+		}
+		out[j], from, seq = c, c.status, c.seq
+	}
+	return out
+}
+
 func (r *snapReader) state() TransferState {
 	b := r.raw()
 	for _, s := range snapStates {
@@ -763,8 +826,8 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 
 	s := &snapshot{}
 	r.expect(snapItemHeader)
-	if v := r.u(); v != snapVersion && r.err == nil {
-		r.fail("format version %d is not supported", v)
+	if r.ver = r.u(); (r.ver < 1 || r.ver > snapVersion) && r.err == nil {
+		r.fail("format version %d is not supported", r.ver)
 	}
 	s.num, s.head, s.time = r.u(), r.u(), r.when()
 	nAccounts, nTransfers, nEntries, nIdem := r.u(), r.u(), r.u(), r.u()
@@ -788,6 +851,7 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 	for k := uint64(0); k < nAccounts && r.err == nil; k++ {
 		r.expect(snapItemAcct)
 		a := &account{Account: r.account(), bal: r.balance(), version: r.u()}
+		a.life = r.life(a.ID, s.head)
 		if r.err != nil {
 			break
 		}
@@ -923,6 +987,10 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 			b := r.balance()
 			as.Balance = b.View(as.NormalBalance)
 			as.AsOfSeq = r.u()
+			as.Status = StatusOpen
+			if r.ver >= 2 {
+				as.Status, as.StatusReason, as.StatusChangedAt = r.status(), r.str(), r.when()
+			}
 			q.e.out.Account = as
 		}
 		if flags&4 != 0 {

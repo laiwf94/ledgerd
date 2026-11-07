@@ -30,6 +30,10 @@ like cash at the bank, credit for wallets and revenue) and optional limits:
 `non_negative` for a wallet that can't be overdrawn, `non_positive` for its
 mirror. Each account reports a posted, pending and available balance, now or
 as of any point in the journal, plus a paged statement with running balances.
+An account can be frozen, which stops money moving through it while its
+existing holds can still be voided or expire, unfrozen again, or closed once
+its balance is zero and it holds no reservations; a closed account takes no
+more entries.
 
 A transfer has 2 to 64 postings in one currency, debits must equal credits,
 and either every posting applies or none does. Amounts are `int64` minor
@@ -120,8 +124,11 @@ JSON bodies and an optional `Idempotency-Key` header.
 |---|---|
 | `POST /v1/accounts` | Open an account. |
 | `GET /v1/accounts` | List accounts in ID order with balances; `?currency=&metadata[key]=value&limit=&cursor=`. Pages carry `has_more` and an opaque, signed `next_cursor`. |
-| `GET /v1/accounts/{id}` | Account and balance; `?as_of_seq=N` for the balance after entry N. |
+| `GET /v1/accounts/{id}` | Account, balance and `status` (`open`, `frozen`, `closed`, with `status_reason` and `status_changed_at`); `?as_of_seq=N` for both as of entry N. |
 | `GET /v1/accounts/{id}/statement` | Entries touching the account with running balances; `?after_seq=&limit=`. |
+| `POST /v1/accounts/{id}/freeze` | Freeze an open account; optional `{"reason":"..."}`. New transfers, posts of its holds and reversals that touch it get `account_frozen`; voids and expiries still apply. |
+| `POST /v1/accounts/{id}/unfreeze` | Return a frozen account to open; optional reason. |
+| `POST /v1/accounts/{id}/close` | Close an account whose posted balance is zero and that holds no reservations (else `failed_precondition`); optional reason. Final: anything touching it afterwards gets `account_closed`. |
 | `POST /v1/accounts/{id}/reconcile` | Match a `text/csv` statement; `?window_days=&from=&to=`. Read only. |
 | `POST /v1/transfers` | Create a transfer; `"pending": true` for two-phase. |
 | `GET /v1/transfers` | List transfers in creation order, `order=desc` for newest first; `?account=&state=&currency=&reference=&metadata[key]=value&limit=&cursor=`. `reference=` finds the transfers that carry an external reference. Same cursors as accounts. |
@@ -135,7 +142,8 @@ JSON bodies and an optional `Idempotency-Key` header.
 Errors look like `{"error":{"code":"limit_exceeded","message":"...","request_id":"..."}}`
 with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 `permission_denied` 403, `not_found` 404, `already_exists` / `invalid_state` /
-`transfer_expired` / `idempotency_in_progress` 409, `failed_precondition` 412,
+`transfer_expired` / `idempotency_in_progress` / `account_frozen` /
+`account_closed` 409, `failed_precondition` 412,
 `currency_mismatch` / `limit_exceeded` / `overflow` / `idempotency_key_reused` 422,
 `resource_exhausted` 429, `unavailable` 503, `deadline_exceeded` 504.
 

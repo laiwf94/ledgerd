@@ -15,6 +15,7 @@ const (
 	MaxMetadataKey     = 40
 	MaxMetadataValue   = 500
 	MaxReference       = 128
+	MaxReason          = 500
 	MaxIDLength        = 64
 	MaxIdempotencyKey  = 255
 	MaxScope           = 64
@@ -98,13 +99,23 @@ type ReverseSpec struct {
 	Metadata  map[string]string `json:"metadata,omitempty"`
 }
 
+// StatusSpec freezes, unfreezes or closes an account. Reason is free text
+// kept with the change, such as why an operator froze the account.
+type StatusSpec struct {
+	AccountID string `json:"account_id"`
+	Reason    string `json:"reason,omitempty"`
+}
+
 // Command is one state change. Exactly one field is set.
 type Command struct {
-	CreateAccount  *AccountSpec  `json:"create_account,omitempty"`
-	CreateTransfer *TransferSpec `json:"create_transfer,omitempty"`
-	Post           *PostSpec     `json:"post,omitempty"`
-	Void           *VoidSpec     `json:"void,omitempty"`
-	Reverse        *ReverseSpec  `json:"reverse,omitempty"`
+	CreateAccount   *AccountSpec  `json:"create_account,omitempty"`
+	CreateTransfer  *TransferSpec `json:"create_transfer,omitempty"`
+	Post            *PostSpec     `json:"post,omitempty"`
+	Void            *VoidSpec     `json:"void,omitempty"`
+	Reverse         *ReverseSpec  `json:"reverse,omitempty"`
+	FreezeAccount   *StatusSpec   `json:"freeze_account,omitempty"`
+	UnfreezeAccount *StatusSpec   `json:"unfreeze_account,omitempty"`
+	CloseAccount    *StatusSpec   `json:"close_account,omitempty"`
 }
 
 // Idem identifies a request for idempotency. Scope separates callers (the API
@@ -192,7 +203,8 @@ func validateCurrency(code string) *Error {
 // they reach the journal, and are not recorded for idempotency.
 func (c *Command) Validate() *Error {
 	n := 0
-	for _, set := range []bool{c.CreateAccount != nil, c.CreateTransfer != nil, c.Post != nil, c.Void != nil, c.Reverse != nil} {
+	for _, set := range []bool{c.CreateAccount != nil, c.CreateTransfer != nil, c.Post != nil, c.Void != nil, c.Reverse != nil,
+		c.FreezeAccount != nil, c.UnfreezeAccount != nil, c.CloseAccount != nil} {
 		if set {
 			n++
 		}
@@ -215,6 +227,12 @@ func (c *Command) Validate() *Error {
 			return errf(CodeInvalid, "transfer_id is not valid")
 		}
 		return nil
+	case c.FreezeAccount != nil:
+		return c.FreezeAccount.validate()
+	case c.UnfreezeAccount != nil:
+		return c.UnfreezeAccount.validate()
+	case c.CloseAccount != nil:
+		return c.CloseAccount.validate()
 	default:
 		r := c.Reverse
 		if !ValidID(r.TransferID) {
@@ -244,6 +262,16 @@ func (s *AccountSpec) validate() *Error {
 		return errf(CodeInvalid, "an account can't be both non_negative and non_positive")
 	}
 	return validateMetadata(s.Metadata)
+}
+
+func (s *StatusSpec) validate() *Error {
+	if !ValidID(s.AccountID) {
+		return errf(CodeInvalid, "account_id is not valid")
+	}
+	if !validText(s.Reason, MaxReason) {
+		return errf(CodeInvalid, "reason must be at most %d characters of printable text", MaxReason)
+	}
+	return nil
 }
 
 func (s *TransferSpec) validate() *Error {

@@ -16,6 +16,10 @@ type account struct {
 	bal     Balance
 	version uint64
 	rows    []row
+	// life lists the account's status changes, oldest first; nil while it
+	// has never left open. A new change replaces the slice, so readers may
+	// keep the old one without a lock.
+	life []statusChange
 }
 
 // state is the committed ledger. Only the writer goroutine changes it, and
@@ -142,7 +146,7 @@ func (t *txn) commit() {
 			if v != nil {
 				v.keepAccount(a)
 			}
-			a.bal, a.version = c.bal, c.version
+			a.bal, a.version, a.life = c.bal, c.version, c.life
 		} else {
 			t.st.addAccount(c)
 		}
@@ -184,6 +188,12 @@ func (t *txn) apply(c *Command, id string) (Outcome, *Error) {
 		return t.release(c.Void.TransferID, KindVoidPending, StateVoided)
 	case c.Reverse != nil:
 		return t.reverse(c.Reverse, id)
+	case c.FreezeAccount != nil:
+		return t.changeStatus(c.FreezeAccount, StatusFrozen)
+	case c.UnfreezeAccount != nil:
+		return t.changeStatus(c.UnfreezeAccount, StatusOpen)
+	case c.CloseAccount != nil:
+		return t.changeStatus(c.CloseAccount, StatusClosed)
 	}
 	return Outcome{}, errf(CodeInvalid, "empty command")
 }
@@ -204,7 +214,13 @@ func (t *txn) createAccount(s *AccountSpec) (Outcome, *Error) {
 }
 
 func (a *account) state(asOf uint64) AccountState {
-	return AccountState{Account: a.Account, Version: a.version, Balance: a.bal.View(a.NormalBalance), AsOfSeq: asOf}
+	s := AccountState{Account: a.Account, Version: a.version, Balance: a.bal.View(a.NormalBalance), AsOfSeq: asOf}
+	if n := len(a.life); n > 0 {
+		s.setStatus(&a.life[n-1])
+	} else {
+		s.Status = StatusOpen
+	}
+	return s
 }
 
 func copyMap(m map[string]string) map[string]string {
@@ -447,8 +463,8 @@ func resolve(tr *Transfer, a Amounts, limit []int64, what string) ([]int64, *Err
 }
 
 // post appends a journal entry after checking every line: the account
-// exists, has the entry's currency, no total overflows, and no balance limit
-// is crossed. Nothing changes unless every line passes.
+// exists, its status allows the entry, it has the entry's currency, no total
+// overflows, and no balance limit is crossed. Nothing changes unless every line passes.
 func (t *txn) post(kind EntryKind, transferID, currency string, lines []Line) (uint64, *Error) {
 	accts := make([]*account, len(lines))
 	next := make([]Balance, len(lines))
@@ -456,6 +472,9 @@ func (t *txn) post(kind EntryKind, transferID, currency string, lines []Line) (u
 		a, ok := t.account(ln.Account)
 		if !ok {
 			return 0, errf(CodeNotFound, "account %s does not exist", ln.Account)
+		}
+		if err := a.usable(kind); err != nil {
+			return 0, err
 		}
 		if a.Currency != currency {
 			return 0, errf(CodeCurrencyMismatch, "account %s holds %s, not %s", a.ID, a.Currency, currency)

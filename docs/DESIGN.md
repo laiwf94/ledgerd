@@ -93,6 +93,47 @@ reversal is an ordinary entry, so limits apply: refunding a merchant that has
 already paid out its balance is refused, not silently overdrawn. A reversal
 cannot itself be reversed; post a new transfer instead.
 
+### Freezing and closing accounts
+
+An account is `open`, `frozen` or `closed`. Three logged commands move it:
+
+| Command | From | To | Refused with |
+|---|---|---|---|
+| `freeze_account` | open | frozen | `invalid_state` if already frozen, `account_closed` if closed |
+| `unfreeze_account` | frozen | open | `invalid_state` if open, `account_closed` if closed |
+| `close_account` | open or frozen | closed | `failed_precondition` unless the posted balance is zero and both pending totals are zero; `account_closed` if closed |
+
+Each takes an optional `reason` (up to 500 characters of printable text),
+which the account reports with the time of the change as `status_reason`
+and `status_changed_at`.
+
+While an account is **frozen**, every entry that would move money through it
+is refused with `account_frozen`: new single-phase or pending transfers in
+either direction, posting a pending transfer that has a posting on it (in
+full or in part), and reversals that touch it. Releasing a reservation is
+not: a void or an expiry only gives back what was reserved, and blocking it
+would also lock the money of the other side of the hold. So a hold on a
+frozen account stays reserved until it is voided, expires, or the account is
+unfrozen and the hold posted. Freezing does not change the account's
+`version`, which counts journal entries; a client that needs to know the
+status reads it.
+
+**Closing** needs the account to hold nothing: posted debits equal posted
+credits and no reservation is open on either side, so no void or expiry can
+ever reach it later. A closed account can still be read, listed and have its
+statement fetched, but every command that touches it is refused with
+`account_closed`, and closing is final.
+
+A status change is not a journal entry. The account keeps every change it
+went through, oldest first, each with the journal head when it happened:
+entries up to that head came before it, entries after it came under the new
+status. A point-in-time read (`as_of_seq=N`) therefore reports the status as
+of entry N, and the invariant checker proves that no entry touched an
+account while it was frozen (other than a release) or closed. The rules are
+checked in `post`, the one place every entry passes through, so batching,
+replay and every command kind share them; a status change and the transfers
+queued behind it in the same batch apply in order.
+
 ## One writer, shared fsyncs
 
 All changes go through one writer goroutine, the way TigerBeetle runs a
@@ -460,16 +501,20 @@ order. Items, in file order:
 
 | Tag | Item | Fields |
 |---|---|---|
-| `H` | header, first | `u` format version (1), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys |
-| `A` | account, by ID | `str` ID, `str` currency, `i` exponent, `str` normal balance, `bool` non-negative, `bool` non-positive, `meta`, `time` created; `i` debits posted, credits posted, debits pending, credits pending; `u` version |
+| `H` | header, first | `u` format version (2), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys |
+| `A` | account, by ID | `str` ID, `str` currency, `i` exponent, `str` normal balance, `bool` non-negative, `bool` non-positive, `meta`, `time` created; `i` debits posted, credits posted, debits pending, credits pending; `u` version; `u` count then per status change `u` journal head, `time`, `str` status, `str` reason |
 | `T` | transfer, by ID | `str` ID, state, currency; `u` posting count then per posting `str` account, `str` direction, `i` amount, posted, reversed; `str` reference, `meta`, `time` created, `time` expires, `str` reverses; `u` count then `str` reversal IDs; `u` count then per entry `u` sequence, `str` kind |
 | `E` | journal entry, by sequence from 1 | `u` sequence, `time`, `str` kind, transfer ID, currency; `u` line count then per line `str` account, `str` direction, `i` posted, `i` pending |
-| `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result); then if flagged: `str` code and message; an account as in `A` with `u` version, the four totals and `u` as-of sequence; a transfer as in `T`; finally `i` count of reservations expired |
+| `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result); then if flagged: `str` code and message; an account as in `A` with `u` version, the four totals, `u` as-of sequence, then `str` status, `str` status reason and `time` changed; a transfer as in `T`; finally `i` count of reservations expired |
 | `Z` | footer, alone in the last frame | `u` number of frames before it |
 
 Each format carries a version: the log's `header` record, the manifest's
 first line and the snapshot's `H` item. A reader refuses a version it does
-not know, so a changed layout must come with a new version number.
+not know, so a changed layout must come with a new version number. Snapshot
+format 2 added account status; format 1 files, which lack the status fields,
+still load with every account open. New command kinds in `cmd` records keep
+the log at version 1: an older binary refuses a log holding a command it
+does not know, as an unknown field, rather than misreading it.
 
 ### Restoring a copied directory
 
@@ -716,7 +761,11 @@ a reversal. Dates are UTC.
 5. every account's pending totals equal the open pending transfers' postings
    to it, and the count of open transfers matches;
 6. every transfer's posted and reversed amounts agree with its postings and
-   its reversals.
+   its reversals;
+7. every account's status history follows the rules (open to frozen and
+   back, open or frozen to closed, never out of closed, in journal order),
+   no entry touched an account while it was closed or, other than a void or
+   expiry, while it was frozen, and a closed account holds nothing.
 
 The checker is linear in the journal size, but commits do not wait for it.
 It checks a frozen, copy-on-write view of the committed state as of the
@@ -724,7 +773,7 @@ journal head when it started, and reports that head
 (`checked_through_seq`). Taking the view costs O(1) under the write lock:
 the journal and the list of account IDs are append-only, so their prefixes
 need no copy and no lock. What a commit changes in place, an account's
-totals, version and history length, or which version of a transfer the map
+totals, version, history length and status history, or which version of a transfer the map
 points at, it first saves into the view, once per account or transfer, while
 a check runs. Committed transfers are never modified, so saving one is
 saving a pointer. The checker reads accounts and transfers through the view
@@ -772,6 +821,7 @@ crashes), so a passing run cannot be a vacuous one.
 | Metadata | 20 keys, 40-char keys, 500-char values | Stripe's per-key limits, fewer keys. |
 | IDs | 64 chars, `[A-Za-z0-9][A-Za-z0-9_.:-]*` | Safe in paths and logs. |
 | Reference | 128 chars | |
+| Status reason | 500 chars | Same as a metadata value. |
 | Idempotency key | 255 printable ASCII chars | Stripe's limit. |
 | Idempotency retention | 24 h (1 min to 30 days) | Memory is proportional to keys in the window. |
 | Pending timeout | 1 s to 30 days, default 24 h | |

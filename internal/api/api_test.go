@@ -551,6 +551,7 @@ func TestFailMapping(t *testing.T) {
 		ledger.CodeInvalid: 400, ledger.CodeNotFound: 404, ledger.CodeAlreadyExists: 409, ledger.CodeInvalidState: 409,
 		ledger.CodeExpired: 409, ledger.CodeInProgress: 409, ledger.CodePrecondition: 412, ledger.CodeCurrencyMismatch: 422,
 		ledger.CodeLimitExceeded: 422, ledger.CodeOverflow: 422, ledger.CodeKeyReused: 422, ledger.CodeUnavailable: 503, "mystery": 500,
+		ledger.CodeAccountFrozen: 409, ledger.CodeAccountClosed: 409,
 	} {
 		if got := statusOf(code); got != status {
 			t.Errorf("%s -> %d, want %d", code, got, status)
