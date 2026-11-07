@@ -38,6 +38,10 @@ type cursorKind byte
 
 const (
 	cursorAccounts cursorKind = 1
+	// Transfer listings in each order get their own kind, so a cursor from
+	// one order cannot continue the other.
+	cursorTransfers     cursorKind = 2
+	cursorTransfersDesc cursorKind = 3
 )
 
 var errBadCursor = errors.New("api: bad cursor")

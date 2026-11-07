@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/binary"
 	"net/http"
 	"net/url"
 	"strings"
@@ -118,6 +119,87 @@ func (s *Server) listAccounts(w http.ResponseWriter, r *http.Request) error {
 	if page.Next != "" {
 		resp.HasMore = true
 		resp.NextCursor = s.cursors.encode(cursorAccounts, canonicalFilter(q.filters), []byte(page.Next))
+	}
+	writeJSON(w, http.StatusOK, resp)
+	return nil
+}
+
+// transferFilterParams are the filters GET /v1/transfers takes besides
+// metadata[key].
+var transferFilterParams = map[string]bool{"account": true, "state": true, "currency": true, "reference": true}
+
+func (s *Server) listTransfers(w http.ResponseWriter, r *http.Request) error {
+	q, err := parseListQuery(r, func(name string) bool {
+		_, meta := metadataParam(name)
+		return meta || name == "order" || transferFilterParams[name]
+	})
+	if err != nil {
+		return err
+	}
+	// The order picks the cursor kind rather than joining the filters, so
+	// leaving it out and giving order=asc continue the same listing.
+	kind, desc := cursorTransfers, false
+	if o, ok := q.filters["order"]; ok {
+		switch o {
+		case "asc":
+		case "desc":
+			kind, desc = cursorTransfersDesc, true
+		default:
+			return badRequest("order must be asc or desc")
+		}
+		delete(q.filters, "order")
+	}
+	var f ledger.TransferFilter
+	for name, v := range q.filters {
+		if k, ok := metadataParam(name); ok {
+			if f.Metadata == nil {
+				f.Metadata = map[string]string{}
+			}
+			f.Metadata[k] = v
+			continue
+		}
+		if v == "" {
+			return badRequest("%s must not be empty", name)
+		}
+		switch name {
+		case "account":
+			f.Account = v
+		case "state":
+			f.State = ledger.TransferState(v)
+		case "currency":
+			f.Currency = v
+		case "reference":
+			f.Reference = v
+		}
+	}
+	var from uint64
+	if q.cursor != "" {
+		pos, err := s.position(kind, q)
+		if err != nil {
+			return err
+		}
+		// A correctly signed position is one this server encoded.
+		if len(pos) != 8 {
+			return badRequest("cursor is invalid, or was issued for a different listing or different filters")
+		}
+		from = binary.BigEndian.Uint64([]byte(pos))
+	}
+	page, err := s.l.ListTransfers(f, from, desc, q.limit)
+	if err != nil {
+		return err
+	}
+	resp := struct {
+		Transfers  []*ledger.Transfer `json:"transfers"`
+		HasMore    bool               `json:"has_more"`
+		NextCursor string             `json:"next_cursor,omitempty"`
+		AsOfSeq    uint64             `json:"as_of_seq"`
+	}{Transfers: page.Transfers, AsOfSeq: page.AsOfSeq}
+	if resp.Transfers == nil {
+		resp.Transfers = []*ledger.Transfer{}
+	}
+	if page.Next != 0 {
+		resp.HasMore = true
+		resp.NextCursor = s.cursors.encode(kind, canonicalFilter(q.filters), binary.BigEndian.AppendUint64(nil, page.Next))
 	}
 	writeJSON(w, http.StatusOK, resp)
 	return nil

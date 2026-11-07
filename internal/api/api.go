@@ -140,6 +140,7 @@ func New(cfg Config) (*Server, error) {
 	s.route("GET /v1/accounts/{id}/statement", s.statement, authKey)
 	s.route("POST /v1/accounts/{id}/reconcile", s.reconcile, authKey, recon.MaxBytes)
 	s.route("POST /v1/transfers", s.createTransfer, authKey)
+	s.route("GET /v1/transfers", s.listTransfers, authKey)
 	s.route("GET /v1/transfers/{id}", s.getTransfer, authKey)
 	s.route("POST /v1/transfers/{id}/post", s.postTransfer, authKey)
 	s.route("POST /v1/transfers/{id}/void", s.voidTransfer, authKey)

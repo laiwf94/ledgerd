@@ -124,6 +124,7 @@ JSON bodies and an optional `Idempotency-Key` header.
 | `GET /v1/accounts/{id}/statement` | Entries touching the account with running balances; `?after_seq=&limit=`. |
 | `POST /v1/accounts/{id}/reconcile` | Match a `text/csv` statement; `?window_days=&from=&to=`. Read only. |
 | `POST /v1/transfers` | Create a transfer; `"pending": true` for two-phase. |
+| `GET /v1/transfers` | List transfers in creation order, `order=desc` for newest first; `?account=&state=&currency=&reference=&metadata[key]=value&limit=&cursor=`. `reference=` finds the transfers that carry an external reference. Same cursors as accounts. |
 | `GET /v1/transfers/{id}` | A transfer with its postings, state, links and entries. |
 | `POST /v1/transfers/{id}/post` | Post a pending transfer: all, `{"amount":n}`, or per-posting amounts. |
 | `POST /v1/transfers/{id}/void` | Release a pending transfer. |
