@@ -31,10 +31,24 @@ current formats.
   order too), limits and scan budget as accounts. Filtering by `reference`
   is a direct lookup by external reference that reads only that
   reference's index set.
+- Account freeze, unfreeze and close: `POST /v1/accounts/{id}/freeze`,
+  `/unfreeze` and `/close`, logged as the new `freeze_account`,
+  `unfreeze_account` and `close_account` commands, each with an optional
+  reason. A frozen account refuses new transfers, posts of its holds and
+  reversals with `account_frozen` (409), while its holds can still be
+  voided or expire. Closing needs a zero posted balance and no open
+  reservations (`failed_precondition` otherwise) and is final; a closed
+  account refuses everything with `account_closed` (409). Accounts report
+  `status`, `status_reason` and `status_changed_at`, also as of any journal
+  entry, and the invariant checker proves no entry moved money through a
+  frozen or closed account.
 
 #### Changed
 
 - A snapshot listing a transfer with no journal entries is refused.
+- Snapshot format 2 stores each account's status history and the status in
+  stored idempotent results. Format 1 snapshots still load, with every
+  account open.
 
 ### Fast recovery and storage safety (#24)
 

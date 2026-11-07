@@ -139,6 +139,9 @@ func New(cfg Config) (*Server, error) {
 	s.route("GET /v1/accounts/{id}", s.getAccount, authKey)
 	s.route("GET /v1/accounts/{id}/statement", s.statement, authKey)
 	s.route("POST /v1/accounts/{id}/reconcile", s.reconcile, authKey, recon.MaxBytes)
+	s.route("POST /v1/accounts/{id}/freeze", s.accountStatus(func(c *ledger.Command, sp *ledger.StatusSpec) { c.FreezeAccount = sp }), authKey)
+	s.route("POST /v1/accounts/{id}/unfreeze", s.accountStatus(func(c *ledger.Command, sp *ledger.StatusSpec) { c.UnfreezeAccount = sp }), authKey)
+	s.route("POST /v1/accounts/{id}/close", s.accountStatus(func(c *ledger.Command, sp *ledger.StatusSpec) { c.CloseAccount = sp }), authKey)
 	s.route("POST /v1/transfers", s.createTransfer, authKey)
 	s.route("GET /v1/transfers", s.listTransfers, authKey)
 	s.route("GET /v1/transfers/{id}", s.getTransfer, authKey)
@@ -322,7 +325,8 @@ func statusOf(c ledger.Code) int {
 		return http.StatusBadRequest
 	case ledger.CodeNotFound:
 		return http.StatusNotFound
-	case ledger.CodeAlreadyExists, ledger.CodeInvalidState, ledger.CodeExpired, ledger.CodeInProgress:
+	case ledger.CodeAlreadyExists, ledger.CodeInvalidState, ledger.CodeExpired, ledger.CodeInProgress,
+		ledger.CodeAccountFrozen, ledger.CodeAccountClosed:
 		return http.StatusConflict
 	case ledger.CodePrecondition:
 		return http.StatusPreconditionFailed
@@ -528,6 +532,26 @@ func (s *Server) getAccount(w http.ResponseWriter, r *http.Request) error {
 	}
 	writeJSON(w, http.StatusOK, a)
 	return nil
+}
+
+// accountStatus handles freeze, unfreeze and close. The body is optional
+// and may give a reason, which is kept with the change.
+func (s *Server) accountStatus(set func(*ledger.Command, *ledger.StatusSpec)) handler {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		id, err := pathID(r)
+		if err != nil {
+			return err
+		}
+		var body struct {
+			Reason string `json:"reason,omitempty"`
+		}
+		if err := decode(r, &body, true); err != nil {
+			return err
+		}
+		var cmd ledger.Command
+		set(&cmd, &ledger.StatusSpec{AccountID: id, Reason: body.Reason})
+		return s.execute(w, r, cmd, body, http.StatusOK)
+	}
 }
 
 func (s *Server) statement(w http.ResponseWriter, r *http.Request) error {

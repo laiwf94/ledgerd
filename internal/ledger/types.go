@@ -40,6 +40,8 @@ const (
 	CodeKeyReused        Code = "idempotency_key_reused"
 	CodeInProgress       Code = "idempotency_in_progress"
 	CodeUnavailable      Code = "unavailable"
+	CodeAccountFrozen    Code = "account_frozen"
+	CodeAccountClosed    Code = "account_closed"
 )
 
 // Error is a ledger error with a stable code. Errors returned while executing
@@ -114,6 +116,17 @@ func (b Balance) View(normal Direction) BalanceView {
 	return BalanceView{Balance: b, Posted: ip - dp, Pending: iq - dq, Available: ip - (dp + dq)}
 }
 
+// AccountStatus is where an account is in its life cycle.
+type AccountStatus string
+
+// Account statuses. An account opens as open. Freezing stops money moving
+// through it until it is unfrozen; closing is final.
+const (
+	StatusOpen   AccountStatus = "open"
+	StatusFrozen AccountStatus = "frozen"
+	StatusClosed AccountStatus = "closed"
+)
+
 // AccountState is an account with its balance at some point in the journal.
 type AccountState struct {
 	Account
@@ -121,6 +134,12 @@ type AccountState struct {
 	// value to pass as an optimistic-concurrency precondition.
 	Version uint64      `json:"version"`
 	Balance BalanceView `json:"balance"`
+	// Status is the account's status as of AsOfSeq. StatusReason and
+	// StatusChangedAt describe the change that set it; both are empty while
+	// the account has never left open.
+	Status          AccountStatus `json:"status"`
+	StatusReason    string        `json:"status_reason,omitempty"`
+	StatusChangedAt time.Time     `json:"status_changed_at,omitzero"`
 	// AsOfSeq is the journal sequence the balance reflects.
 	AsOfSeq uint64 `json:"as_of_seq"`
 }
