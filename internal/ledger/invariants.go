@@ -55,10 +55,11 @@ type accountImage struct {
 	version uint64
 	rows    []row
 	life    []statusChange
+	limits  []limitChange
 }
 
 func image(a *account) accountImage {
-	return accountImage{bal: a.bal, version: a.version, rows: a.rows[:len(a.rows):len(a.rows)], life: a.life}
+	return accountImage{bal: a.bal, version: a.version, rows: a.rows[:len(a.rows):len(a.rows)], life: a.life, limits: a.limits}
 }
 
 // keepAccount saves a's values before commit changes them for the first time
@@ -134,7 +135,9 @@ func (l *Ledger) step(name string) {
 //  2. per currency, the sum of all debits equals the sum of all credits;
 //  3. every account's balance equals the fold of the journal entries that
 //     touch it, and its running balances and version agree with that fold;
-//  4. no limit-flagged account is past its limit;
+//  4. no entry took an account past the balance limit in force when it was
+//     written, or further past it than the account already was, and the
+//     account's limit history is well formed;
 //  5. every account's pending totals equal the open pending transfers'
 //     postings to it, and the open count matches;
 //  6. every transfer's posted and reversed amounts are consistent with its
@@ -157,12 +160,12 @@ type acctCheck struct {
 	id      string
 	cur     string
 	normal  Direction
-	nonNeg  bool
-	nonPos  bool
+	init    bounds // the limits the account was opened with
 	bal     Balance
 	version uint64
 	rows    []row
 	life    []statusChange
+	limits  []limitChange
 	folded  Balance
 }
 
@@ -217,8 +220,8 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 				bad("account %s is listed but missing", id)
 				continue
 			}
-			accts = append(accts, acctCheck{id: id, cur: a.Currency, normal: a.NormalBalance, nonNeg: a.NonNegative,
-				nonPos: a.NonPositive, bal: im.bal, version: im.version, rows: im.rows, life: im.life})
+			accts = append(accts, acctCheck{id: id, cur: a.Currency, normal: a.NormalBalance, init: initialBounds(&a.Account),
+				bal: im.bal, version: im.version, rows: im.rows, life: im.life, limits: im.limits})
 		}
 		l.mu.RUnlock()
 		l.step("accounts")
@@ -287,7 +290,7 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 		if a.version != uint64(len(a.rows)) {
 			bad("account %s version %d but %d entries", id, a.version, len(a.rows))
 		}
-		var run Balance
+		var run, prev Balance
 		for _, r := range a.rows {
 			if r.seq == 0 || r.seq > v.head || r.line >= len(v.entries[r.seq-1].Lines) || v.entries[r.seq-1].Lines[r.line].Account != id {
 				bad("account %s has a history row that points at the wrong entry", id)
@@ -305,6 +308,11 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 				bad("account %s running balance after entry %d is wrong", id, r.seq)
 				break
 			}
+			if err := boundsAt(a.init, a.limits, r.seq-1).check(id, a.normal, prev, run); err != nil {
+				bad("entry %d broke the limit in force on account %s: %s", r.seq, id, err.Message)
+				break
+			}
+			prev = run
 			if c := statusAt(a.life, r.seq-1); c != nil {
 				k := v.entries[r.seq-1].Kind
 				if c.status == StatusClosed || (c.status == StatusFrozen && k != KindVoidPending && k != KindExpirePending) {
@@ -318,12 +326,18 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 			bad("account %s has a negative total", id)
 		}
 
-		view := a.bal.View(a.normal)
-		if a.nonNeg && view.Available < 0 {
-			bad("account %s is non_negative but its available balance is %d", id, view.Available)
+		if limitHistoryProblem(a.limits, v.head) {
+			bad("account %s has a limit history out of order or with a bad kind or amount", id)
 		}
-		if ip, iq, dp, _ := a.bal.sides(a.normal); a.nonPos && ip+iq-dp > 0 {
-			bad("account %s is non_positive but its balance including pending is %d", id, ip+iq-dp)
+		// The balance itself, against the limits in force now and the
+		// balance after its last entry: damage to the totals alone shows
+		// here as well as in the fold.
+		var last Balance
+		if n := len(a.rows); n > 0 {
+			last = a.rows[n-1].balance
+		}
+		if err := boundsAt(a.init, a.limits, v.head).check(id, a.normal, last, a.bal); err != nil {
+			bad("account %s is past its limit: %s", id, err.Message)
 		}
 	}
 	for cur, t := range byCurrency {

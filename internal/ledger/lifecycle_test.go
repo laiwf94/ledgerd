@@ -381,7 +381,7 @@ func TestVersionOneSnapshotsLoad(t *testing.T) {
 	old := snapWriteVersion
 	snapWriteVersion = 1
 	t.Cleanup(func() { snapWriteVersion = old })
-	dir, clock := writeSmallSnapshot(t, false)
+	dir, clock := writeSmallSnapshot(t, 1)
 	snapWriteVersion = old
 	fromSnap := openAt(t, copyDir(t, dir, true), clock, nil)
 	full := openAt(t, copyDir(t, dir, false), clock, nil)

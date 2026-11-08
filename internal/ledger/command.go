@@ -106,6 +106,17 @@ type StatusSpec struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
+// LimitSpec sets one of an account's balance limits. Amount is the new limit
+// in minor units; Unlimited removes the limit instead. Exactly one of them
+// must be given, so a forgotten field never removes a limit by accident.
+type LimitSpec struct {
+	AccountID string    `json:"account_id"`
+	Kind      LimitKind `json:"kind"`
+	Amount    *int64    `json:"amount,omitempty"`
+	Unlimited bool      `json:"unlimited,omitempty"`
+	Reason    string    `json:"reason,omitempty"`
+}
+
 // Command is one state change. Exactly one field is set.
 type Command struct {
 	CreateAccount   *AccountSpec  `json:"create_account,omitempty"`
@@ -116,6 +127,7 @@ type Command struct {
 	FreezeAccount   *StatusSpec   `json:"freeze_account,omitempty"`
 	UnfreezeAccount *StatusSpec   `json:"unfreeze_account,omitempty"`
 	CloseAccount    *StatusSpec   `json:"close_account,omitempty"`
+	SetLimit        *LimitSpec    `json:"set_limit,omitempty"`
 }
 
 // Idem identifies a request for idempotency. Scope separates callers (the API
@@ -204,7 +216,7 @@ func validateCurrency(code string) *Error {
 func (c *Command) Validate() *Error {
 	n := 0
 	for _, set := range []bool{c.CreateAccount != nil, c.CreateTransfer != nil, c.Post != nil, c.Void != nil, c.Reverse != nil,
-		c.FreezeAccount != nil, c.UnfreezeAccount != nil, c.CloseAccount != nil} {
+		c.FreezeAccount != nil, c.UnfreezeAccount != nil, c.CloseAccount != nil, c.SetLimit != nil} {
 		if set {
 			n++
 		}
@@ -233,6 +245,8 @@ func (c *Command) Validate() *Error {
 		return c.UnfreezeAccount.validate()
 	case c.CloseAccount != nil:
 		return c.CloseAccount.validate()
+	case c.SetLimit != nil:
+		return c.SetLimit.validate()
 	default:
 		r := c.Reverse
 		if !ValidID(r.TransferID) {
@@ -267,6 +281,27 @@ func (s *AccountSpec) validate() *Error {
 func (s *StatusSpec) validate() *Error {
 	if !ValidID(s.AccountID) {
 		return errf(CodeInvalid, "account_id is not valid")
+	}
+	if !validText(s.Reason, MaxReason) {
+		return errf(CodeInvalid, "reason must be at most %d characters of printable text", MaxReason)
+	}
+	return nil
+}
+
+func (s *LimitSpec) validate() *Error {
+	if !ValidID(s.AccountID) {
+		return errf(CodeInvalid, "account_id is not valid")
+	}
+	if !validLimitKind(s.Kind) {
+		return errf(CodeInvalid, "kind must be overdraft or credit")
+	}
+	switch {
+	case s.Unlimited && s.Amount != nil:
+		return errf(CodeInvalid, "give amount or unlimited, not both")
+	case !s.Unlimited && s.Amount == nil:
+		return errf(CodeInvalid, "give amount, a limit in minor units, or unlimited: true to remove the limit")
+	case s.Amount != nil && *s.Amount < 0:
+		return errf(CodeInvalid, "amount must be zero or a positive number of minor units")
 	}
 	if !validText(s.Reason, MaxReason) {
 		return errf(CodeInvalid, "reason must be at most %d characters of printable text", MaxReason)

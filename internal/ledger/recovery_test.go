@@ -329,8 +329,8 @@ func TestInvariantCheckerFindsDamage(t *testing.T) {
 		"balance":   {func(st *state) { st.accounts["alice"].bal.CreditsPosted++ }, "does not match its journal"},
 		"version":   {func(st *state) { st.accounts["alice"].version++ }, "version"},
 		"entry":     {func(st *state) { st.entries[0].Lines[0].Posted++ }, "does not balance"},
-		"limit":     {func(st *state) { st.accounts["alice"].NonPositive = true }, "non_positive"},
-		"overdraft": {func(st *state) { st.accounts["alice"].bal.DebitsPending += 10_000 }, "non_negative"},
+		"limit":     {func(st *state) { st.accounts["alice"].NonPositive = true }, "may not go positive"},
+		"overdraft": {func(st *state) { st.accounts["alice"].bal.DebitsPending += 10_000 }, "may not go negative"},
 		"open":      {func(st *state) { st.open++ }, "open pending count"},
 		"reserved": {func(st *state) {
 			for id, tr := range st.transfers {

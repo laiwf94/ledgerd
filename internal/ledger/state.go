@@ -20,6 +20,9 @@ type account struct {
 	// has never left open. A new change replaces the slice, so readers may
 	// keep the old one without a lock.
 	life []statusChange
+	// limits lists the account's set_limit changes, oldest first, replaced
+	// the same way as life.
+	limits []limitChange
 }
 
 // state is the committed ledger. Only the writer goroutine changes it, and
@@ -146,7 +149,7 @@ func (t *txn) commit() {
 			if v != nil {
 				v.keepAccount(a)
 			}
-			a.bal, a.version, a.life = c.bal, c.version, c.life
+			a.bal, a.version, a.life, a.limits = c.bal, c.version, c.life, c.limits
 		} else {
 			t.st.addAccount(c)
 		}
@@ -194,6 +197,8 @@ func (t *txn) apply(c *Command, id string) (Outcome, *Error) {
 		return t.changeStatus(c.UnfreezeAccount, StatusOpen)
 	case c.CloseAccount != nil:
 		return t.changeStatus(c.CloseAccount, StatusClosed)
+	case c.SetLimit != nil:
+		return t.setLimit(c.SetLimit)
 	}
 	return Outcome{}, errf(CodeInvalid, "empty command")
 }
@@ -220,6 +225,7 @@ func (a *account) state(asOf uint64) AccountState {
 	} else {
 		s.Status = StatusOpen
 	}
+	s.Limits = limitsView(&a.Account, a.limits, asOf)
 	return s
 }
 
@@ -483,7 +489,7 @@ func (t *txn) post(kind EntryKind, transferID, currency string, lines []Line) (u
 		if err != nil {
 			return 0, err
 		}
-		if err := a.checkLimits(a.bal, nb); err != nil {
+		if err := a.bounds().check(a.ID, a.NormalBalance, a.bal, nb); err != nil {
 			return 0, err
 		}
 		accts[i], next[i] = a, nb
@@ -517,30 +523,6 @@ func (b Balance) with(ln Line) (Balance, *Error) {
 	}
 	*posted, *pending = p, q
 	return b, nil
-}
-
-// checkLimits refuses a change that takes a limit-flagged account past its
-// limit, or further past it. A change that moves the balance back towards
-// the limit is always allowed, so releasing or posting a reservation can't be
-// blocked.
-func (a *account) checkLimits(old, next Balance) *Error {
-	if a.NonNegative {
-		before, after := old.View(a.NormalBalance).Available, next.View(a.NormalBalance).Available
-		if after < 0 && after < before {
-			return errf(CodeLimitExceeded, "account %s may not go negative: available balance would be %d", a.ID, after)
-		}
-	}
-	if a.NonPositive {
-		ceiling := func(b Balance) int64 {
-			ip, iq, dp, _ := b.sides(a.NormalBalance)
-			return (ip + iq) - dp
-		}
-		before, after := ceiling(old), ceiling(next)
-		if after > 0 && after > before {
-			return errf(CodeLimitExceeded, "account %s may not go positive: balance including pending would be %d", a.ID, after)
-		}
-	}
-	return nil
 }
 
 // sweep expires every pending transfer whose timeout is at or before now.

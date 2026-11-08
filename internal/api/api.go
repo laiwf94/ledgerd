@@ -142,6 +142,8 @@ func New(cfg Config) (*Server, error) {
 	s.route("POST /v1/accounts/{id}/freeze", s.accountStatus(func(c *ledger.Command, sp *ledger.StatusSpec) { c.FreezeAccount = sp }), authKey)
 	s.route("POST /v1/accounts/{id}/unfreeze", s.accountStatus(func(c *ledger.Command, sp *ledger.StatusSpec) { c.UnfreezeAccount = sp }), authKey)
 	s.route("POST /v1/accounts/{id}/close", s.accountStatus(func(c *ledger.Command, sp *ledger.StatusSpec) { c.CloseAccount = sp }), authKey)
+	s.route("POST /v1/accounts/{id}/limits", s.setLimit, authKey)
+	s.route("GET /v1/accounts/{id}/limits", s.limits, authKey)
 	s.route("POST /v1/transfers", s.createTransfer, authKey)
 	s.route("GET /v1/transfers", s.listTransfers, authKey)
 	s.route("GET /v1/transfers/{id}", s.getTransfer, authKey)
@@ -552,6 +554,40 @@ func (s *Server) accountStatus(set func(*ledger.Command, *ledger.StatusSpec)) ha
 		set(&cmd, &ledger.StatusSpec{AccountID: id, Reason: body.Reason})
 		return s.execute(w, r, cmd, body, http.StatusOK)
 	}
+}
+
+// setLimit sets or removes one of an account's balance limits.
+func (s *Server) setLimit(w http.ResponseWriter, r *http.Request) error {
+	id, err := pathID(r)
+	if err != nil {
+		return err
+	}
+	var body struct {
+		Kind      ledger.LimitKind `json:"kind"`
+		Amount    *int64           `json:"amount,omitempty"`
+		Unlimited bool             `json:"unlimited,omitempty"`
+		Reason    string           `json:"reason,omitempty"`
+	}
+	if err := decode(r, &body, false); err != nil {
+		return err
+	}
+	cmd := ledger.Command{SetLimit: &ledger.LimitSpec{AccountID: id, Kind: body.Kind, Amount: body.Amount,
+		Unlimited: body.Unlimited, Reason: body.Reason}}
+	return s.execute(w, r, cmd, body, http.StatusOK)
+}
+
+// limits returns an account's limits and every change made to them.
+func (s *Server) limits(w http.ResponseWriter, r *http.Request) error {
+	id, err := pathID(r)
+	if err != nil {
+		return err
+	}
+	cur, changes, err := s.l.LimitHistory(id)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"account": id, "limits": cur, "changes": changes})
+	return nil
 }
 
 func (s *Server) statement(w http.ResponseWriter, r *http.Request) error {
