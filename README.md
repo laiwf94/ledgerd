@@ -28,7 +28,11 @@ $ curl -s localhost:8080/v1/accounts/alice -H "$AUTH"
 Accounts have an ISO 4217 currency, a normal balance side (debit for assets
 like cash at the bank, credit for wallets and revenue) and optional limits:
 `non_negative` for a wallet that can't be overdrawn, `non_positive` for its
-mirror. Each account reports a posted, pending and available balance, now or
+mirror. Those are the opening values of two balance limits that can be
+changed at any time as amounts: an overdraft limit (how far below zero the
+available balance may go) and a credit limit (how high the balance may go),
+each logged with the journal sequence it takes effect at and kept in a
+history. Each account reports a posted, pending and available balance, now or
 as of any point in the journal, plus a paged statement with running balances.
 An account can be frozen, which stops money moving through it while its
 existing holds can still be voided or expire, unfrozen again, or closed once
@@ -124,8 +128,10 @@ JSON bodies and an optional `Idempotency-Key` header.
 |---|---|
 | `POST /v1/accounts` | Open an account. |
 | `GET /v1/accounts` | List accounts in ID order with balances; `?currency=&metadata[key]=value&limit=&cursor=`. Pages carry `has_more` and an opaque, signed `next_cursor`. |
-| `GET /v1/accounts/{id}` | Account, balance and `status` (`open`, `frozen`, `closed`, with `status_reason` and `status_changed_at`); `?as_of_seq=N` for both as of entry N. |
+| `GET /v1/accounts/{id}` | Account, balance, `status` (`open`, `frozen`, `closed`, with `status_reason` and `status_changed_at`) and `limits` (`overdraft`, `credit`, null where none); `?as_of_seq=N` for all of them as of entry N. |
 | `GET /v1/accounts/{id}/statement` | Entries touching the account with running balances; `?after_seq=&limit=`. |
+| `POST /v1/accounts/{id}/limits` | Set one balance limit: `{"kind":"overdraft"\|"credit","amount":N}`, or `"unlimited":true` to remove it; optional reason. Takes effect from the next journal entry (`limits.effective_seq`); an account already past a lowered limit can only move back towards it. |
+| `GET /v1/accounts/{id}/limits` | The limits in force and every change made to them, oldest first. |
 | `POST /v1/accounts/{id}/freeze` | Freeze an open account; optional `{"reason":"..."}`. New transfers, posts of its holds and reversals that touch it get `account_frozen`; voids and expiries still apply. |
 | `POST /v1/accounts/{id}/unfreeze` | Return a frozen account to open; optional reason. |
 | `POST /v1/accounts/{id}/close` | Close an account whose posted balance is zero and that holds no reservations (else `failed_precondition`); optional reason. Final: anything touching it afterwards gets `account_closed`. |

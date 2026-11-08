@@ -42,6 +42,18 @@ current formats.
   `status`, `status_reason` and `status_changed_at`, also as of any journal
   entry, and the invariant checker proves no entry moved money through a
   frozen or closed account.
+- Balance limits as amounts: an overdraft limit (how far below zero the
+  available balance may go) and a credit limit (how high the balance
+  including incoming holds may go). `POST /v1/accounts/{id}/limits` logs a
+  new `set_limit` command that sets one of them or removes it
+  (`"unlimited":true`), with an optional reason; it takes effect from the
+  next journal entry, reported as `effective_seq`. `non_negative` and
+  `non_positive` are now the opening limits of 0. Lowering a limit below
+  what an account uses is allowed; the account can then only move back
+  towards it. Accounts report `limits`, also as of any journal entry, and
+  `GET /v1/accounts/{id}/limits` lists every change. The writer enforces
+  the limit in force inside the batch, and the invariant checker checks
+  every entry against the limit of its time.
 
 #### Changed
 
@@ -49,6 +61,12 @@ current formats.
 - Snapshot format 2 stores each account's status history and the status in
   stored idempotent results. Format 1 snapshots still load, with every
   account open.
+- Snapshot format 3 stores each account's limit history and the limits in
+  stored idempotent results. Format 1 and 2 snapshots still load, with the
+  limits the account flags give.
+- The invariant checker's limit check (invariant 4) now judges each entry
+  against the limit in force at its sequence instead of only the final
+  balance against the flags.
 
 ### Fast recovery and storage safety (#24)
 

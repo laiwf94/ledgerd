@@ -310,7 +310,9 @@ func TestSnapshotsArePruned(t *testing.T) {
 
 // writeSmallSnapshot builds a ledger with every kind of state and returns its
 // directory after a clean shutdown, with exactly one snapshot.
-func writeSmallSnapshot(t *testing.T, lifecycle bool) (dir string, clock *fakeClock) {
+// writeSmallSnapshot writes a ledger using what snapshot format ver can
+// hold: account status from version 2, limit changes from version 3.
+func writeSmallSnapshot(t *testing.T, ver int) (dir string, clock *fakeClock) {
 	t.Helper()
 	e := newEnv(t, true)
 	ctx := context.Background()
@@ -333,7 +335,7 @@ func writeSmallSnapshot(t *testing.T, lifecycle bool) (dir string, clock *fakeCl
 	e.do(hold(5, dr("alice", 10), cr("shop", 10)))
 	e.do(openAcct("late", "EUR", Credit))
 	e.l.Do(ctx, openAcct("late2", "EUR", Credit), key("", "acct", "acct"))
-	if lifecycle {
+	if ver >= 2 {
 		// Every status, with reasons, keyed results and a keyed refusal.
 		if _, err := e.l.Do(ctx, freezeCmd("alice", "review"), key("k3", "freeze", "freeze")); err != nil {
 			t.Fatal(err)
@@ -346,6 +348,18 @@ func writeSmallSnapshot(t *testing.T, lifecycle bool) (dir string, clock *fakeCl
 		}
 		e.l.Do(ctx, closeCmd("shop", ""), key("k3", "close-shop", "close-shop"))
 	}
+	if ver >= 3 {
+		// Limit changes of both kinds, a removal, a keyed result and a
+		// keyed refusal on the closed account.
+		if _, err := e.l.Do(ctx, limitCmd("alice", LimitOverdraft, 200, "line"), key("k4", "limit", "limit")); err != nil {
+			t.Fatal(err)
+		}
+		e.clock.Advance(time.Second)
+		e.do(limitCmd("bank", LimitCredit, 5000, ""))
+		e.do(move(dr("bank", 7), cr("shop", 7)))
+		e.do(noLimitCmd("bank", LimitCredit, "lifted"))
+		e.l.Do(ctx, limitCmd("late", LimitCredit, 1, ""), key("k4", "late", "late"))
+	}
 	e.l.Close()
 	if nums := snapshotFiles(t, e.dir); len(nums) != 1 {
 		t.Fatalf("snapshots %v", nums)
@@ -354,7 +368,7 @@ func writeSmallSnapshot(t *testing.T, lifecycle bool) (dir string, clock *fakeCl
 }
 
 func TestSnapshotRoundTripsEveryField(t *testing.T) {
-	dir, clock := writeSmallSnapshot(t, true)
+	dir, clock := writeSmallSnapshot(t, snapVersion)
 	fromSnap := openAt(t, copyDir(t, dir, true), clock, nil)
 	full := openAt(t, copyDir(t, dir, false), clock, nil)
 	sameState(t, "small", fromSnap, full)
@@ -385,6 +399,16 @@ func TestSnapshotRoundTripsEveryField(t *testing.T) {
 		if a, _ := l.Account("shop", 0); a.StatusReason != "done" {
 			t.Fatalf("shop reason %q", a.StatusReason)
 		}
+		out, err = l.Do(ctx, limitCmd("alice", LimitOverdraft, 200, "line"), key("k4", "limit", "limit"))
+		if err != nil || !out.Replayed || out.Account.Limits.Overdraft == nil || *out.Account.Limits.Overdraft != 200 || out.Account.Limits.EffectiveSeq == 0 {
+			t.Fatalf("replayed limit: %v %+v", err, out.Account)
+		}
+		if out, err := l.Do(ctx, limitCmd("late", LimitCredit, 1, ""), key("k4", "late", "late")); codeOf(err) != CodeAccountClosed || !out.Replayed {
+			t.Fatalf("replayed refused limit: %v", err)
+		}
+		if _, changes, err := l.LimitHistory("bank"); err != nil || len(changes) != 2 || changes[1].Amount != nil || changes[1].Reason != "lifted" {
+			t.Fatalf("bank limit history: %+v %v", changes, err)
+		}
 	}
 	// The expiry schedule came back: the 5 second hold expires on time.
 	clock.Advance(6 * time.Second)
@@ -395,7 +419,7 @@ func TestSnapshotRoundTripsEveryField(t *testing.T) {
 }
 
 func TestDamagedSnapshotsAreRejected(t *testing.T) {
-	dir, _ := writeSmallSnapshot(t, true)
+	dir, _ := writeSmallSnapshot(t, snapVersion)
 	path := filepath.Join(dir, snapName(1))
 	good, err := os.ReadFile(path)
 	if err != nil {
@@ -429,7 +453,7 @@ func TestDamagedSnapshotsAreRejected(t *testing.T) {
 // A damaged newest snapshot is skipped in favour of an older one or a full
 // replay, and the recovered state is the same either way.
 func TestDamagedSnapshotFallsBack(t *testing.T) {
-	dir, clock := writeSmallSnapshot(t, true)
+	dir, clock := writeSmallSnapshot(t, snapVersion)
 	l := openAt(t, dir, clock, func(o *Options) { o.SnapshotEvery = 0 })
 	if _, err := l.Do(context.Background(), move(dr("bank", 1), cr("shop", 1)), nil); err != nil {
 		t.Fatal(err)
@@ -464,7 +488,7 @@ func TestDamagedSnapshotFallsBack(t *testing.T) {
 
 // A snapshot is only trusted at the point the log says it was taken.
 func TestSnapshotWithoutItsLogRecordStopsStartup(t *testing.T) {
-	dir, _ := writeSmallSnapshot(t, true)
+	dir, _ := writeSmallSnapshot(t, snapVersion)
 	other := newEnv(t, true)
 	other.standard()
 	other.l.Close()
@@ -497,7 +521,7 @@ func TestSnapshotWithoutItsLogRecordStopsStartup(t *testing.T) {
 }
 
 func TestSnapshotLeftoversAreIgnored(t *testing.T) {
-	dir, clock := writeSmallSnapshot(t, true)
+	dir, clock := writeSmallSnapshot(t, snapVersion)
 	tmp := filepath.Join(dir, snapName(7)+snapTmpSuffix)
 	os.WriteFile(tmp, []byte("half written"), 0o600)
 	os.WriteFile(filepath.Join(dir, "snapshot-notes.txt"), []byte("x"), 0o600)

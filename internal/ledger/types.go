@@ -140,8 +140,43 @@ type AccountState struct {
 	Status          AccountStatus `json:"status"`
 	StatusReason    string        `json:"status_reason,omitempty"`
 	StatusChangedAt time.Time     `json:"status_changed_at,omitzero"`
+	// Limits are the balance limits in force as of AsOfSeq.
+	Limits Limits `json:"limits"`
 	// AsOfSeq is the journal sequence the balance reflects.
 	AsOfSeq uint64 `json:"as_of_seq"`
+}
+
+// LimitKind names one of an account's two balance limits.
+type LimitKind string
+
+// Limit kinds. See limits.go for what each bounds.
+const (
+	LimitOverdraft LimitKind = "overdraft"
+	LimitCredit    LimitKind = "credit"
+)
+
+// Limits are an account's balance limits at some point. A nil limit is not
+// set.
+type Limits struct {
+	// Overdraft is how far below zero the available balance may go.
+	Overdraft *int64 `json:"overdraft"`
+	// Credit is how high the balance including incoming pending may go.
+	Credit *int64 `json:"credit"`
+	// EffectiveSeq is the first journal entry governed by the newest
+	// set_limit change, or 0 while the limits are those the account was
+	// opened with.
+	EffectiveSeq uint64 `json:"effective_seq,omitempty"`
+}
+
+// LimitChange is one set_limit change in an account's history.
+type LimitChange struct {
+	Kind LimitKind `json:"kind"`
+	// Amount is the new limit, or nil when the change removed it.
+	Amount *int64 `json:"amount"`
+	// EffectiveSeq is the first journal entry the change governs.
+	EffectiveSeq uint64    `json:"effective_seq"`
+	Time         time.Time `json:"time"`
+	Reason       string    `json:"reason,omitempty"`
 }
 
 // TransferState is where a transfer is in its life cycle.

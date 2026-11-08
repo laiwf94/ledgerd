@@ -51,8 +51,9 @@ import (
 const (
 	snapMagic = "LDGSNAP1"
 	// snapVersion is the format written. Version 1, which lacks account
-	// status, is still read: every account in it is open.
-	snapVersion    = 2
+	// status, and version 2, which lacks limit changes, are still read:
+	// every account in them is open with the limits it was created with.
+	snapVersion    = 3
 	snapPrefix     = "snapshot-"
 	snapSuffix     = ".snap"
 	snapTmpSuffix  = ".tmp"
@@ -83,6 +84,7 @@ type snapAccount struct {
 	bal     Balance
 	version uint64
 	life    []statusChange
+	limits  []limitChange
 }
 
 type snapIdem struct {
@@ -114,7 +116,7 @@ func (l *Ledger) capture(num uint64, now time.Time) *snapshot {
 		transfers: make([]*Transfer, 0, len(st.transfers)),
 		entries:   st.entries[:len(st.entries):len(st.entries)]}
 	for _, a := range st.accounts {
-		s.accounts = append(s.accounts, snapAccount{Account: a.Account, bal: a.bal, version: a.version, life: a.life})
+		s.accounts = append(s.accounts, snapAccount{Account: a.Account, bal: a.bal, version: a.version, life: a.life, limits: a.limits})
 	}
 	for _, tr := range st.transfers {
 		s.transfers = append(s.transfers, tr)
@@ -291,6 +293,15 @@ func (w *snapWriter) when(t time.Time) {
 	w.u(uint64(t.Nanosecond()))
 }
 
+// limit writes a limit amount, -1 for none.
+func (w *snapWriter) limit(p *int64) {
+	if p == nil {
+		w.i(noLimit)
+	} else {
+		w.i(*p)
+	}
+}
+
 func boolByte(b bool) byte {
 	if b {
 		return 1
@@ -383,6 +394,16 @@ func (w *snapWriter) encode(s *snapshot) error {
 				w.str(c.reason)
 			}
 		}
+		if w.ver >= 3 {
+			w.u(uint64(len(a.limits)))
+			for _, c := range a.limits {
+				w.u(c.seq)
+				w.when(c.at)
+				w.str(string(c.kind))
+				w.i(c.amount)
+				w.str(c.reason)
+			}
+		}
 		w.item()
 	}
 	for _, t := range s.transfers {
@@ -436,6 +457,11 @@ func (w *snapWriter) encode(s *snapshot) error {
 				w.str(string(a.Status))
 				w.str(a.StatusReason)
 				w.when(a.StatusChangedAt)
+			}
+			if w.ver >= 3 {
+				w.limit(a.Limits.Overdraft)
+				w.limit(a.Limits.Credit)
+				w.u(a.Limits.EffectiveSeq)
 			}
 		}
 		if t := q.e.out.Transfer; t != nil {
@@ -693,6 +719,39 @@ func (r *snapReader) life(id string, head uint64) []statusChange {
 	return out
 }
 
+// limits reads an account's limit changes, which must be in journal order
+// within the snapshot, with known kinds and amounts.
+func (r *snapReader) limits(id string, head uint64) []limitChange {
+	if r.ver < 3 {
+		return nil
+	}
+	n := r.count(5)
+	if n == 0 {
+		return nil
+	}
+	out := make([]limitChange, n)
+	for j := range out {
+		out[j] = limitChange{seq: r.u(), at: r.when(), kind: LimitKind(r.sym()), amount: r.i(), reason: r.str()}
+		if r.err != nil {
+			return nil
+		}
+	}
+	if limitHistoryProblem(out, head) {
+		r.fail("account %s has a limit history out of order or with a bad kind or amount", id)
+		return nil
+	}
+	return out
+}
+
+// limit reads a limit amount written by snapWriter.limit.
+func (r *snapReader) limit() *int64 {
+	v := r.i()
+	if v < noLimit {
+		r.fail("bad limit amount %d", v)
+	}
+	return limitPtr(v)
+}
+
 func (r *snapReader) state() TransferState {
 	b := r.raw()
 	for _, s := range snapStates {
@@ -852,6 +911,7 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 		r.expect(snapItemAcct)
 		a := &account{Account: r.account(), bal: r.balance(), version: r.u()}
 		a.life = r.life(a.ID, s.head)
+		a.limits = r.limits(a.ID, s.head)
 		if r.err != nil {
 			break
 		}
@@ -990,6 +1050,11 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 			as.Status = StatusOpen
 			if r.ver >= 2 {
 				as.Status, as.StatusReason, as.StatusChangedAt = r.status(), r.str(), r.when()
+			}
+			if r.ver >= 3 {
+				as.Limits = Limits{Overdraft: r.limit(), Credit: r.limit(), EffectiveSeq: r.u()}
+			} else {
+				as.Limits = limitsView(&as.Account, nil, 0)
 			}
 			q.e.out.Account = as
 		}

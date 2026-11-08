@@ -42,6 +42,7 @@ func (l *Ledger) Account(id string, asOf uint64) (AccountState, error) {
 	}
 	st.Balance = b.View(a.NormalBalance)
 	st.setStatus(statusAt(a.life, asOf))
+	st.Limits = limitsView(&a.Account, a.limits, asOf)
 	return st, nil
 }
 

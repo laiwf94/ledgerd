@@ -47,9 +47,11 @@ raise it: money is spendable once it arrives, not when it is promised.
 Of the limit flags, `non_negative` refuses any entry that would take
 `available` below zero (TigerBeetle's `debits_must_not_exceed_credits` on a
 credit-normal account). `non_positive` refuses any entry that would take
-`posted + incoming pending` above zero. A change that moves the balance
-*towards* the limit is always allowed, so posting, voiding or expiring a
-reservation can never be blocked by a limit.
+`posted + incoming pending` above zero. They are the limits an account
+opens with; [balance limits](#balance-limits) can raise, lower or remove
+them later as amounts. A change that moves the balance *towards* the limit
+is always allowed, so posting, voiding or expiring a reservation can never
+be blocked by a limit.
 
 A transfer is the business object a client
 creates; journal entries are the immutable records of what happened to it.
@@ -133,6 +135,49 @@ account while it was frozen (other than a release) or closed. The rules are
 checked in `post`, the one place every entry passes through, so batching,
 replay and every command kind share them; a status change and the transfers
 queued behind it in the same batch apply in order.
+
+### Balance limits
+
+An account has two limits, each an amount in minor units or none, both
+measured on the account's normal side:
+
+| Limit | Bounds | Opens at |
+|---|---|---|
+| overdraft `O` | `available` may not go below `-O` (outgoing reservations count) | 0 with `non_negative`, else none |
+| credit `C` | `posted + incoming pending` may not go above `C` | 0 with `non_positive`, else none |
+
+An overdraft limit is a wallet or current account that may go into the red
+by up to `O`; a credit limit caps what a debit-normal receivable (a card or
+loan balance) may reach, or what a wallet may hold. An account may have
+both, bounding its balance on both sides.
+
+The `set_limit` command (`POST /v1/accounts/{id}/limits` with
+`{"kind":"overdraft"|"credit","amount":N}`, or `"unlimited":true` to remove
+the limit, and an optional `reason`) changes one of them. One of `amount`
+and `unlimited` must be given, so a missing field never removes a limit by
+accident. Like a status change it is logged, writes no journal entry and
+does not change `version`; it is refused with `account_closed` on a closed
+account and allowed on a frozen one. The account keeps every change with
+the journal head it happened at; a change made at head N has **effective
+sequence** N+1: it governs entry N+1 onwards, and a point-in-time read as of
+entry N or later reports it. Accounts report their limits as
+`limits: {"overdraft", "credit", "effective_seq"}` (null where none is set;
+`effective_seq` is that of the newest change, absent while the account has
+its opening limits), and `GET /v1/accounts/{id}/limits` returns the limits
+with every change: kind, amount (null when removed), effective sequence,
+time and reason.
+
+The rule an entry must pass is the same at every moment: it may not take
+the balance past the limit in force, nor further past it than it already
+was. Lowering a limit below what an account already uses is therefore
+allowed, as when a credit line is cut: the account is over its limit and
+can only move back towards it (money in, a hold posted for less or voided)
+until it is within it again. The check runs in `post`, inside the writer, on
+the balance as it stands after every earlier command in the batch, so a
+limit change and the transfers queued around it apply in order and two
+spends can never both pass against the same headroom. The invariant
+checker applies the same rule to every account's history: each entry,
+against the balance before it and the limits in force at its sequence.
 
 ## One writer, shared fsyncs
 
@@ -501,18 +546,19 @@ order. Items, in file order:
 
 | Tag | Item | Fields |
 |---|---|---|
-| `H` | header, first | `u` format version (2), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys |
-| `A` | account, by ID | `str` ID, `str` currency, `i` exponent, `str` normal balance, `bool` non-negative, `bool` non-positive, `meta`, `time` created; `i` debits posted, credits posted, debits pending, credits pending; `u` version; `u` count then per status change `u` journal head, `time`, `str` status, `str` reason |
+| `H` | header, first | `u` format version (3), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys |
+| `A` | account, by ID | `str` ID, `str` currency, `i` exponent, `str` normal balance, `bool` non-negative, `bool` non-positive, `meta`, `time` created; `i` debits posted, credits posted, debits pending, credits pending; `u` version; `u` count then per status change `u` journal head, `time`, `str` status, `str` reason; `u` count then per limit change `u` journal head, `time`, `str` kind, `i` amount (-1 for none), `str` reason |
 | `T` | transfer, by ID | `str` ID, state, currency; `u` posting count then per posting `str` account, `str` direction, `i` amount, posted, reversed; `str` reference, `meta`, `time` created, `time` expires, `str` reverses; `u` count then `str` reversal IDs; `u` count then per entry `u` sequence, `str` kind |
 | `E` | journal entry, by sequence from 1 | `u` sequence, `time`, `str` kind, transfer ID, currency; `u` line count then per line `str` account, `str` direction, `i` posted, `i` pending |
-| `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result); then if flagged: `str` code and message; an account as in `A` with `u` version, the four totals, `u` as-of sequence, then `str` status, `str` status reason and `time` changed; a transfer as in `T`; finally `i` count of reservations expired |
+| `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result); then if flagged: `str` code and message; an account as in `A` with `u` version, the four totals, `u` as-of sequence, then `str` status, `str` status reason and `time` changed, then `i` overdraft and credit limits (-1 for none) and `u` effective sequence; a transfer as in `T`; finally `i` count of reservations expired |
 | `Z` | footer, alone in the last frame | `u` number of frames before it |
 
 Each format carries a version: the log's `header` record, the manifest's
 first line and the snapshot's `H` item. A reader refuses a version it does
 not know, so a changed layout must come with a new version number. Snapshot
-format 2 added account status; format 1 files, which lack the status fields,
-still load with every account open. New command kinds in `cmd` records keep
+format 2 added account status and format 3 limit changes; format 1 and 2
+files, which lack those fields, still load with every account open and at
+the limits its flags give. New command kinds in `cmd` records keep
 the log at version 1: an older binary refuses a log holding a command it
 does not know, as an unknown field, rather than misreading it.
 
@@ -757,7 +803,11 @@ a reversal. Dates are UTC.
 2. per currency, total debits equal total credits across all accounts;
 3. every account's totals equal the fold of the entries that touch it, and
    its running balances and version agree with that fold;
-4. no limit-flagged account is past its limit;
+4. no entry took an account past the balance limit in force at its
+   sequence, or further past it than the account already was; every
+   limit history is in journal order with known kinds and amounts; and the
+   account's totals are not past its current limit beyond where its last
+   entry left them;
 5. every account's pending totals equal the open pending transfers' postings
    to it, and the count of open transfers matches;
 6. every transfer's posted and reversed amounts agree with its postings and
@@ -773,7 +823,7 @@ journal head when it started, and reports that head
 (`checked_through_seq`). Taking the view costs O(1) under the write lock:
 the journal and the list of account IDs are append-only, so their prefixes
 need no copy and no lock. What a commit changes in place, an account's
-totals, version, history length and status history, or which version of a transfer the map
+totals, version, history length, status history and limit history, or which version of a transfer the map
 points at, it first saves into the view, once per account or transfer, while
 a check runs. Committed transfers are never modified, so saving one is
 saving a pointer. The checker reads accounts and transfers through the view
@@ -821,7 +871,8 @@ crashes), so a passing run cannot be a vacuous one.
 | Metadata | 20 keys, 40-char keys, 500-char values | Stripe's per-key limits, fewer keys. |
 | IDs | 64 chars, `[A-Za-z0-9][A-Za-z0-9_.:-]*` | Safe in paths and logs. |
 | Reference | 128 chars | |
-| Status reason | 500 chars | Same as a metadata value. |
+| Status and limit reason | 500 chars | Same as a metadata value. |
+| Balance limit | 0 to 2^63-1 minor units, or none | |
 | Idempotency key | 255 printable ASCII chars | Stripe's limit. |
 | Idempotency retention | 24 h (1 min to 30 days) | Memory is proportional to keys in the window. |
 | Pending timeout | 1 s to 30 days, default 24 h | |
