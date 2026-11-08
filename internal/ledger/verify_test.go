@@ -1,6 +1,7 @@
 package ledger
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -25,6 +26,14 @@ func verifyFixture(t *testing.T, segBytes int64) (string, *fakeClock) {
 		o.SnapshotEvery, o.SegmentBytes, o.NewID = 30, segBytes, seqIDs()
 	})
 	randomWorkload(t, l, clock, rand.New(rand.NewSource(7)), 300)
+	// Whatever the random workload left, the fixture holds an open
+	// reservation, on accounts of its own so no freeze or close blocks it.
+	for _, c := range []Command{openAcct("fx_src", "USD", Debit), openAcct("fx_dst", "USD", Credit),
+		hold(3600, dr("fx_src", 5), cr("fx_dst", 5))} {
+		if _, err := l.Do(context.Background(), c, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
 	}

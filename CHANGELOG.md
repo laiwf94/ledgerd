@@ -68,6 +68,18 @@ current formats.
   against the limit in force at its sequence instead of only the final
   balance against the flags.
 
+#### Tests
+
+- The reference model covers freeze, unfreeze, close and `set_limit`,
+  accounts with metadata and transfers with references and metadata. After
+  every round it checks every account's status, limits and limit history,
+  a point-in-time read, and walks of both listings across every kind of
+  filter, both orders and changing page sizes against its own answers.
+  Eight broken-index variants must each be caught by those walks alone.
+- `FuzzCreateTransfer` also posts its input to the freeze, unfreeze, close
+  and limit endpoints and checks the indexes; the new `FuzzListQuery`
+  fuzzes listing query strings and follows every cursor. CI runs both.
+
 ### Fast recovery and storage safety (#24)
 
 #### Added

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -635,6 +636,10 @@ func FuzzCreateTransfer(f *testing.F) {
 	f.Add(`{"currency":"USD","pending":true,"timeout_seconds":5,"postings":[]}`)
 	f.Add(`{"postings":[{"amount":1e400}]}`)
 	f.Add(`[]`)
+	f.Add(`{"reason":"chargeback review"}`)
+	f.Add(`{"kind":"overdraft","amount":500}`)
+	f.Add(`{"kind":"credit","unlimited":true,"reason":"line removed"}`)
+	f.Add(`{"kind":"credit","amount":-1,"unlimited":true}`)
 	l, err := ledger.Open(ledger.Options{SweepInterval: -1})
 	if err != nil {
 		f.Fatal(err)
@@ -643,12 +648,17 @@ func FuzzCreateTransfer(f *testing.F) {
 	ctx := context.Background()
 	l.Do(ctx, ledger.Command{CreateAccount: &ledger.AccountSpec{ID: "a", Currency: "USD", NormalBalance: ledger.Debit}}, nil)
 	l.Do(ctx, ledger.Command{CreateAccount: &ledger.AccountSpec{ID: "b", Currency: "USD", NormalBalance: ledger.Credit, NonNegative: true}}, nil)
+	// z is the account the lifecycle endpoints work on, so a close leaves
+	// a and b free to move money for later inputs.
+	l.Do(ctx, ledger.Command{CreateAccount: &ledger.AccountSpec{ID: "z", Currency: "USD", NormalBalance: ledger.Credit}}, nil)
 	s, err := New(Config{Ledger: l, APIKeys: []string{apiKey}})
 	if err != nil {
 		f.Fatal(err)
 	}
 	f.Fuzz(func(t *testing.T, body string) {
-		for _, path := range []string{"/v1/transfers", "/v1/accounts", "/v1/transfers/tr_x/reverse"} {
+		for _, path := range []string{"/v1/transfers", "/v1/accounts", "/v1/transfers/tr_x/reverse",
+			"/v1/accounts/b/limits", "/v1/accounts/z/freeze", "/v1/accounts/z/limits", "/v1/accounts/z/unfreeze",
+			"/v1/accounts/z/close", "/v1/accounts/missing/freeze"} {
 			req := httptest.NewRequest("POST", path, strings.NewReader(body))
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 			req.Header.Set("Content-Type", "application/json")
@@ -661,8 +671,134 @@ func FuzzCreateTransfer(f *testing.F) {
 				t.Fatalf("%s %q: response is not JSON", path, body)
 			}
 		}
-		if v := l.CheckInvariants(); len(v) > 0 {
+		if v := append(l.CheckInvariants(), l.CheckIndexes()...); len(v) > 0 {
 			t.Fatalf("invariants broken after %q: %v", body, v)
+		}
+	})
+}
+
+// FuzzListQuery sends arbitrary query strings to both listings and follows
+// every cursor they hand out. No query may cause a server error or a
+// response that is not JSON, a listing must never repeat or reorder what it
+// lists across pages, and a walk must end.
+func FuzzListQuery(f *testing.F) {
+	for _, q := range []string{"", "limit=1", "currency=USD&limit=2", "metadata[tier]=gold", "metadata%5Btier%5D=gold&currency=USD",
+		"account=a&order=desc&limit=1", "state=pending", "reference=inv%2F1", "metadata[kind]=fee&state=posted",
+		"order=sideways", "limit=0", "limit=1001", "cursor=AAAA", "currency=", "metadata[]=x", "state=pending&state=posted",
+		"%zz", "account=" + strings.Repeat("x", 70)} {
+		f.Add(q)
+	}
+	l, err := ledger.Open(ledger.Options{SweepInterval: -1})
+	if err != nil {
+		f.Fatal(err)
+	}
+	defer l.Close()
+	ctx := context.Background()
+	do := func(c ledger.Command) {
+		if _, err := l.Do(ctx, c, nil); err != nil {
+			f.Fatal(err)
+		}
+	}
+	for i, id := range []string{"a", "b", "c", "d", "e"} {
+		meta := map[string]string{"tier": []string{"gold", "silver"}[i%2]}
+		if i == 4 {
+			meta = nil
+		}
+		do(ledger.Command{CreateAccount: &ledger.AccountSpec{ID: id, Currency: "USD", NormalBalance: ledger.Credit, Metadata: meta}})
+	}
+	do(ledger.Command{CreateAccount: &ledger.AccountSpec{ID: "eur", Currency: "EUR", NormalBalance: ledger.Credit}})
+	var holds []string
+	for i := 0; i < 24; i++ {
+		spec := &ledger.TransferSpec{Currency: "USD", Pending: i%3 == 0,
+			Postings: []ledger.PostingSpec{{Account: []string{"a", "b", "c"}[i%3], Direction: ledger.Debit, Amount: int64(1 + i)},
+				{Account: []string{"d", "e"}[i%2], Direction: ledger.Credit, Amount: int64(1 + i)}}}
+		if spec.Pending {
+			spec.TimeoutSeconds = 3600
+		}
+		if i%4 == 0 {
+			spec.Reference = fmt.Sprintf("inv/%d", i%8)
+		}
+		if i%5 == 0 {
+			spec.Metadata = map[string]string{"kind": "fee"}
+		}
+		out, err := l.Do(ctx, ledger.Command{CreateTransfer: spec}, nil)
+		if err != nil {
+			f.Fatal(err)
+		}
+		if spec.Pending {
+			holds = append(holds, out.Transfer.ID)
+		}
+	}
+	do(ledger.Command{Post: &ledger.PostSpec{TransferID: holds[0]}})
+	do(ledger.Command{Void: &ledger.VoidSpec{TransferID: holds[1]}})
+	do(ledger.Command{FreezeAccount: &ledger.StatusSpec{AccountID: "c"}})
+	s, err := New(Config{Ledger: l, APIKeys: []string{apiKey}})
+	if err != nil {
+		f.Fatal(err)
+	}
+	get := func(t *testing.T, path string) (int, []byte) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.URL.Path, req.URL.RawQuery, _ = strings.Cut(path, "?")
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, req)
+		if w.Code >= 500 {
+			t.Fatalf("GET %s: %d %s", path, w.Code, w.Body.String())
+		}
+		if !json.Valid(w.Body.Bytes()) {
+			t.Fatalf("GET %s: response is not JSON", path)
+		}
+		return w.Code, w.Body.Bytes()
+	}
+	f.Fuzz(func(t *testing.T, query string) {
+		for _, listing := range []string{"/v1/accounts", "/v1/transfers"} {
+			path := listing + "?" + query
+			var seen []string
+			for pages := 0; ; pages++ {
+				if pages > 200 {
+					t.Fatalf("GET %s: the walk never ended", listing+"?"+query)
+				}
+				code, body := get(t, path)
+				if code != http.StatusOK {
+					break
+				}
+				var page struct {
+					Accounts   []struct{ ID string }
+					Transfers  []struct{ ID string }
+					HasMore    bool   `json:"has_more"`
+					NextCursor string `json:"next_cursor"`
+				}
+				if err := json.Unmarshal(body, &page); err != nil {
+					t.Fatalf("GET %s: %v", path, err)
+				}
+				for _, it := range append(page.Accounts, page.Transfers...) {
+					seen = append(seen, it.ID)
+				}
+				if page.HasMore != (page.NextCursor != "") {
+					t.Fatalf("GET %s: has_more %v with cursor %q", path, page.HasMore, page.NextCursor)
+				}
+				if !page.HasMore {
+					break
+				}
+				path = listing + "?" + query + "&cursor=" + url.QueryEscape(page.NextCursor)
+			}
+			for i := 1; i < len(seen); i++ {
+				// Accounts come in ID order. Transfer IDs here are random,
+				// so only repeats can be checked.
+				if listing == "/v1/accounts" && seen[i] <= seen[i-1] {
+					t.Fatalf("GET %s: listed %v, out of order", listing+"?"+query, seen)
+				}
+			}
+			dup := map[string]bool{}
+			for _, id := range seen {
+				if dup[id] {
+					t.Fatalf("GET %s: listed %s twice: %v", listing+"?"+query, id, seen)
+				}
+				dup[id] = true
+			}
+		}
+		if v := append(l.CheckInvariants(), l.CheckIndexes()...); len(v) > 0 {
+			t.Fatalf("invariants broken after %q: %v", query, v)
 		}
 	})
 }

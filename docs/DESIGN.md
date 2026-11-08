@@ -851,16 +851,51 @@ amounts, wrong currencies, unknown accounts and stale preconditions mixed
 in), posts, partial posts, voids, reversals, clock advances that expire
 reservations, idempotent retries (including concurrent duplicates), key reuse
 with different requests, and crash-restarts from a copy of the log with a
-torn half-batch appended.
+torn half-batch appended. The same workload freezes, unfreezes and closes
+accounts, sets and removes overdraft and credit limits (often below what an
+account already uses), opens new accounts with metadata, and puts
+references and metadata on transfers and reversals.
 
 The order the writer chose is read back from the log (every operation carries
 an idempotency key, so even refusals are recorded), and a separate
 single-threaded model replays the same operations in that order. The model
-keeps balances as `big.Int` and shares no code with the ledger. After every
-round, every result code, every returned transfer, every balance and version,
-and every invariant must agree. The test also asserts that the workload
-reached every outcome (each error code, each operation, expiries, replays,
-crashes), so a passing run cannot be a vacuous one.
+keeps balances as `big.Int` and shares no code with the ledger; it has its
+own status and limit rules and its own journal head, and it keeps each
+account's history of totals, status changes and limit changes. After every
+round these must agree with the ledger:
+
+- every result code, every returned transfer and every returned account;
+- every account's balance, version, metadata, status and limits now, and
+  the same as of an earlier journal entry (a point-in-time read checked
+  against the model's histories), and its limit history;
+- every invariant;
+- the listings. Account listings are walked with every currency and
+  metadata filter the workload uses, and transfer listings with a sample of
+  filters by state, currency, account, reference, metadata and
+  combinations, in both orders, with values nothing has among them. Pages
+  change size from one to the next (1 to 1,000) and every page must be as
+  of the model's head. Each walk must be exactly the model's answer, found
+  by scanning its own maps: the same items in the same order, each as the
+  model describes it.
+
+The listings are what prove the secondary indexes against the model rather
+than against a scan of the ledger's own state. `TestModelCatchesBrokenIndexes`
+runs the workload with the indexes broken after every round the way eight
+upkeep bugs would leave them (a state never moved, expiries not moved, only
+the first posting indexed by account, reversal references or hold metadata
+not indexed, the newest transfer left out, accounts filed under the wrong
+currency, a second metadata pair dropped), compares only the listings, and
+requires each one to be caught; a control run with nothing broken must come
+out clean. Changing the index code itself the same way (voids left in
+pending, reversals not indexed by reference) also fails the model test with
+`CheckIndexes` turned off.
+
+The test also asserts that the workload reached every outcome (each error
+code including `account_frozen` and `account_closed`, each operation
+including every lifecycle and limit command, expiries, replays, crashes), so
+a passing run cannot be a vacuous one. The power-cut and snapshot tests use
+the same generator, so lifecycle and limit commands also cross power cuts
+and snapshots.
 
 ## Limits
 
