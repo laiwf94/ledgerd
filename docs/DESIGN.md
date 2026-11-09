@@ -179,6 +179,30 @@ spends can never both pass against the same headroom. The invariant
 checker applies the same rule to every account's history: each entry,
 against the balance before it and the limits in force at its sequence.
 
+### How the rules combine
+
+Every entry that touches an account passes the checks in `post` in one
+order, posting by posting: the account must exist (`not_found`), its status
+must allow the entry (`account_closed`, or `account_frozen` unless the entry
+only releases a reservation), it must hold the entry's currency
+(`currency_mismatch`), the new totals must not overflow (`overflow`), and
+the balance must stay within the limits in force (`limit_exceeded`). The
+first failure refuses the whole entry and nothing is written. Status and limit commands are refused only by status:
+`set_limit` works on a frozen account so a credit line can be arranged
+during a review, and nothing works on a closed one. An account's life
+therefore reads as one sequence of logged commands, which
+`examples/demo.sh` walks over HTTP (step 10 onwards) and `TestDemoScript`
+runs in CI:
+
+| Step | Command | Outcome |
+|---|---|---|
+| open | `POST /v1/accounts` with `non_negative` | overdraft limit 0 |
+| fund | transfer in | balance 200.00 |
+| freeze | `POST /v1/accounts/{id}/freeze` | a payout is refused with `account_frozen`; listings show `status: frozen` |
+| list | `GET /v1/accounts?metadata[cohort]=...&limit=1`, following `next_cursor` | one account per page, each page as of one entry |
+| unfreeze, raise a limit | `/unfreeze`, then `/limits` with `{"kind":"overdraft","amount":5000}` | governs entries from `effective_seq`; a 230.00 payout leaves -30.00 |
+| close | `POST /v1/accounts/{id}/close` | `failed_precondition` at -30.00; accepted once settled to zero, after which every command gets `account_closed` |
+
 ## One writer, shared fsyncs
 
 All changes go through one writer goroutine, the way TigerBeetle runs a

@@ -55,6 +55,14 @@ current formats.
   the limit in force inside the batch, and the invariant checker checks
   every entry against the limit of its time.
 
+- `examples/demo.sh` walks an account's lifecycle over HTTP after the card
+  payment: open two tagged wallets and fund one, freeze it (a payout is
+  refused with `account_frozen`), list the cohort one page at a time by
+  following the signed cursor, look up a transfer by reference, unfreeze
+  and raise the overdraft limit so a larger payout goes through, then close
+  it (refused while it owes money, accepted at zero, and closed for good).
+  `LEDGERD_DEMO_RUN` sets the suffix of its account IDs.
+
 #### Changed
 
 - A snapshot listing a transfer with no journal entries is refused.
@@ -79,6 +87,10 @@ current formats.
 - `FuzzCreateTransfer` also posts its input to the freeze, unfreeze, close
   and limit endpoints and checks the indexes; the new `FuzzListQuery`
   fuzzes listing query strings and follows every cursor. CI runs both.
+- `TestDemoScript` runs `examples/demo.sh` against the real binary twice,
+  across a restart, checks every step's outcome in order and then runs
+  `ledgerd verify` on the data directory, so the walkthrough cannot drift
+  from the API.
 
 ### Fast recovery and storage safety (#24)
 
