@@ -89,7 +89,8 @@ metrics.
 ```console
 $ export LEDGERD_API_KEYS=local-dev-key-0123456
 $ LEDGERD_DATA_DIR=./data go run ./cmd/ledgerd    # omit LEDGERD_DATA_DIR to keep everything in memory
-$ ./examples/demo.sh                              # card payment, refund, retry, overdraft, reconciliation
+$ ./examples/demo.sh                              # card payment, refund, retry, overdraft, reconciliation,
+                                                  # then open, fund, freeze, list, raise a limit, close
 ```
 
 Or with Docker (data in a volume; set an admin token, since requests from the
@@ -145,6 +146,17 @@ JSON bodies and an optional `Idempotency-Key` header.
 | `GET /v1/admin/invariants` | Run the invariant checker. Admin token, or loopback without one. |
 | `GET /healthz`, `GET /readyz`, `GET /metrics` | Liveness, readiness (fails after a storage error), Prometheus metrics. |
 
+Listings return one page at a time. Pass `next_cursor` back unchanged with
+the same filters to get the next page; it is signed and bound to those
+filters, so an edited cursor or one used with other filters is refused:
+
+```console
+$ curl -s "localhost:8080/v1/accounts?metadata%5Bcohort%5D=march&limit=1" -H "$AUTH"
+{"accounts":[{"id":"acme","status":"frozen",...}],"has_more":true,"next_cursor":"AQEm...","as_of_seq":6}
+$ curl -s "localhost:8080/v1/accounts?metadata%5Bcohort%5D=march&limit=1&cursor=AQEm..." -H "$AUTH"
+{"accounts":[{"id":"zenith","status":"open",...}],"has_more":false,"as_of_seq":6}
+```
+
 Errors look like `{"error":{"code":"limit_exceeded","message":"...","request_id":"..."}}`
 with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 `permission_denied` 403, `not_found` 404, `already_exists` / `invalid_state` /
@@ -169,7 +181,7 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 | Idempotency | Replays across restarts, errors replayed, key reuse, scope per API key, retention expiry, concurrent duplicates held in flight by a blocked fsync. |
 | Reconciliation | The amount-and-date pass is compared with a maximum bipartite matching on random inputs; a worst case of 10,000 lines against 100,000 identical movements must stay fast. |
 | Parsers | Go fuzzing of the decimal amount parser, the log reader, the CSV parser, the transfer, freeze, close and limit endpoints, and the listing query strings with every cursor they return followed: accepted input round-trips; nothing returns a 500, breaks an invariant or an index, and no walk repeats an item or fails to end. |
-| API | Every endpoint and error code over real HTTP, a full card-payment flow, auth and admin rules, body limits, timeouts and request IDs. |
+| API | Every endpoint and error code over real HTTP, a full card-payment flow, auth and admin rules, body limits, timeouts and request IDs. `examples/demo.sh` runs in CI against the real binary, twice and across a restart, and every step's outcome is checked (each refusal with its error code), followed by `ledgerd verify` on the data directory. |
 | Concurrency | The whole suite runs under the race detector in CI. |
 
 To run the suite and the ledger benchmarks:

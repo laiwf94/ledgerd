@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Walks through ledgerd against a running server: a card payment (authorize,
-# partial capture, refund), an idempotent retry, a refused overdraft and a
-# reconciliation run.
+# partial capture, refund), an idempotent retry, a refused overdraft, a
+# reconciliation run, and an account's lifecycle (open, fund, freeze, list,
+# raise a limit, close).
 #   LEDGERD_URL (default http://localhost:8080), LEDGERD_API_KEY (default local-dev-key-0123456),
-#   LEDGERD_ADMIN_TOKEN (needed for step 10 when the server has one, e.g. in Docker)
+#   LEDGERD_ADMIN_TOKEN (needed for the last step when the server has one, e.g. in Docker)
 set -euo pipefail
 
 URL="${LEDGERD_URL:-http://localhost:8080}"
 KEY="${LEDGERD_API_KEY:-local-dev-key-0123456}"
-RUN="$(date -u +%s)"  # suffix so the demo can run more than once against one ledger
+RUN="${LEDGERD_DEMO_RUN:-$(date -u +%s)}"  # suffix so the demo can run more than once against one ledger
 
 # call METHOD PATH [JSON] [extra curl args...] -> prints the body, fails on 5xx
 call() {
@@ -103,5 +104,78 @@ for l in json.load(sys.stdin)["lines"]:
     print("   #%-4d %-13s posted %8.2f  pending %8.2f   balance %7.2f  available %7.2f" % (
         l["seq"], l["kind"], l["posted_change"] / 100, l["pending_change"] / 100, b["posted"] / 100, b["available"] / 100))'
 
-echo "10. Invariants"
+# expect CODE -> reads an error body on stdin, fails unless its code is CODE
+expect() {
+  python3 -c "import sys, json
+e = json.load(sys.stdin).get('error') or {}
+if e.get('code') != sys.argv[1]: sys.exit('expected %s, got %r' % (sys.argv[1], e))
+print('   refused: %s: %s' % (e['code'], e['message']))" "$1"
+}
+status() {
+  call GET "/v1/accounts/$1" | python3 -c "import sys, json; a = json.load(sys.stdin); l = a['limits']
+fmt = lambda v: 'none' if v is None else '%.2f' % (v / 100)
+print(f\"   $1: {a['status']}{' (' + a['status_reason'] + ')' if a.get('status_reason') else ''}, available {a['balance']['available']/100:.2f}, overdraft limit {fmt(l['overdraft'])}\")"
+}
+
+echo "10. Open two supplier wallets tagged with this run's cohort, and fund one with 200.00"
+cohort="cohort-$RUN" acme="acme-$RUN" zenith="zenith-$RUN"
+for id in "$acme" "$zenith"; do
+  call POST /v1/accounts "{\"id\":\"$id\",\"currency\":\"USD\",\"normal_balance\":\"credit\",\"non_negative\":true,
+    \"metadata\":{\"cohort\":\"$cohort\"}}" > /dev/null
+done
+call POST /v1/transfers "{\"currency\":\"USD\",\"reference\":\"fund-$RUN\",\"postings\":[
+  {\"account\":\"$bank\",\"direction\":\"debit\",\"amount\":20000},
+  {\"account\":\"$acme\",\"direction\":\"credit\",\"amount\":20000}]}" > /dev/null
+status "$acme"
+
+echo "11. Freeze $acme for review: payouts are refused until it is unfrozen"
+call POST "/v1/accounts/$acme/freeze" '{"reason":"compliance review"}' > /dev/null
+status "$acme"
+call POST /v1/transfers "{\"currency\":\"USD\",\"reference\":\"payout-acme-$RUN\",\"postings\":[
+  {\"account\":\"$acme\",\"direction\":\"debit\",\"amount\":5000},
+  {\"account\":\"$bank\",\"direction\":\"credit\",\"amount\":5000}]}" | expect account_frozen
+
+echo "12. List the cohort one account per page, following the signed cursor"
+page="/v1/accounts?metadata%5Bcohort%5D=$cohort&limit=1"
+while :; do
+  out=$(call GET "$page")
+  echo "$out" | python3 -c 'import sys, json
+d = json.load(sys.stdin)
+for a in d["accounts"]:
+    print("   %-18s %-7s available %7.2f   (page as of entry %d, has_more %s)" % (
+        a["id"], a["status"], a["balance"]["available"] / 100, d["as_of_seq"], d["has_more"]))'
+  next=$(echo "$out" | field ".get('next_cursor', '')")
+  [[ -n $next ]] || break
+  page="/v1/accounts?metadata%5Bcohort%5D=$cohort&limit=1&cursor=$next"
+done
+echo "   transfers carrying reference fund-$RUN, found through the reference index:"
+call GET "/v1/transfers?reference=fund-$RUN" | python3 -c 'import sys, json
+for t in json.load(sys.stdin)["transfers"]:
+    print("   %s %s %.2f" % (t["id"], t["state"], sum(p["amount"] for p in t["postings"] if p["direction"] == "debit") / 100))'
+
+echo "13. Unfreeze and raise the overdraft limit to 50.00; a 230.00 payout now goes through"
+call POST "/v1/accounts/$acme/unfreeze" '{"reason":"review passed"}' > /dev/null
+call POST "/v1/accounts/$acme/limits" '{"kind":"overdraft","amount":5000,"reason":"approved credit line"}' \
+  | field "['limits']['effective_seq']" | sed 's/^/   limit takes effect from entry /'
+call POST /v1/transfers "{\"currency\":\"USD\",\"reference\":\"payout-acme-$RUN\",\"postings\":[
+  {\"account\":\"$acme\",\"direction\":\"debit\",\"amount\":23000},
+  {\"account\":\"$bank\",\"direction\":\"credit\",\"amount\":23000}]}" > /dev/null
+status "$acme"
+call GET "/v1/accounts/$acme/limits" | python3 -c 'import sys, json
+for c in json.load(sys.stdin)["changes"]:
+    print("   %-9s -> %-7s from entry %d  %s" % (c["kind"], "none" if c["amount"] is None else "%.2f" % (c["amount"] / 100),
+        c["effective_seq"], c.get("reason", "")))'
+
+echo "14. Close $acme: refused while it owes 30.00, accepted once it is settled to zero"
+call POST "/v1/accounts/$acme/close" '{"reason":"offboarded"}' | expect failed_precondition
+call POST /v1/transfers "{\"currency\":\"USD\",\"reference\":\"settle-$RUN\",\"postings\":[
+  {\"account\":\"$bank\",\"direction\":\"debit\",\"amount\":3000},
+  {\"account\":\"$acme\",\"direction\":\"credit\",\"amount\":3000}]}" > /dev/null
+call POST "/v1/accounts/$acme/close" '{"reason":"offboarded"}' > /dev/null
+status "$acme"
+call POST /v1/transfers "{\"currency\":\"USD\",\"postings\":[
+  {\"account\":\"$bank\",\"direction\":\"debit\",\"amount\":100},
+  {\"account\":\"$acme\",\"direction\":\"credit\",\"amount\":100}]}" | expect account_closed
+
+echo "15. Invariants"
 curl -sS "$URL/v1/admin/invariants" -H "Authorization: Bearer ${LEDGERD_ADMIN_TOKEN:-$KEY}" | field "['ok']" | sed 's/^/   ok: /'
