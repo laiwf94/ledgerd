@@ -1,10 +1,13 @@
 package ledger
 
 import (
+	"encoding/json"
+	"fmt"
 	"time"
 	"unicode/utf8"
 
 	"github.com/laiwf94/ledgerd/internal/money"
+	"github.com/laiwf94/ledgerd/internal/wal"
 )
 
 // Limits on what one command may contain.
@@ -23,6 +26,17 @@ const (
 	MaxTimeout         = 30 * 24 * time.Hour
 	defaultTimeoutSecs = int64(DefaultTimeout / time.Second)
 	maxTimeoutSecs     = int64(MaxTimeout / time.Second)
+
+	// MaxBatchTransfers is how many transfers one atomic batch may hold,
+	// the number of events TigerBeetle accepts in one request.
+	MaxBatchTransfers = 8190
+	// batchRecordSlack is what a batch's log record adds around the
+	// command itself: type, time, sequence, an escaped idempotency key and
+	// scope, and the request hash. The generated IDs are counted apart.
+	batchRecordSlack = 4096
+	// MaxBatchBytes is the most a batch command may take in its log record,
+	// generated IDs and record fields included.
+	MaxBatchBytes = wal.MaxRecord
 )
 
 // AccountSpec opens an account.
@@ -117,6 +131,14 @@ type LimitSpec struct {
 	Reason    string    `json:"reason,omitempty"`
 }
 
+// BatchSpec creates linked transfers that commit together or not at all. The
+// transfers run in order, each seeing the effects of the ones before it, and
+// the whole batch is one log record. If any transfer is refused, none of
+// them happens and the error names the one that failed.
+type BatchSpec struct {
+	Transfers []TransferSpec `json:"transfers"`
+}
+
 // Command is one state change. Exactly one field is set.
 type Command struct {
 	CreateAccount   *AccountSpec  `json:"create_account,omitempty"`
@@ -128,6 +150,7 @@ type Command struct {
 	UnfreezeAccount *StatusSpec   `json:"unfreeze_account,omitempty"`
 	CloseAccount    *StatusSpec   `json:"close_account,omitempty"`
 	SetLimit        *LimitSpec    `json:"set_limit,omitempty"`
+	CreateBatch     *BatchSpec    `json:"create_batch,omitempty"`
 }
 
 // Idem identifies a request for idempotency. Scope separates callers (the API
@@ -216,7 +239,7 @@ func validateCurrency(code string) *Error {
 func (c *Command) Validate() *Error {
 	n := 0
 	for _, set := range []bool{c.CreateAccount != nil, c.CreateTransfer != nil, c.Post != nil, c.Void != nil, c.Reverse != nil,
-		c.FreezeAccount != nil, c.UnfreezeAccount != nil, c.CloseAccount != nil, c.SetLimit != nil} {
+		c.FreezeAccount != nil, c.UnfreezeAccount != nil, c.CloseAccount != nil, c.SetLimit != nil, c.CreateBatch != nil} {
 		if set {
 			n++
 		}
@@ -247,6 +270,8 @@ func (c *Command) Validate() *Error {
 		return c.CloseAccount.validate()
 	case c.SetLimit != nil:
 		return c.SetLimit.validate()
+	case c.CreateBatch != nil:
+		return c.validateBatch()
 	default:
 		r := c.Reverse
 		if !ValidID(r.TransferID) {
@@ -260,6 +285,35 @@ func (c *Command) Validate() *Error {
 		}
 		return r.Amounts.validate()
 	}
+}
+
+// validateBatch checks every transfer in a batch, then that the batch fits
+// in one log record with the largest IDs the ledger could give it, so a
+// batch that passes can always be logged.
+func (c *Command) validateBatch() *Error {
+	b := c.CreateBatch
+	n := len(b.Transfers)
+	if n == 0 || n > MaxBatchTransfers {
+		return errf(CodeInvalid, "a batch holds 1 to %d transfers, not %d", MaxBatchTransfers, n)
+	}
+	for i := range b.Transfers {
+		if err := b.Transfers[i].validate(); err != nil {
+			return itemError(i, err)
+		}
+	}
+	p, err := json.Marshal(c)
+	if err != nil {
+		return errf(CodeInvalid, "the batch cannot be encoded: %v", err)
+	}
+	if size := len(p) + n*(MaxIDLength+3) + batchRecordSlack; size > MaxBatchBytes {
+		return errf(CodeInvalid, "the batch takes up to %d bytes in the log; the limit is %d, so split it", size, MaxBatchBytes)
+	}
+	return nil
+}
+
+// itemError says which transfer of a batch an error is about.
+func itemError(i int, err *Error) *Error {
+	return &Error{Code: err.Code, Message: fmt.Sprintf("transfers[%d]: %s", i, err.Message), Item: &i}
 }
 
 func (s *AccountSpec) validate() *Error {

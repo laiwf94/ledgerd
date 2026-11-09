@@ -360,6 +360,14 @@ func writeSmallSnapshot(t *testing.T, ver int) (dir string, clock *fakeClock) {
 		e.do(noLimitCmd("bank", LimitCredit, "lifted"))
 		e.l.Do(ctx, limitCmd("late", LimitCredit, 1, ""), key("k4", "late", "late"))
 	}
+	if ver >= 4 {
+		// A keyed batch with a hold in it, and a keyed batch refused at its
+		// second transfer because alice is frozen.
+		if _, err := e.l.Do(ctx, batchCmd(move(dr("bank", 3), cr("shop", 3)), hold(60, dr("bank", 4), cr("shop", 4))), key("k5", "batch", "batch")); err != nil {
+			t.Fatal(err)
+		}
+		e.l.Do(ctx, batchCmd(move(dr("bank", 1), cr("shop", 1)), move(dr("alice", 1), cr("shop", 1))), key("k5", "batch-frozen", "batch-frozen"))
+	}
 	e.l.Close()
 	if nums := snapshotFiles(t, e.dir); len(nums) != 1 {
 		t.Fatalf("snapshots %v", nums)
@@ -409,10 +417,24 @@ func TestSnapshotRoundTripsEveryField(t *testing.T) {
 		if _, changes, err := l.LimitHistory("bank"); err != nil || len(changes) != 2 || changes[1].Amount != nil || changes[1].Reason != "lifted" {
 			t.Fatalf("bank limit history: %+v %v", changes, err)
 		}
+		out, err = l.Do(ctx, batchCmd(move(dr("bank", 3), cr("shop", 3)), hold(60, dr("bank", 4), cr("shop", 4))), key("k5", "batch", "batch"))
+		if err != nil || !out.Replayed || len(out.Transfers) != 2 || out.Transfers[1].State != StatePending || out.Transfers[0].Postings[0].Posted != 3 {
+			t.Fatalf("replayed batch: %v %+v", err, out)
+		}
+		_, err = l.Do(ctx, batchCmd(move(dr("bank", 1), cr("shop", 1)), move(dr("alice", 1), cr("shop", 1))), key("k5", "batch-frozen", "batch-frozen"))
+		if le, _ := err.(*Error); le == nil || le.Code != CodeAccountFrozen || le.Item == nil || *le.Item != 1 {
+			t.Fatalf("replayed refused batch: %v", err)
+		}
 	}
-	// The expiry schedule came back: the 5 second hold expires on time.
+	// The expiry schedule came back: the 5 second hold expires on time, and
+	// the batch's 60 second hold later.
 	clock.Advance(6 * time.Second)
 	n, err := fromSnap.ExpireDue(ctx)
+	if err != nil || n != 1 {
+		t.Fatalf("expired %d, %v", n, err)
+	}
+	clock.Advance(60 * time.Second)
+	n, err = fromSnap.ExpireDue(ctx)
 	if err != nil || n != 1 {
 		t.Fatalf("expired %d, %v", n, err)
 	}

@@ -116,14 +116,14 @@ func scanSegment(r io.Reader, first uint64, apply func(index uint64, payload []b
 	var s segScan
 	atEOF := func() bool { _, err := br.Peek(1); return errors.Is(err, io.EOF) }
 	for {
-		line, err := br.ReadSlice('\n')
+		line, err := readLine(br)
 		if errors.Is(err, io.EOF) {
 			if s.sealed && len(line) > 0 {
 				return s, fmt.Errorf("%w: data after the seal at offset %d", ErrCorrupt, s.good)
 			}
 			return s, nil // no trailing newline: a torn final write
 		}
-		if errors.Is(err, bufio.ErrBufferFull) {
+		if errors.Is(err, errLineTooLong) {
 			return s, fmt.Errorf("%w: record at offset %d is longer than %d bytes", ErrCorrupt, s.end, MaxRecord)
 		}
 		if err != nil {
@@ -165,10 +165,42 @@ func scanSegment(r io.Reader, first uint64, apply func(index uint64, payload []b
 	}
 }
 
-// Readers big enough for the longest record are pooled: replaying a log of
-// many small segments would otherwise allocate and clear a megabyte per
-// segment.
-var readers = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, MaxRecord+16) }}
+// readerSize is the buffer of a pooled reader. Lines up to this long are read
+// in place; longer ones, up to MaxRecord, are assembled by readLine.
+const readerSize = 1<<20 + 16
+
+// maxLine is the longest line a record can take: checksum, space, payload
+// and newline, with room to spare.
+const maxLine = MaxRecord + 16
+
+var errLineTooLong = errors.New("line is longer than the largest record")
+
+// Readers are pooled: replaying a log of many small segments would otherwise
+// allocate and clear a megabyte per segment.
+var readers = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, readerSize) }}
+
+// readLine returns the next line, newline included, like ReadSlice. A line
+// longer than the reader's buffer is copied into a buffer of its own, so
+// memory follows the longest record actually met rather than MaxRecord. At
+// the end of the input it returns what is left with io.EOF. The line is
+// valid until the next read.
+func readLine(br *bufio.Reader) ([]byte, error) {
+	line, err := br.ReadSlice('\n')
+	if !errors.Is(err, bufio.ErrBufferFull) {
+		return line, err
+	}
+	long := append([]byte(nil), line...)
+	for {
+		line, err = br.ReadSlice('\n')
+		if len(long)+len(line) > maxLine {
+			return nil, errLineTooLong
+		}
+		long = append(long, line...)
+		if !errors.Is(err, bufio.ErrBufferFull) {
+			return long, err
+		}
+	}
+}
 
 func getReader(r io.Reader) *bufio.Reader {
 	br := readers.Get().(*bufio.Reader)

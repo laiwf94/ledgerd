@@ -26,7 +26,6 @@
 package wal
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/hex"
 	"errors"
@@ -39,8 +38,10 @@ import (
 	"sync"
 )
 
-// MaxRecord is the largest payload a record may carry.
-const MaxRecord = 1 << 20
+// MaxRecord is the largest payload a record may carry. Almost every record
+// is far smaller; the limit is sized for an atomic batch of 8,190
+// transfers, which is one record.
+const MaxRecord = 16 << 20
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
@@ -410,11 +411,11 @@ func Replay(r io.Reader, apply func(payload []byte) error) (int64, error) {
 	defer putReader(br)
 	var offset int64
 	for {
-		line, err := br.ReadSlice('\n')
+		line, err := readLine(br)
 		if errors.Is(err, io.EOF) {
 			return offset, nil // no trailing newline: a torn final write
 		}
-		if errors.Is(err, bufio.ErrBufferFull) {
+		if errors.Is(err, errLineTooLong) {
 			return 0, fmt.Errorf("%w: record at offset %d is longer than %d bytes", ErrCorrupt, offset, MaxRecord)
 		}
 		if err != nil {

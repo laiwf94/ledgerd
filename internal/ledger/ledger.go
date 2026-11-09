@@ -425,7 +425,7 @@ func (l *Ledger) replay(p []byte, first bool) error {
 			if verr := r.Cmd.Validate(); verr != nil {
 				return verr
 			}
-			out, aerr = t.apply(r.Cmd, r.ID)
+			out, aerr = t.exec(r.Cmd, r.ID, r.IDs)
 		}
 		if aerr != nil {
 			return fmt.Errorf("replaying %s record: %v", r.Type, aerr)
@@ -729,11 +729,18 @@ func (l *Ledger) process(batch []*request) {
 			continue
 		}
 		var id string
-		if req.cmd.CreateTransfer != nil || req.cmd.Reverse != nil {
+		var ids []string
+		switch {
+		case req.cmd.CreateTransfer != nil || req.cmd.Reverse != nil:
 			id = l.opts.NewID()
+		case req.cmd.CreateBatch != nil:
+			ids = make([]string, len(req.cmd.CreateBatch.Transfers))
+			for j := range ids {
+				ids[j] = l.opts.NewID()
+			}
 		}
 		before := t.nextSeq()
-		out, aerr := t.apply(req.cmd, id)
+		out, aerr := t.exec(req.cmd, id, ids)
 		rec := record{Time: now, Idem: toIdemField(req.idem)}
 		if aerr != nil {
 			rejected++
@@ -745,7 +752,7 @@ func (l *Ledger) process(batch []*request) {
 		} else {
 			committed++
 			results[i].out = out
-			rec.Type, rec.Cmd, rec.ID = recCmd, req.cmd, id
+			rec.Type, rec.Cmd, rec.ID, rec.IDs = recCmd, req.cmd, id, ids
 			if t.nextSeq() != before {
 				rec.Seq = t.nextSeq() - 1
 			}

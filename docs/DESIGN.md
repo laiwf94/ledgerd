@@ -246,7 +246,8 @@ The log is a command log. Each line is:
 ```
 
 Records are `header` (format version), `cmd` (an accepted command with the
-time it ran, the ID it generated and the entry sequence it produced),
+time it ran, the ID or, for a batch, IDs it generated and the entry
+sequence it produced),
 `expire` (a timeout released a reservation), `reject` (a refused command
 that carried an idempotency key, with its error) and `snapshot` (the point a
 snapshot was taken at, below). Replay runs each `cmd`
@@ -536,13 +537,16 @@ then a footer once sealed:
 ```
 
 A record is a JSON object with `"t"` naming its type and only the fields
-that type uses. Unknown fields are refused.
+that type uses. Unknown fields are refused. A record's JSON is at most 16
+MiB; readers take lines up to 1 MiB in place and assemble longer ones in a
+buffer of their own, so replay memory follows the longest record actually
+in the log.
 
 | `t` | Fields | Written when |
 |---|---|---|
 | `header` | `v` (log format version, 1) | first record of a new log |
-| `cmd` | `time`, `cmd` (the command as accepted), `seq` (last entry it produced, if any), `id` (the ID it generated for a new transfer or reversal), `idem` (`scope`, `key`, request `hash`) if it had a key | a command is accepted |
-| `reject` | `time`, `idem`, `err` (`code`, `message`) | a command with an idempotency key is refused |
+| `cmd` | `time`, `cmd` (the command as accepted), `seq` (last entry it produced, if any), `id` (the ID it generated for a new transfer or reversal), `ids` (the IDs it generated for a batch's transfers, in order), `idem` (`scope`, `key`, request `hash`) if it had a key | a command is accepted |
+| `reject` | `time`, `idem`, `err` (`code`, `message`, and `item`, the refused transfer's index, for a batch) | a command with an idempotency key is refused |
 | `expire` | `time`, `id`, `seq` | a pending transfer times out |
 | `snapshot` | `time`, `snap` (snapshot number), `seq` (journal head) | a snapshot is taken |
 
@@ -570,19 +574,23 @@ order. Items, in file order:
 
 | Tag | Item | Fields |
 |---|---|---|
-| `H` | header, first | `u` format version (3), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys |
+| `H` | header, first | `u` format version (4), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys |
 | `A` | account, by ID | `str` ID, `str` currency, `i` exponent, `str` normal balance, `bool` non-negative, `bool` non-positive, `meta`, `time` created; `i` debits posted, credits posted, debits pending, credits pending; `u` version; `u` count then per status change `u` journal head, `time`, `str` status, `str` reason; `u` count then per limit change `u` journal head, `time`, `str` kind, `i` amount (-1 for none), `str` reason |
 | `T` | transfer, by ID | `str` ID, state, currency; `u` posting count then per posting `str` account, `str` direction, `i` amount, posted, reversed; `str` reference, `meta`, `time` created, `time` expires, `str` reverses; `u` count then `str` reversal IDs; `u` count then per entry `u` sequence, `str` kind |
 | `E` | journal entry, by sequence from 1 | `u` sequence, `time`, `str` kind, transfer ID, currency; `u` line count then per line `str` account, `str` direction, `i` posted, `i` pending |
-| `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result); then if flagged: `str` code and message; an account as in `A` with `u` version, the four totals, `u` as-of sequence, then `str` status, `str` status reason and `time` changed, then `i` overdraft and credit limits (-1 for none) and `u` effective sequence; a transfer as in `T`; finally `i` count of reservations expired |
+| `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result, 8 batch result, 16 error names a batch item); then if flagged: `str` code and message, and `u` item index if flag 16; an account as in `A` with `u` version, the four totals, `u` as-of sequence, then `str` status, `str` status reason and `time` changed, then `i` overdraft and credit limits (-1 for none) and `u` effective sequence; a transfer as in `T`; `i` count of reservations expired; finally `u` number of batch transfers if flag 8 |
+| `B` | one transfer of a batch result, right after its `I` item, in batch order | a transfer as in `T` |
 | `Z` | footer, alone in the last frame | `u` number of frames before it |
 
 Each format carries a version: the log's `header` record, the manifest's
 first line and the snapshot's `H` item. A reader refuses a version it does
 not know, so a changed layout must come with a new version number. Snapshot
-format 2 added account status and format 3 limit changes; format 1 and 2
-files, which lack those fields, still load with every account open and at
-the limits its flags give. New command kinds in `cmd` records keep
+format 2 added account status, format 3 limit changes and format 4 batch
+results; format 1 and 2 files, which lack those fields, still load with
+every account open and at the limits its flags give, and format 3 files,
+written before batches existed, load as they are. A batch result is spread
+over `B` items because thousands of transfers can be more than one frame
+holds. New command kinds in `cmd` records keep
 the log at version 1: an older binary refuses a log holding a command it
 does not know, as an unknown field, rather than misreading it.
 
@@ -650,6 +658,51 @@ What makes this safe is that the effect and the key are one log record,
 fsynced together. There is no window where a transfer is durable but its key
 is not (a retry would double-charge) or the reverse (a retry would return a
 result that does not exist).
+
+## Atomic batches
+
+`POST /v1/transfers/batch` takes up to 8,190 transfers, the number of
+events TigerBeetle accepts in one request, and commits them as one unit.
+It is TigerBeetle's chain of linked events: the transfers run in the order
+given, each seeing the balances, versions and holds the ones before it
+left, so a batch can fund an account and spend from it, and a precondition
+on a later transfer is checked against the version the earlier ones
+produced. If any transfer is refused, none of them happens.
+
+The batch is one `create_batch` command. Validation checks every transfer
+as it would a single one, then that the batch fits in one log record: the
+encoded command, plus 67 bytes for each generated ID at the longest an ID
+can be, plus 4 KiB for the record's other fields, must be at most
+`MaxBatchBytes` (16 MiB, the log's record limit). A batch that passes can
+therefore always be logged, and the writer never meets a record it cannot
+write. On success the record is a `cmd` with `ids`, the generated IDs in
+order, and `seq`, the last of the batch's consecutive entries; replay runs
+the batch with those IDs and checks it ends at that entry. A refused batch
+with an idempotency key is a `reject` record whose error carries `item`.
+
+All or nothing inside a group commit needs a way to take the batch back out
+of a transaction that other commands share. A single command never needs
+one, because it checks everything before it changes anything. A batch
+cannot: its third transfer may depend on what its first did. So the batch
+runs under a *savepoint*. While one is set, the first time the transaction
+hands out an account or replaces a transfer it keeps its own copy as it was
+(or notes that it had none), and the savepoint records the lengths of the
+append-only parts: entries, history rows, new timeouts, new transfer IDs,
+and the open count. Rolling back restores those copies, deletes what was
+new, and cuts the append-only parts back. Commands before and after the
+batch in the same group commit are unaffected and see none of it, not even
+its generated IDs. The cost is one map entry and one account copy per
+account the batch touches, paid only by batches.
+
+The response lists one result per transfer. On success each is `created`
+with the transfer. On failure the status and error are the refused
+transfer's (`limit_exceeded` 422 for an overdraft, for example), the error's
+`item` is its index and its message starts `transfers[i]: `, and the
+results list it as `failed` and every other transfer as `not_applied`.
+Validation errors about one transfer name it the same way. One
+`Idempotency-Key` covers the whole batch: a retry returns every transfer of
+the original, or the original refusal naming the same transfer, even once
+the batch would succeed.
 
 ## Preconditions instead of locks
 
@@ -935,13 +988,14 @@ and snapshots.
 | Idempotency key | 255 printable ASCII chars | Stripe's limit. |
 | Idempotency retention | 24 h (1 min to 30 days) | Memory is proportional to keys in the window. |
 | Pending timeout | 1 s to 30 days, default 24 h | |
-| JSON body | 1 MiB | Checked before decoding. |
+| JSON body | 1 MiB, 16 MiB for a batch | Checked before decoding. |
+| Batch | 8,190 transfers, and at most 16 MiB in its log record | TigerBeetle's request size; one record, one fsync. |
 | Statement CSV | 4 MiB, 10,000 lines | |
 | Reconciliation | 4 at once, period 366 days, window 31 days, 100,000 movements | Bounds memory per request. |
 | Statement page | 1,000 lines | |
 | Listing page | 1,000 accounts or transfers, 8 metadata filters, max(16 × limit, 4,096) candidates scanned | Bounds the time a listing holds the read lock. |
-| Log record | 1 MiB | The largest valid command encodes to well under this (tested). |
-| Batch | 1,024 commands per fsync | |
+| Log record | 16 MiB | Sized for the largest batch; validation guarantees every accepted command fits (tested). Other commands encode to under 256 KiB. |
+| Group commit | 1,024 commands per fsync | |
 | Request deadline | 5 s | A timed-out write may still commit; retry with the key to find out. |
 
 ## Hardening

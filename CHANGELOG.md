@@ -8,6 +8,29 @@ current formats.
 
 ## Unreleased
 
+### Batches, balancing transfers, holds and multi-currency (#26)
+
+#### Added
+
+- Atomic batches: `POST /v1/transfers/batch` creates up to 8,190 linked
+  transfers as one `create_batch` command, written as one log record with
+  one fsync. The transfers run in order, each seeing the effects of the ones
+  before it; if any is refused, none happens. The response has one result
+  per transfer (`created`, or `failed` and `not_applied`); a refusal carries
+  the failing transfer's status and error, with its index in `error.item`.
+  One `Idempotency-Key` covers the whole batch, and its result, including a
+  refusal, replays across restarts. A batch is rolled back out of a group
+  commit it shares with other commands without affecting them.
+
+#### Changed
+
+- The log's record limit is 16 MiB, up from 1 MiB, so the largest batch
+  fits in one record. Lines over 1 MiB are assembled in a buffer of their
+  own, so the pooled replay readers stay at 1 MiB.
+- Snapshot format 4 stores batch results and the failing item of a batch
+  refusal for kept idempotency keys. Format 1 to 3 files still load.
+- Ledger errors carry `item` when they are about one transfer of a batch.
+
 ### Listings, indexes and account lifecycle (#25)
 
 #### Added
