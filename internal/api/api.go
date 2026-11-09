@@ -27,7 +27,10 @@ import (
 
 // Request limits.
 const (
-	MaxBodyBytes       = 1 << 20
+	MaxBodyBytes = 1 << 20
+	// MaxBatchBodyBytes caps a batch request. The ledger checks separately
+	// that the batch fits in one log record.
+	MaxBatchBodyBytes  = ledger.MaxBatchBytes
 	DefaultTimeout     = 5 * time.Second
 	DefaultWindowDays  = 3
 	MaxReconcileDays   = 366
@@ -145,6 +148,7 @@ func New(cfg Config) (*Server, error) {
 	s.route("POST /v1/accounts/{id}/limits", s.setLimit, authKey)
 	s.route("GET /v1/accounts/{id}/limits", s.limits, authKey)
 	s.route("POST /v1/transfers", s.createTransfer, authKey)
+	s.route("POST /v1/transfers/batch", s.createBatch, authKey, MaxBatchBodyBytes)
 	s.route("GET /v1/transfers", s.listTransfers, authKey)
 	s.route("GET /v1/transfers/{id}", s.getTransfer, authKey)
 	s.route("POST /v1/transfers/{id}/post", s.postTransfer, authKey)
@@ -436,11 +440,11 @@ func idem(r *http.Request, params any) (*ledger.Idem, error) {
 	return i, nil
 }
 
-// execute runs a command and writes its result, marking replays.
-func (s *Server) execute(w http.ResponseWriter, r *http.Request, cmd ledger.Command, params any, status int) error {
+// do runs a command with the request's idempotency key, marking replays.
+func (s *Server) do(w http.ResponseWriter, r *http.Request, cmd ledger.Command, params any) (ledger.Outcome, error) {
 	id, err := idem(r, params)
 	if err != nil {
-		return err
+		return ledger.Outcome{}, err
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
 	defer cancel()
@@ -449,6 +453,12 @@ func (s *Server) execute(w http.ResponseWriter, r *http.Request, cmd ledger.Comm
 		w.Header().Set(replayedHeader, "true")
 		s.m.Counter("ledgerd_idempotent_replays_total", "", "Requests answered from the idempotency store.").Inc()
 	}
+	return out, err
+}
+
+// execute runs a command and writes its result, marking replays.
+func (s *Server) execute(w http.ResponseWriter, r *http.Request, cmd ledger.Command, params any, status int) error {
+	out, err := s.do(w, r, cmd, params)
 	if err != nil {
 		return err
 	}
@@ -624,6 +634,55 @@ func (s *Server) createTransfer(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	return s.execute(w, r, ledger.Command{CreateTransfer: &body}, body, http.StatusCreated)
+}
+
+// Statuses of the items in a batch response.
+const (
+	itemCreated    = "created"     // the transfer was created
+	itemFailed     = "failed"      // this transfer was refused, so the batch was
+	itemNotApplied = "not_applied" // another transfer was refused, so this one did not happen
+)
+
+type batchItem struct {
+	Status   string           `json:"status"`
+	Transfer *ledger.Transfer `json:"transfer,omitempty"`
+	Error    *ledger.Error    `json:"error,omitempty"`
+}
+
+// createBatch creates up to MaxBatchTransfers linked transfers atomically.
+// The response has one result per transfer, in request order. When one is
+// refused, the response status and error are that transfer's, the error's
+// item names it, and every other result is not_applied.
+func (s *Server) createBatch(w http.ResponseWriter, r *http.Request) error {
+	var body ledger.BatchSpec
+	if err := decode(r, &body, false); err != nil {
+		return err
+	}
+	out, err := s.do(w, r, ledger.Command{CreateBatch: &body}, body)
+	var le *ledger.Error
+	if errors.As(err, &le) && le.Item != nil {
+		items := make([]batchItem, len(body.Transfers))
+		for i := range items {
+			items[i].Status = itemNotApplied
+		}
+		if *le.Item < len(items) {
+			items[*le.Item] = batchItem{Status: itemFailed, Error: &ledger.Error{Code: le.Code, Message: le.Message}}
+		}
+		id, _ := r.Context().Value(requestIDKey).(string)
+		writeJSON(w, statusOf(le.Code), map[string]any{
+			"error":   map[string]any{"code": le.Code, "message": le.Message, "item": *le.Item, "request_id": id},
+			"results": items})
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	items := make([]batchItem, len(out.Transfers))
+	for i, tr := range out.Transfers {
+		items[i] = batchItem{Status: itemCreated, Transfer: tr}
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"results": items})
+	return nil
 }
 
 func (s *Server) getTransfer(w http.ResponseWriter, r *http.Request) error {

@@ -96,6 +96,69 @@ type txn struct {
 	rows      []pendingRow
 	expiries  []expiry
 	open      int
+	sp        *savepoint // set while a batch runs; see begin
+}
+
+// savepoint is what a txn looked like when a batch began, so a failed batch
+// can be taken back out of a txn that other commands share. It keeps the
+// txn's own copy of each account and transfer the batch touches, from just
+// before the first touch, and the lengths of the append-only parts.
+type savepoint struct {
+	entries, rows, expiries, order, open int
+	accounts                             map[string]*account // nil: the txn had no copy
+	transfers                            map[string]*Transfer
+}
+
+// begin starts a savepoint. Batches do not nest.
+func (t *txn) begin() {
+	t.sp = &savepoint{entries: len(t.entries), rows: len(t.rows), expiries: len(t.expiries), order: len(t.order),
+		open: t.open, accounts: map[string]*account{}, transfers: map[string]*Transfer{}}
+}
+
+// keep drops the savepoint, keeping everything done since begin.
+func (t *txn) keep() { t.sp = nil }
+
+// rollback undoes everything done since begin. Entries, rows, expiries and
+// new transfer IDs are only ever appended, so cutting them back is enough;
+// accounts and transfers get back the copies saved at their first touch.
+func (t *txn) rollback() {
+	sp := t.sp
+	t.sp = nil
+	for id, a := range sp.accounts {
+		if a == nil {
+			delete(t.accounts, id)
+		} else {
+			t.accounts[id] = a
+		}
+	}
+	for id, tr := range sp.transfers {
+		if tr == nil {
+			delete(t.transfers, id)
+		} else {
+			t.transfers[id] = tr
+		}
+	}
+	clear(t.entries[sp.entries:])
+	t.entries = t.entries[:sp.entries]
+	clear(t.rows[sp.rows:])
+	t.rows = t.rows[:sp.rows]
+	t.expiries = t.expiries[:sp.expiries]
+	t.order = t.order[:sp.order]
+	t.open = sp.open
+}
+
+// saveAccount remembers the txn's copy of an account before a batch first
+// touches it.
+func (t *txn) saveAccount(id string) {
+	if _, done := t.sp.accounts[id]; done {
+		return
+	}
+	var prev *account
+	if a, ok := t.accounts[id]; ok {
+		c := *a
+		prev = &c
+	}
+	t.sp.accounts[id] = prev
 }
 
 type pendingRow struct {
@@ -111,6 +174,9 @@ func (t *txn) nextSeq() uint64 { return t.st.head() + uint64(len(t.entries)) + 1
 
 // account returns the txn's copy of an account, copying it on first use.
 func (t *txn) account(id string) (*account, bool) {
+	if t.sp != nil {
+		t.saveAccount(id)
+	}
 	if a, ok := t.accounts[id]; ok {
 		return a, true
 	}
@@ -136,6 +202,11 @@ func (t *txn) transfer(id string) (*Transfer, bool) {
 // putTransfer records a new version of a transfer. Versions handed out in
 // earlier outcomes are never modified.
 func (t *txn) putTransfer(tr *Transfer) {
+	if t.sp != nil {
+		if _, done := t.sp.transfers[tr.ID]; !done {
+			t.sp.transfers[tr.ID] = t.transfers[tr.ID]
+		}
+	}
 	if _, ok := t.transfers[tr.ID]; !ok {
 		t.order = append(t.order, tr.ID)
 	}
@@ -177,8 +248,43 @@ func (t *txn) commit() {
 	t.st.open += t.open
 }
 
-// apply executes one command. id is the ID for a transfer the command
-// creates: freshly generated when live, read from the log on replay.
+// exec executes one command. id is the ID for a transfer the command creates
+// and ids the IDs for a batch's transfers: freshly generated when live, read
+// from the log on replay.
+func (t *txn) exec(c *Command, id string, ids []string) (Outcome, *Error) {
+	if c.CreateBatch != nil {
+		return t.createBatch(c.CreateBatch, ids)
+	}
+	if ids != nil {
+		return Outcome{}, errf(CodeInvalid, "only a batch takes a list of transfer ids")
+	}
+	return t.apply(c, id)
+}
+
+// createBatch creates a batch's transfers in order, all or none. A refused
+// transfer rolls back the ones before it, and the error says which one it
+// was. Commands before and after the batch in the same group commit are
+// unaffected.
+func (t *txn) createBatch(s *BatchSpec, ids []string) (Outcome, *Error) {
+	if len(ids) != len(s.Transfers) {
+		return Outcome{}, errf(CodeInvalid, "a batch of %d transfers came with %d ids", len(s.Transfers), len(ids))
+	}
+	out := make([]*Transfer, len(s.Transfers))
+	t.begin()
+	for i := range s.Transfers {
+		o, err := t.createTransfer(&s.Transfers[i], ids[i])
+		if err != nil {
+			t.rollback()
+			return Outcome{}, itemError(i, err)
+		}
+		out[i] = o.Transfer
+	}
+	t.keep()
+	return Outcome{Transfers: out}, nil
+}
+
+// apply executes one command other than a batch. id is the ID for a transfer
+// the command creates.
 func (t *txn) apply(c *Command, id string) (Outcome, *Error) {
 	switch {
 	case c.CreateAccount != nil:

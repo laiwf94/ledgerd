@@ -50,6 +50,9 @@ const (
 type Error struct {
 	Code    Code   `json:"code"`
 	Message string `json:"message"`
+	// Item is the index of the transfer that failed when the command was a
+	// batch, and nil otherwise.
+	Item *int `json:"item,omitempty"`
 }
 
 func (e *Error) Error() string { return string(e.Code) + ": " + e.Message }
@@ -306,6 +309,8 @@ type Movement struct {
 type Outcome struct {
 	Account  *AccountState
 	Transfer *Transfer
+	// Transfers are a batch's transfers, in the order it gave them.
+	Transfers []*Transfer
 	// Replayed is true when the result was returned from the idempotency
 	// store instead of executing the command again.
 	Replayed bool

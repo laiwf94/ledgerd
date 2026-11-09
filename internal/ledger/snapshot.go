@@ -53,7 +53,9 @@ const (
 	// snapVersion is the format written. Version 1, which lacks account
 	// status, and version 2, which lacks limit changes, are still read:
 	// every account in them is open with the limits it was created with.
-	snapVersion    = 3
+	// Version 3 lacks batch results, which no ledger could hold when it was
+	// written.
+	snapVersion    = 4
 	snapPrefix     = "snapshot-"
 	snapSuffix     = ".snap"
 	snapTmpSuffix  = ".tmp"
@@ -65,6 +67,7 @@ const (
 	snapItemXfer   = 'T'
 	snapItemEntry  = 'E'
 	snapItemIdem   = 'I'
+	snapItemBatch  = 'B' // one transfer of a batch result; follows its key
 	snapItemFooter = 'Z'
 )
 
@@ -443,10 +446,19 @@ func (w *snapWriter) encode(s *snapshot) error {
 		if q.e.out.Transfer != nil {
 			flags |= 4
 		}
+		if w.ver >= 4 && q.e.out.Transfers != nil {
+			flags |= 8
+		}
+		if w.ver >= 4 && q.e.err != nil && q.e.err.Item != nil {
+			flags |= 16
+		}
 		w.buf = append(w.buf, flags)
 		if q.e.err != nil {
 			w.str(string(q.e.err.Code))
 			w.str(q.e.err.Message)
+			if flags&16 != 0 {
+				w.u(uint64(*q.e.err.Item))
+			}
 		}
 		if a := q.e.out.Account; a != nil {
 			w.account(&a.Account)
@@ -468,7 +480,19 @@ func (w *snapWriter) encode(s *snapshot) error {
 			w.transfer(t)
 		}
 		w.i(int64(q.e.out.Expired))
+		if flags&8 != 0 {
+			w.u(uint64(len(q.e.out.Transfers)))
+		}
 		w.item()
+		// A batch result can hold thousands of transfers, more than one
+		// frame takes, so each is an item of its own.
+		if flags&8 != 0 {
+			for _, t := range q.e.out.Transfers {
+				w.tag(snapItemBatch)
+				w.transfer(t)
+				w.item()
+			}
+		}
 	}
 	w.flush()
 	w.tag(snapItemFooter)
@@ -1034,12 +1058,24 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 		r.p = r.p[len(q.e.hash):]
 		q.e.at = r.when()
 		flags := r.byte1()
-		if flags&^7 != 0 {
+		known := byte(7)
+		if r.ver >= 4 {
+			known = 31
+		}
+		if flags&^known != 0 || flags&16 != 0 && flags&1 == 0 {
 			r.fail("bad idempotency flags")
 			break
 		}
 		if flags&1 != 0 {
 			q.e.err = &Error{Code: Code(r.sym()), Message: r.str()}
+			if flags&16 != 0 {
+				item := r.u()
+				if item >= MaxBatchTransfers && r.err == nil {
+					r.fail("batch item %d is out of range", item)
+				}
+				n := int(item)
+				q.e.err.Item = &n
+			}
 		}
 		if flags&2 != 0 {
 			as := &AccountState{Account: r.account()}
@@ -1062,6 +1098,17 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 			q.e.out.Transfer = r.transfer()
 		}
 		q.e.out.Expired = int(r.i())
+		if flags&8 != 0 {
+			n := r.u()
+			if (n == 0 || n > MaxBatchTransfers) && r.err == nil {
+				r.fail("a batch result of %d transfers", n)
+			}
+			q.e.out.Transfers = make([]*Transfer, 0, min(n, MaxBatchTransfers))
+			for j := uint64(0); j < n && r.err == nil; j++ {
+				r.expect(snapItemBatch)
+				q.e.out.Transfers = append(q.e.out.Transfers, r.transfer())
+			}
+		}
 		s.idem = append(s.idem, q)
 	}
 

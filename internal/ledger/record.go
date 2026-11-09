@@ -36,6 +36,7 @@ type record struct {
 	Time    time.Time  `json:"time,omitzero"`
 	Seq     uint64     `json:"seq,omitempty"` // entry the record produced, if any
 	ID      string     `json:"id,omitempty"`  // transfer created or expired
+	IDs     []string   `json:"ids,omitempty"` // a batch's transfers, in order
 	Cmd     *Command   `json:"cmd,omitempty"`
 	Idem    *idemField `json:"idem,omitempty"`
 	Err     *Error     `json:"err,omitempty"`

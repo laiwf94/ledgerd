@@ -640,6 +640,7 @@ func FuzzCreateTransfer(f *testing.F) {
 	f.Add(`{"kind":"overdraft","amount":500}`)
 	f.Add(`{"kind":"credit","unlimited":true,"reason":"line removed"}`)
 	f.Add(`{"kind":"credit","amount":-1,"unlimited":true}`)
+	f.Add(`{"transfers":[{"currency":"USD","postings":[{"account":"a","direction":"debit","amount":1},{"account":"b","direction":"credit","amount":1}]}]}`)
 	l, err := ledger.Open(ledger.Options{SweepInterval: -1})
 	if err != nil {
 		f.Fatal(err)
@@ -656,10 +657,15 @@ func FuzzCreateTransfer(f *testing.F) {
 		f.Fatal(err)
 	}
 	f.Fuzz(func(t *testing.T, body string) {
-		for _, path := range []string{"/v1/transfers", "/v1/accounts", "/v1/transfers/tr_x/reverse",
-			"/v1/accounts/b/limits", "/v1/accounts/z/freeze", "/v1/accounts/z/limits", "/v1/accounts/z/unfreeze",
-			"/v1/accounts/z/close", "/v1/accounts/missing/freeze"} {
-			req := httptest.NewRequest("POST", path, strings.NewReader(body))
+		// The batch endpoint gets the input as it is and as two linked
+		// transfers, so an input that is a valid transfer also runs as a
+		// batch whose second transfer depends on the first.
+		linked := `{"transfers":[` + body + `,` + body + `]}`
+		for _, c := range []struct{ path, body string }{{"/v1/transfers", body}, {"/v1/accounts", body}, {"/v1/transfers/tr_x/reverse", body},
+			{"/v1/accounts/b/limits", body}, {"/v1/accounts/z/freeze", body}, {"/v1/accounts/z/limits", body}, {"/v1/accounts/z/unfreeze", body},
+			{"/v1/accounts/z/close", body}, {"/v1/accounts/missing/freeze", body}, {"/v1/transfers/batch", body}, {"/v1/transfers/batch", linked}} {
+			path := c.path
+			req := httptest.NewRequest("POST", path, strings.NewReader(c.body))
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
@@ -669,6 +675,12 @@ func FuzzCreateTransfer(f *testing.F) {
 			}
 			if !json.Valid(w.Body.Bytes()) {
 				t.Fatalf("%s %q: response is not JSON", path, body)
+			}
+			if path == "/v1/transfers/batch" && w.Code == 201 && c.body == linked {
+				var out struct{ Results []batchItem }
+				if json.Unmarshal(w.Body.Bytes(), &out); len(out.Results) != 2 || out.Results[0].Transfer == nil || out.Results[1].Transfer == nil {
+					t.Fatalf("linked batch %q: %s", body, w.Body.String())
+				}
 			}
 		}
 		if v := append(l.CheckInvariants(), l.CheckIndexes()...); len(v) > 0 {
