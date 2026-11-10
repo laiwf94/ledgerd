@@ -373,8 +373,18 @@ func (t *txn) createTransfer(s *TransferSpec, id string) (Outcome, *Error) {
 	}
 	tr := &Transfer{ID: id, State: StatePosted, Currency: s.Currency, Reference: s.Reference,
 		Metadata: copyMap(s.Metadata), CreatedAt: t.now, Postings: make([]Posting, len(s.Postings))}
+	if s.BalanceDebit || s.BalanceCredit {
+		amount, err := t.balancingAmount(s, kind)
+		if err != nil {
+			return Outcome{}, err
+		}
+		tr.Balancing = &Balancing{Debit: s.BalanceDebit, Credit: s.BalanceCredit, Requested: s.Postings[0].Amount, Amount: amount}
+	}
 	lines := make([]Line, len(s.Postings))
 	for i, p := range s.Postings {
+		if tr.Balancing != nil {
+			p.Amount = tr.Balancing.Amount
+		}
 		tr.Postings[i] = Posting{Account: p.Account, Direction: p.Direction, Amount: p.Amount}
 		lines[i] = Line{Account: p.Account, Direction: p.Direction}
 		if s.Pending {
@@ -397,6 +407,75 @@ func (t *txn) createTransfer(s *TransferSpec, id string) (Outcome, *Error) {
 	}
 	t.putTransfer(tr)
 	return Outcome{Transfer: tr}, nil
+}
+
+// balancingAmount is what a balancing transfer moves: the amount asked for,
+// cut down to the room of each side that may balance. Validate has made sure
+// the transfer has two postings of the same amount, one each way.
+// Status and currency are checked first, so a balancing transfer is refused
+// for the same reasons, with the same errors, as any other.
+func (t *txn) balancingAmount(s *TransferSpec, kind EntryKind) (int64, *Error) {
+	amount := s.Postings[0].Amount
+	for _, p := range s.Postings {
+		if p.Direction == Debit && !s.BalanceDebit || p.Direction == Credit && !s.BalanceCredit {
+			continue
+		}
+		a, ok := t.account(p.Account)
+		if !ok {
+			return 0, errf(CodeNotFound, "account %s does not exist", p.Account)
+		}
+		if err := a.usable(kind); err != nil {
+			return 0, err
+		}
+		if a.Currency != s.Currency {
+			return 0, errf(CodeCurrencyMismatch, "account %s holds %s, not %s", a.ID, a.Currency, s.Currency)
+		}
+		room := a.room(p.Direction)
+		if room <= 0 {
+			return 0, errf(CodeLimitExceeded, "account %s has nothing to balance against: a %s would take it past its limit", a.ID, p.Direction)
+		}
+		amount = min(amount, room)
+	}
+	return amount, nil
+}
+
+// room is the largest amount a line on side d, posted or pending, can move
+// through the account without crossing its limits, counting a limit that is
+// not set as zero (TigerBeetle's balancing rule, measured on the account's
+// normal side). A line on the normal side raises the balance including
+// incoming reservations, so the credit limit bounds it; a line on the other
+// side lowers the available balance, so the overdraft limit bounds it. Both
+// quantities move by exactly the line's amount whether it posts or reserves.
+// The result is negative when the account is already past the limit.
+func (a *account) room(d Direction) int64 {
+	b := a.bounds()
+	if d == a.NormalBalance {
+		c := max(b.credit, 0)
+		return satSub(c, ceilingOf(a.bal, a.NormalBalance))
+	}
+	o := max(b.overdraft, 0)
+	return satAdd(floorOf(a.bal, a.NormalBalance), o)
+}
+
+// satAdd and satSub add and subtract, stopping at the int64 range.
+func satAdd(x, y int64) int64 {
+	if r, ok := money.Add(x, y); ok {
+		return r
+	}
+	if y > 0 {
+		return math.MaxInt64
+	}
+	return math.MinInt64
+}
+
+func satSub(x, y int64) int64 {
+	if r, ok := money.Sub(x, y); ok {
+		return r
+	}
+	if y < 0 {
+		return math.MaxInt64
+	}
+	return math.MinInt64
 }
 
 // pendingTransfer returns a transfer that must currently be pending.

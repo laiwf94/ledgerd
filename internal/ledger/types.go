@@ -240,9 +240,22 @@ type Transfer struct {
 	ExpiresAt time.Time         `json:"expires_at,omitzero"`
 	// Reverses links a reversal to the transfer it reverses; Reversals links
 	// the other way.
-	Reverses  string     `json:"reverses,omitempty"`
-	Reversals []string   `json:"reversals,omitempty"`
+	Reverses  string   `json:"reverses,omitempty"`
+	Reversals []string `json:"reversals,omitempty"`
+	// Balancing is set when the transfer was created with balance_debit or
+	// balance_credit, and says how much was asked for and how much moved.
+	Balancing *Balancing `json:"balancing,omitempty"`
 	Entries   []EntryRef `json:"entries"`
+}
+
+// Balancing records a balancing transfer: the amount asked for, which sides
+// were allowed to clamp it, and the amount that moved, which is what each
+// posting's Amount holds.
+type Balancing struct {
+	Debit     bool  `json:"balance_debit,omitempty"`
+	Credit    bool  `json:"balance_credit,omitempty"`
+	Requested int64 `json:"requested_amount"`
+	Amount    int64 `json:"amount"`
 }
 
 func (t *Transfer) clone() *Transfer {
