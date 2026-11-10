@@ -368,6 +368,20 @@ func writeSmallSnapshot(t *testing.T, ver int) (dir string, clock *fakeClock) {
 		}
 		e.l.Do(ctx, batchCmd(move(dr("bank", 1), cr("shop", 1)), move(dr("alice", 1), cr("shop", 1))), key("k5", "batch-frozen", "batch-frozen"))
 	}
+	if ver >= 5 {
+		// A keyed balancing transfer cut down to what the sweep account
+		// holds, and a balancing hold cut down to the pool's credit limit.
+		e.do(openAcct("sweep", "USD", Credit, "nonneg"))
+		e.do(openAcct("pool", "USD", Credit))
+		e.do(move(dr("bank", 40), cr("sweep", 40)))
+		if _, err := e.l.Do(ctx, balancing(true, false, dr("sweep", 100), cr("pool", 100)), key("k6", "sweep", "sweep")); err != nil {
+			t.Fatal(err)
+		}
+		e.do(limitCmd("pool", LimitCredit, 60, ""))
+		c := balancing(false, true, dr("bank", 100), cr("pool", 100))
+		c.CreateTransfer.Pending, c.CreateTransfer.TimeoutSeconds = true, 60
+		e.do(c)
+	}
 	e.l.Close()
 	if nums := snapshotFiles(t, e.dir); len(nums) != 1 {
 		t.Fatalf("snapshots %v", nums)
@@ -425,9 +439,13 @@ func TestSnapshotRoundTripsEveryField(t *testing.T) {
 		if le, _ := err.(*Error); le == nil || le.Code != CodeAccountFrozen || le.Item == nil || *le.Item != 1 {
 			t.Fatalf("replayed refused batch: %v", err)
 		}
+		out, err = l.Do(ctx, balancing(true, false, dr("sweep", 100), cr("pool", 100)), key("k6", "sweep", "sweep"))
+		if err != nil || !out.Replayed || !reflect.DeepEqual(out.Transfer.Balancing, &Balancing{Debit: true, Requested: 100, Amount: 40}) {
+			t.Fatalf("replayed balancing transfer: %v %+v", err, out.Transfer)
+		}
 	}
 	// The expiry schedule came back: the 5 second hold expires on time, and
-	// the batch's 60 second hold later.
+	// the batch's and the balancing 60 second holds later.
 	clock.Advance(6 * time.Second)
 	n, err := fromSnap.ExpireDue(ctx)
 	if err != nil || n != 1 {
@@ -435,7 +453,7 @@ func TestSnapshotRoundTripsEveryField(t *testing.T) {
 	}
 	clock.Advance(60 * time.Second)
 	n, err = fromSnap.ExpireDue(ctx)
-	if err != nil || n != 1 {
+	if err != nil || n != 2 {
 		t.Fatalf("expired %d, %v", n, err)
 	}
 }

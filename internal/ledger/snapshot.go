@@ -54,8 +54,8 @@ const (
 	// status, and version 2, which lacks limit changes, are still read:
 	// every account in them is open with the limits it was created with.
 	// Version 3 lacks batch results, which no ledger could hold when it was
-	// written.
-	snapVersion    = 4
+	// written, and version 4 lacks balancing records for the same reason.
+	snapVersion    = 5
 	snapPrefix     = "snapshot-"
 	snapSuffix     = ".snap"
 	snapTmpSuffix  = ".tmp"
@@ -369,6 +369,29 @@ func (w *snapWriter) transfer(t *Transfer) {
 		w.u(e.Seq)
 		w.str(string(e.Kind))
 	}
+	if w.ver >= 5 {
+		w.balancing(t.Balancing)
+	}
+}
+
+// balancing writes a transfer's balancing record: one byte with bit 0 for
+// balance_debit and bit 1 for balance_credit, 0 for none, then the requested
+// and resulting amounts.
+func (w *snapWriter) balancing(b *Balancing) {
+	if b == nil {
+		w.tag(0)
+		return
+	}
+	var bits byte
+	if b.Debit {
+		bits |= 1
+	}
+	if b.Credit {
+		bits |= 2
+	}
+	w.tag(bits)
+	w.i(b.Requested)
+	w.i(b.Amount)
 }
 
 func (w *snapWriter) encode(s *snapshot) error {
@@ -858,7 +881,24 @@ func (r *snapReader) transfer() *Transfer {
 			t.Entries[j] = EntryRef{Seq: r.u(), Kind: r.kind()}
 		}
 	}
+	if r.ver >= 5 {
+		t.Balancing = r.balancing()
+	}
 	return t
+}
+
+// balancing reads what snapWriter.balancing wrote: a zero byte is no record,
+// and flags other than the two sides are refused.
+func (r *snapReader) balancing() *Balancing {
+	bits := r.byte1()
+	if bits == 0 || r.err != nil {
+		return nil
+	}
+	if bits > 3 {
+		r.fail("bad balancing flags %#x", bits)
+		return nil
+	}
+	return &Balancing{Debit: bits&1 != 0, Credit: bits&2 != 0, Requested: r.i(), Amount: r.i()}
 }
 
 // itemTag starts the next item, loading a new frame if needed.

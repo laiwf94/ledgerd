@@ -21,6 +21,13 @@ current formats.
   One `Idempotency-Key` covers the whole batch, and its result, including a
   refusal, replays across restarts. A batch is rolled back out of a group
   commit it shares with other commands without affecting them.
+- Balancing transfers: `balance_debit` and `balance_credit` on a
+  two-posting transfer cut its amount to what the flagged account can take
+  without crossing its limits, a limit that is not set counting as zero
+  (TigerBeetle's rule), for posted transfers and holds alike. The transfer's
+  `balancing` records `requested_amount` and the `amount` that moved; with
+  nothing to move it is refused with `limit_exceeded`. The invariant checker
+  verifies the record against the postings.
 
 #### Changed
 
@@ -29,6 +36,8 @@ current formats.
   own, so the pooled replay readers stay at 1 MiB.
 - Snapshot format 4 stores batch results and the failing item of a batch
   refusal for kept idempotency keys. Format 1 to 3 files still load.
+- Snapshot format 5 stores each transfer's balancing record. Format 1 to 4
+  files still load.
 - Ledger errors carry `item` when they are about one transfer of a batch.
 
 ### Listings, indexes and account lifecycle (#25)

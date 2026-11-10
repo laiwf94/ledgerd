@@ -574,9 +574,9 @@ order. Items, in file order:
 
 | Tag | Item | Fields |
 |---|---|---|
-| `H` | header, first | `u` format version (4), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys |
+| `H` | header, first | `u` format version (5), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys |
 | `A` | account, by ID | `str` ID, `str` currency, `i` exponent, `str` normal balance, `bool` non-negative, `bool` non-positive, `meta`, `time` created; `i` debits posted, credits posted, debits pending, credits pending; `u` version; `u` count then per status change `u` journal head, `time`, `str` status, `str` reason; `u` count then per limit change `u` journal head, `time`, `str` kind, `i` amount (-1 for none), `str` reason |
-| `T` | transfer, by ID | `str` ID, state, currency; `u` posting count then per posting `str` account, `str` direction, `i` amount, posted, reversed; `str` reference, `meta`, `time` created, `time` expires, `str` reverses; `u` count then `str` reversal IDs; `u` count then per entry `u` sequence, `str` kind |
+| `T` | transfer, by ID | `str` ID, state, currency; `u` posting count then per posting `str` account, `str` direction, `i` amount, posted, reversed; `str` reference, `meta`, `time` created, `time` expires, `str` reverses; `u` count then `str` reversal IDs; `u` count then per entry `u` sequence, `str` kind; from format 5 a balancing byte (0 none, else bit 0 `balance_debit`, bit 1 `balance_credit`) followed, when not 0, by `i` requested amount and `i` amount |
 | `E` | journal entry, by sequence from 1 | `u` sequence, `time`, `str` kind, transfer ID, currency; `u` line count then per line `str` account, `str` direction, `i` posted, `i` pending |
 | `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result, 8 batch result, 16 error names a batch item); then if flagged: `str` code and message, and `u` item index if flag 16; an account as in `A` with `u` version, the four totals, `u` as-of sequence, then `str` status, `str` status reason and `time` changed, then `i` overdraft and credit limits (-1 for none) and `u` effective sequence; a transfer as in `T`; `i` count of reservations expired; finally `u` number of batch transfers if flag 8 |
 | `B` | one transfer of a batch result, right after its `I` item, in batch order | a transfer as in `T` |
@@ -585,10 +585,11 @@ order. Items, in file order:
 Each format carries a version: the log's `header` record, the manifest's
 first line and the snapshot's `H` item. A reader refuses a version it does
 not know, so a changed layout must come with a new version number. Snapshot
-format 2 added account status, format 3 limit changes and format 4 batch
-results; format 1 and 2 files, which lack those fields, still load with
-every account open and at the limits its flags give, and format 3 files,
-written before batches existed, load as they are. A batch result is spread
+format 2 added account status, format 3 limit changes, format 4 batch
+results and format 5 balancing records; format 1 and 2 files, which lack
+those fields, still load with every account open and at the limits its
+flags give, and format 3 and 4 files, written before batches or balancing
+transfers existed, load as they are. A batch result is spread
 over `B` items because thousands of transfers can be more than one frame
 holds. New command kinds in `cmd` records keep
 the log at version 1: an older binary refuses a log holding a command it
@@ -703,6 +704,55 @@ Validation errors about one transfer name it the same way. One
 `Idempotency-Key` covers the whole batch: a retry returns every transfer of
 the original, or the original refusal naming the same transfer, even once
 the batch would succeed.
+
+## Balancing transfers
+
+A transfer may carry `balance_debit`, `balance_credit` or both
+(TigerBeetle's `balancing_debit` and `balancing_credit`). The amount given is
+then a maximum: the transfer moves the lesser of it and what each flagged
+account can take without crossing its limits. A sweep asks for more than an
+account could hold and moves whatever is there; a loan repayment asks for
+the payment and stops at what is owed. Only two-posting transfers can
+balance, since cutting one leg of a larger transfer has no single answer;
+validation refuses others with `invalid_argument`.
+
+The room is measured on the account's normal side, with a limit that is not
+set counting as zero:
+
+| Posting on the account's | Moves | Room |
+|---|---|---|
+| normal side (raises the balance) | `posted + incoming pending` up | `C - (posted + incoming pending)` |
+| other side (lowers the balance) | `available` down | `available + O` |
+
+Both quantities move by exactly the posting's amount whether it posts or
+reserves, so the rule is the same for a balancing hold, and open
+reservations count against the room of later balancing transfers. Counting
+an unset limit as zero is TigerBeetle's rule (a balancing debit never takes
+the debit account's debits past its credits), and it holds on either normal
+balance: a credit-normal wallet with no limits is swept down to zero, and a
+debit-normal loan with no limits is repaid down to zero. Where a limit is
+set, the transfer may use all of it, overdraft included. The room is
+computed in saturating arithmetic, so limits near the int64 range cannot
+overflow it.
+
+The flagged accounts are checked for existence, status and currency first,
+with the usual errors, so a frozen account with nothing in it is
+`account_frozen`, not a limit error. If the room is zero or less the
+transfer is refused with `limit_exceeded` ("nothing to balance against");
+ledgerd never writes an entry for zero. Only the flagged side is cut: the
+other account still passes every check in `post`, so a balancing debit into
+an account at its credit limit is refused as usual. Inside a batch a
+balancing transfer sees what the transfers before it did, so "fund, then
+sweep" is one record.
+
+The transfer's postings hold the amount that moved, and `balancing`
+(`balance_debit`, `balance_credit`, `requested_amount`, `amount`) records the
+request; it is absent on other transfers. The amount is not in the log:
+replay recomputes it from the same state, so the log, a snapshot and a
+keyed retry (which returns the original result even after balances change)
+all agree. The invariant checker refuses a balancing record its postings
+do not bear out (two postings, opposite directions, both of `amount`, which
+is positive and at most `requested_amount`, and never on a reversal).
 
 ## Preconditions instead of locks
 
@@ -888,7 +938,8 @@ a reversal. Dates are UTC.
 5. every account's pending totals equal the open pending transfers' postings
    to it, and the count of open transfers matches;
 6. every transfer's posted and reversed amounts agree with its postings and
-   its reversals;
+   its reversals, and a balancing transfer's record agrees with its two
+   postings;
 7. every account's status history follows the rules (open to frozen and
    back, open or frozen to closed, never out of closed, in journal order),
    no entry touched an account while it was closed or, other than a void or

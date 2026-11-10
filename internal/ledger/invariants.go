@@ -399,6 +399,9 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 			if tr.State == StatePending {
 				open++
 			}
+			if b := tr.Balancing; b != nil && balancingProblem(tr) {
+				bad("transfer %s says it balanced %d of %d, which its postings do not match", id, b.Amount, b.Requested)
+			}
 			for _, p := range tr.Postings {
 				if p.Posted < 0 || p.Posted > p.Amount || p.Reversed < 0 || p.Reversed > p.Posted {
 					bad("transfer %s posting to %s has inconsistent amounts", id, p.Account)
@@ -489,4 +492,20 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 		}
 	}
 	return v.head, out
+}
+
+// balancingProblem checks a balancing transfer's record against its
+// postings: a side was named, both postings moved the amount it says, and
+// that amount is positive and at most what was asked for.
+func balancingProblem(tr *Transfer) bool {
+	b := tr.Balancing
+	if !b.Debit && !b.Credit || len(tr.Postings) != 2 || b.Amount <= 0 || b.Amount > b.Requested || tr.Reverses != "" {
+		return true
+	}
+	for _, p := range tr.Postings {
+		if p.Amount != b.Amount {
+			return true
+		}
+	}
+	return tr.Postings[0].Direction == tr.Postings[1].Direction
 }

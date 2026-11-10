@@ -76,6 +76,13 @@ type TransferSpec struct {
 	Reference      string            `json:"reference,omitempty"`
 	Metadata       map[string]string `json:"metadata,omitempty"`
 	Preconditions  []Precondition    `json:"preconditions,omitempty"`
+	// BalanceDebit and BalanceCredit make a balancing transfer: the posted
+	// or reserved amount is the lesser of the amount asked for and what the
+	// debit (or credit) account can take without crossing its limits, a
+	// limit that is not set counting as zero. Only two-posting transfers can
+	// balance; the transfer's Balancing says how much moved.
+	BalanceDebit  bool `json:"balance_debit,omitempty"`
+	BalanceCredit bool `json:"balance_credit,omitempty"`
 }
 
 // PartialAmount names how much of one posting to post or reverse.
@@ -398,6 +405,9 @@ func (s *TransferSpec) validate() *Error {
 	}
 	if debits != credits {
 		return errf(CodeInvalid, "debits (%d) must equal credits (%d)", debits, credits)
+	}
+	if (s.BalanceDebit || s.BalanceCredit) && len(s.Postings) != 2 {
+		return errf(CodeInvalid, "balance_debit and balance_credit work for two-posting transfers; this one has %d postings", len(s.Postings))
 	}
 	if s.Pending {
 		if s.TimeoutSeconds == 0 {

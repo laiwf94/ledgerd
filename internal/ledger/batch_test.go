@@ -543,6 +543,17 @@ func TestLargestBatchSurvivesRestart(t *testing.T) {
 }
 
 // Version 3 snapshots, written before batches, still load.
+func TestVersionFourSnapshotsLoad(t *testing.T) {
+	old := snapWriteVersion
+	snapWriteVersion = 4
+	t.Cleanup(func() { snapWriteVersion = old })
+	dir, clock := writeSmallSnapshot(t, 4)
+	snapWriteVersion = old
+	fromSnap := openAt(t, copyDir(t, dir, true), clock, nil)
+	full := openAt(t, copyDir(t, dir, false), clock, nil)
+	sameState(t, "version 4", fromSnap, full)
+}
+
 func TestVersionThreeSnapshotsLoad(t *testing.T) {
 	old := snapWriteVersion
 	snapWriteVersion = 3
