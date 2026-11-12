@@ -295,6 +295,10 @@ func (t *txn) apply(c *Command, id string) (Outcome, *Error) {
 		return t.postPending(c.Post)
 	case c.Void != nil:
 		return t.release(c.Void.TransferID, KindVoidPending, StateVoided)
+	case c.IncreasePending != nil:
+		return t.increasePending(c.IncreasePending)
+	case c.ExtendPending != nil:
+		return t.extendPending(c.ExtendPending)
 	case c.Reverse != nil:
 		return t.reverse(c.Reverse, id)
 	case c.FreezeAccount != nil:
@@ -526,6 +530,83 @@ func (t *txn) postPending(s *PostSpec) (Outcome, *Error) {
 	return Outcome{Transfer: c}, nil
 }
 
+// increasePending reserves more on a pending transfer's postings. The new
+// lines go through the same checks as a new reservation: the accounts must be
+// open, and no limit may be crossed. A balancing hold is refused, because its
+// amount is what its limits allowed when it was made; a new balancing hold
+// can take more.
+func (t *txn) increasePending(s *IncreaseSpec) (Outcome, *Error) {
+	tr, err := t.pendingTransfer(s.TransferID)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if tr.Balancing != nil {
+		return Outcome{}, errf(CodeInvalidState, "transfer %s is a balancing hold; its amount was cut to its limits, so make a new hold for more", tr.ID)
+	}
+	unbounded := make([]int64, len(tr.Postings))
+	for i := range unbounded {
+		unbounded[i] = math.MaxInt64
+	}
+	more, err := resolve(tr, s.Amounts, unbounded, "")
+	if err != nil {
+		return Outcome{}, err
+	}
+	var lines []Line
+	for i, p := range tr.Postings {
+		if more[i] > 0 {
+			lines = append(lines, Line{Account: p.Account, Direction: p.Direction, Pending: more[i]})
+		}
+	}
+	seq, err := t.post(KindIncreasePending, tr.ID, tr.Currency, lines)
+	if err != nil {
+		return Outcome{}, err
+	}
+	// Each posting's amount is part of its account's pending total, which
+	// post kept within an int64, so the sums below fit.
+	c := tr.clone()
+	for i := range c.Postings {
+		c.Postings[i].Amount += more[i]
+	}
+	c.Entries = append(c.Entries, EntryRef{Seq: seq, Kind: KindIncreasePending})
+	t.putTransfer(c)
+	return Outcome{Transfer: c}, nil
+}
+
+// extendPending moves a pending transfer's timeout later. It writes an entry
+// with no lines, so balances and account versions stay as they are, but the
+// transfer's history and the journal both show the change. Like every other
+// change to a reservation except its release, it is refused while one of the
+// transfer's accounts is frozen. The old timeout stays in the expiry heap,
+// where the sweep skips it because it no longer matches the transfer.
+func (t *txn) extendPending(s *ExtendSpec) (Outcome, *Error) {
+	tr, err := t.pendingTransfer(s.TransferID)
+	if err != nil {
+		return Outcome{}, err
+	}
+	at := t.now.Add(time.Duration(s.TimeoutSeconds) * time.Second)
+	if !at.After(tr.ExpiresAt) {
+		return Outcome{}, errf(CodeInvalidState, "transfer %s already expires at %s; timeout_seconds %d would not extend it",
+			tr.ID, tr.ExpiresAt.Format(time.RFC3339), s.TimeoutSeconds)
+	}
+	for _, p := range tr.Postings {
+		a, ok := t.account(p.Account)
+		if !ok {
+			return Outcome{}, errf(CodeNotFound, "account %s does not exist", p.Account)
+		}
+		if err := a.usable(KindExtendPending); err != nil {
+			return Outcome{}, err
+		}
+	}
+	seq := t.nextSeq()
+	t.entries = append(t.entries, Entry{Seq: seq, Time: t.now, Kind: KindExtendPending, TransferID: tr.ID, Currency: tr.Currency, ExpiresAt: at})
+	c := tr.clone()
+	c.ExpiresAt = at
+	c.Entries = append(c.Entries, EntryRef{Seq: seq, Kind: KindExtendPending})
+	t.putTransfer(c)
+	t.expiries = append(t.expiries, expiry{at: at, id: tr.ID})
+	return Outcome{Transfer: c}, nil
+}
+
 // release voids or expires a pending transfer.
 func (t *txn) release(id string, kind EntryKind, to TransferState) (Outcome, *Error) {
 	tr, err := t.pendingTransfer(id)
@@ -635,12 +716,18 @@ func resolve(tr *Transfer, a Amounts, limit []int64, what string) ([]int64, *Err
 			}
 			out[i] = p.Amount
 		}
-		var debits, credits int64 // each is at most a sum of the transfer's own balanced amounts, so no overflow
+		// An increase has no upper limit per posting, so the sums can
+		// overflow even though each amount fits.
+		var debits, credits int64
 		for i, p := range tr.Postings {
+			ok := true
 			if p.Direction == Debit {
-				debits += out[i]
+				debits, ok = money.Add(debits, out[i])
 			} else {
-				credits += out[i]
+				credits, ok = money.Add(credits, out[i])
+			}
+			if !ok {
+				return nil, errf(CodeOverflow, "the amounts add up to more than %d", int64(math.MaxInt64))
 			}
 		}
 		if debits != credits {

@@ -111,6 +111,24 @@ type VoidSpec struct {
 	TransferID string `json:"transfer_id"`
 }
 
+// IncreaseSpec adds to a pending transfer's reservation, as when a hotel
+// raises a card hold. Amounts says how much more each posting reserves: Amount
+// for a two-posting transfer, or Postings, which must balance. It may not be
+// empty. The new amounts are checked against the accounts' limits like a new
+// reservation, and the transfer keeps its timeout.
+type IncreaseSpec struct {
+	TransferID string `json:"transfer_id"`
+	Amounts
+}
+
+// ExtendSpec moves a pending transfer's timeout to TimeoutSeconds from now,
+// which must be later than the timeout it has. Timeouts only move later; void
+// the transfer to release it early.
+type ExtendSpec struct {
+	TransferID     string `json:"transfer_id"`
+	TimeoutSeconds int64  `json:"timeout_seconds"`
+}
+
 // ReverseSpec sends back some or all of a posted transfer as a new transfer
 // linked to it. History is never edited; corrections are new entries.
 type ReverseSpec struct {
@@ -152,6 +170,8 @@ type Command struct {
 	CreateTransfer  *TransferSpec `json:"create_transfer,omitempty"`
 	Post            *PostSpec     `json:"post,omitempty"`
 	Void            *VoidSpec     `json:"void,omitempty"`
+	IncreasePending *IncreaseSpec `json:"increase_pending,omitempty"`
+	ExtendPending   *ExtendSpec   `json:"extend_pending,omitempty"`
 	Reverse         *ReverseSpec  `json:"reverse,omitempty"`
 	FreezeAccount   *StatusSpec   `json:"freeze_account,omitempty"`
 	UnfreezeAccount *StatusSpec   `json:"unfreeze_account,omitempty"`
@@ -246,7 +266,7 @@ func validateCurrency(code string) *Error {
 func (c *Command) Validate() *Error {
 	n := 0
 	for _, set := range []bool{c.CreateAccount != nil, c.CreateTransfer != nil, c.Post != nil, c.Void != nil, c.Reverse != nil,
-		c.FreezeAccount != nil, c.UnfreezeAccount != nil, c.CloseAccount != nil, c.SetLimit != nil, c.CreateBatch != nil} {
+		c.IncreasePending != nil, c.ExtendPending != nil, c.FreezeAccount != nil, c.UnfreezeAccount != nil, c.CloseAccount != nil, c.SetLimit != nil, c.CreateBatch != nil} {
 		if set {
 			n++
 		}
@@ -269,6 +289,10 @@ func (c *Command) Validate() *Error {
 			return errf(CodeInvalid, "transfer_id is not valid")
 		}
 		return nil
+	case c.IncreasePending != nil:
+		return c.IncreasePending.validate()
+	case c.ExtendPending != nil:
+		return c.ExtendPending.validate()
 	case c.FreezeAccount != nil:
 		return c.FreezeAccount.validate()
 	case c.UnfreezeAccount != nil:
@@ -440,6 +464,26 @@ func (s *TransferSpec) validate() *Error {
 		if p.Version == nil && p.PostedBalance == nil {
 			return errf(CodeInvalid, "preconditions[%d] must set version or posted_balance", i)
 		}
+	}
+	return nil
+}
+
+func (s *IncreaseSpec) validate() *Error {
+	if !ValidID(s.TransferID) {
+		return errf(CodeInvalid, "transfer_id is not valid")
+	}
+	if s.Amount == 0 && len(s.Postings) == 0 {
+		return errf(CodeInvalid, "give amount or postings: how much more to reserve")
+	}
+	return s.Amounts.validate()
+}
+
+func (s *ExtendSpec) validate() *Error {
+	if !ValidID(s.TransferID) {
+		return errf(CodeInvalid, "transfer_id is not valid")
+	}
+	if s.TimeoutSeconds < 1 || s.TimeoutSeconds > maxTimeoutSecs {
+		return errf(CodeInvalid, "timeout_seconds must be between 1 and %d", maxTimeoutSecs)
 	}
 	return nil
 }

@@ -28,6 +28,15 @@ current formats.
   `balancing` records `requested_amount` and the `amount` that moved; with
   nothing to move it is refused with `limit_exceeded`. The invariant checker
   verifies the record against the postings.
+- Growing and extending holds: `POST /v1/transfers/{id}/increase`
+  (`increase_pending`) reserves more on a pending transfer, by `amount` or
+  balanced per-posting `postings`, checked against limits like a new hold;
+  `POST /v1/transfers/{id}/extend` (`extend_pending`) moves its timeout to
+  `timeout_seconds` from now, later only. Both are logged, keyed and listed
+  in the transfer's `entries`; an extension's journal entry has no lines
+  and carries the new `expires_at`. Balancing holds cannot grow, and
+  neither change applies while one of the hold's accounts is frozen. The
+  invariant checker ties each hold's amounts and timeout to its entries.
 
 #### Changed
 
@@ -38,6 +47,10 @@ current formats.
   refusal for kept idempotency keys. Format 1 to 3 files still load.
 - Snapshot format 5 stores each transfer's balancing record. Format 1 to 4
   files still load.
+- Snapshot format 6 allows `increase_pending` and `extend_pending` entries
+  and stores an extension's timeout. Format 1 to 5 files still load.
+- Amounts given per posting are summed with overflow checks, returning
+  `overflow` instead of relying on the transfer's own totals.
 - Ledger errors carry `item` when they are about one transfer of a batch.
 
 ### Listings, indexes and account lifecycle (#25)

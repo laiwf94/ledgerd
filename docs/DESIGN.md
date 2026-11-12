@@ -61,6 +61,8 @@ creates; journal entries are the immutable records of what happened to it.
 | single-phase transfer | `posted` | posted += amount |
 | pending transfer | `pending` | pending += amount |
 | post (capture) | `post_pending` | pending -= reserved, posted += captured |
+| increase a hold | `increase_pending` | pending += increase |
+| extend a hold | `extend_pending` | none; the entry has no lines |
 | void | `void_pending` | pending -= reserved |
 | timeout | `expire_pending` | pending -= reserved |
 | reversal | `reversal` | posted += amount on the opposite side |
@@ -86,6 +88,8 @@ capture less than the reservation (per posting, as long as the capture still
 balances), and the rest is released; voiding releases everything. A pending
 transfer has a timeout (default 24 h, at most 30 days). Posting is one-shot:
 after a partial capture the remainder is gone, as with card authorizations.
+While a hold is open it can grow and its timeout can move later; see
+[changing a hold](#changing-a-hold).
 
 History is immutable: there is no update or delete. A correction is a
 reversal: a new transfer with the original postings' sides flipped, linked
@@ -574,10 +578,10 @@ order. Items, in file order:
 
 | Tag | Item | Fields |
 |---|---|---|
-| `H` | header, first | `u` format version (5), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys |
+| `H` | header, first | `u` format version (6), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys |
 | `A` | account, by ID | `str` ID, `str` currency, `i` exponent, `str` normal balance, `bool` non-negative, `bool` non-positive, `meta`, `time` created; `i` debits posted, credits posted, debits pending, credits pending; `u` version; `u` count then per status change `u` journal head, `time`, `str` status, `str` reason; `u` count then per limit change `u` journal head, `time`, `str` kind, `i` amount (-1 for none), `str` reason |
 | `T` | transfer, by ID | `str` ID, state, currency; `u` posting count then per posting `str` account, `str` direction, `i` amount, posted, reversed; `str` reference, `meta`, `time` created, `time` expires, `str` reverses; `u` count then `str` reversal IDs; `u` count then per entry `u` sequence, `str` kind; from format 5 a balancing byte (0 none, else bit 0 `balance_debit`, bit 1 `balance_credit`) followed, when not 0, by `i` requested amount and `i` amount |
-| `E` | journal entry, by sequence from 1 | `u` sequence, `time`, `str` kind, transfer ID, currency; `u` line count then per line `str` account, `str` direction, `i` posted, `i` pending |
+| `E` | journal entry, by sequence from 1 | `u` sequence, `time`, `str` kind, transfer ID, currency; `u` line count then per line `str` account, `str` direction, `i` posted, `i` pending; from format 6 `time` expires, set only on an `extend_pending` entry, which alone has no lines |
 | `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result, 8 batch result, 16 error names a batch item); then if flagged: `str` code and message, and `u` item index if flag 16; an account as in `A` with `u` version, the four totals, `u` as-of sequence, then `str` status, `str` status reason and `time` changed, then `i` overdraft and credit limits (-1 for none) and `u` effective sequence; a transfer as in `T`; `i` count of reservations expired; finally `u` number of batch transfers if flag 8 |
 | `B` | one transfer of a batch result, right after its `I` item, in batch order | a transfer as in `T` |
 | `Z` | footer, alone in the last frame | `u` number of frames before it |
@@ -586,10 +590,13 @@ Each format carries a version: the log's `header` record, the manifest's
 first line and the snapshot's `H` item. A reader refuses a version it does
 not know, so a changed layout must come with a new version number. Snapshot
 format 2 added account status, format 3 limit changes, format 4 batch
-results and format 5 balancing records; format 1 and 2 files, which lack
+results, format 5 balancing records and format 6 hold increases and
+extensions (`increase_pending` and `extend_pending` entries, and the
+timeout an extension sets); format 1 and 2 files, which lack
 those fields, still load with every account open and at the limits its
-flags give, and format 3 and 4 files, written before batches or balancing
-transfers existed, load as they are. A batch result is spread
+flags give, and format 3 to 5 files, written before batches, balancing
+transfers or hold changes existed, load as they are; a file older than 6
+holding either new entry kind is refused. A batch result is spread
 over `B` items because thousands of transfers can be more than one frame
 holds. New command kinds in `cmd` records keep
 the log at version 1: an older binary refuses a log holding a command it
@@ -753,6 +760,51 @@ keyed retry (which returns the original result even after balances change)
 all agree. The invariant checker refuses a balancing record its postings
 do not bear out (two postings, opposite directions, both of `amount`, which
 is positive and at most `requested_amount`, and never on a reversal).
+
+## Changing a hold
+
+A hold (a pending transfer) can change in two ways while it is open, both
+logged commands with an `Idempotency-Key` like any other, both recorded in
+the transfer's `entries` and in the journal:
+
+- **Increase** (`POST /v1/transfers/{id}/increase`, `increase_pending`)
+  reserves more, as when a hotel raises a card hold for an extra night. The
+  body is shaped like a partial post: `amount` for a two-posting transfer,
+  or `postings` naming how much more each posting reserves, balanced, at
+  least one. The entry has a line for each posting that grows, with only a
+  pending amount, and each posting's `amount` grows by it. The lines go
+  through `post` like a new hold's: the accounts must exist, be open and
+  hold the currency, no total may overflow, and no limit may be crossed, so
+  an increase past what a wallet has is `limit_exceeded` and changes
+  nothing. A balancing hold cannot be increased (`invalid_state`): its
+  amount is what its limits allowed when it was made, and a new balancing
+  hold takes whatever more there is. Posting the hold later captures up to
+  the grown amount, and a void or expiry releases all of it.
+- **Extend** (`POST /v1/transfers/{id}/extend`, `extend_pending`) moves the
+  timeout to `timeout_seconds` (1 s to 30 days) from now. The new timeout
+  must be later than the one the hold has; timeouts never move earlier
+  (`invalid_state`), and voiding is the way to release early. An extension
+  moves no money, so its entry has no lines: no balance, account version or
+  statement row changes. The entry carries the new timeout in
+  `expires_at`, the one entry kind that does. The old timeout stays in the
+  expiry heap, where the sweep skips it because it no longer matches the
+  transfer, and a snapshot schedules only the current one.
+
+Both are refused with `not_found`, `invalid_state` (not pending) or
+`transfer_expired`, and while any of the hold's accounts is frozen
+(`account_frozen`): freezing stops a reservation from growing or lasting
+longer, while a void or expiry still releases it. The sweep runs before
+every group commit, so a hold whose timeout has passed is already expired
+when an increase or extension reaches it. Neither can appear inside an
+atomic batch, which holds new transfers only.
+
+The invariant checker ties a hold to its entries: each listed entry exists,
+belongs to the transfer and has the kind listed; increases and extensions
+follow the `pending` entry and come before any post, void or expiry; each
+posting's `amount` equals what the `pending` and `increase_pending` entries
+reserved on its account; each extension's timeout is later than the one
+before; and an extended hold expires at its last extension's timeout. Only
+`extend_pending` entries have no lines and a timeout.
 
 ## Preconditions instead of locks
 
@@ -940,7 +992,11 @@ a reversal. Dates are UTC.
 6. every transfer's posted and reversed amounts agree with its postings and
    its reversals, and a balancing transfer's record agrees with its two
    postings;
-7. every account's status history follows the rules (open to frozen and
+7. every transfer's entries exist and are its own, every hold reserves on
+   each posting exactly what its `pending` and `increase_pending` entries
+   reserved, it was increased or extended only while open, and it expires at
+   its last extension's timeout (see [changing a hold](#changing-a-hold));
+8. every account's status history follows the rules (open to frozen and
    back, open or frozen to closed, never out of closed, in journal order),
    no entry touched an account while it was closed or, other than a void or
    expiry, while it was frozen, and a closed account holds nothing.
