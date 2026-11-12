@@ -72,10 +72,15 @@ type Account struct {
 	// NonNegative and NonPositive bound the balance on the normal side,
 	// counting pending amounts against it (TigerBeetle's
 	// debits_must_not_exceed_credits and its mirror).
-	NonNegative bool              `json:"non_negative"`
-	NonPositive bool              `json:"non_positive"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	CreatedAt   time.Time         `json:"created_at"`
+	NonNegative bool `json:"non_negative"`
+	NonPositive bool `json:"non_positive"`
+	// Exchange marks a currency exchange account: the ledger's position in
+	// one currency on the other side of conversions. Every multi-currency
+	// transfer converts through exchange accounts, one or more in each of
+	// its currencies, and its rate is checked against what they move.
+	Exchange  bool              `json:"exchange,omitempty"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
+	CreatedAt time.Time         `json:"created_at"`
 }
 
 // Balance holds the four running totals an account keeps. Each only grows,
@@ -216,6 +221,9 @@ const (
 type Posting struct {
 	Account   string    `json:"account"`
 	Direction Direction `json:"direction"`
+	// Currency is set when the posting is in another currency than the
+	// transfer, which only a multi-currency transfer has.
+	Currency string `json:"currency,omitempty"`
 	// Amount is what was requested: reserved for a pending transfer, posted
 	// for a single-phase one.
 	Amount int64 `json:"amount"`
@@ -251,7 +259,38 @@ type Transfer struct {
 	// Balancing is set when the transfer was created with balance_debit or
 	// balance_credit, and says how much was asked for and how much moved.
 	Balancing *Balancing `json:"balancing,omitempty"`
-	Entries   []EntryRef `json:"entries"`
+	// FX is set on a multi-currency transfer: the rate its conversion used,
+	// where the rate came from and when it was quoted.
+	FX      *FX        `json:"fx,omitempty"`
+	Entries []EntryRef `json:"entries"`
+}
+
+// FX is the exchange rate a multi-currency transfer converts at. Base is the
+// transfer's currency and Quote its other one; Rate is how many major units
+// of Quote one major unit of Base buys, as the decimal the client sent.
+type FX struct {
+	Base     string    `json:"base"`
+	Quote    string    `json:"quote"`
+	Rate     string    `json:"rate"`
+	Source   string    `json:"source"`
+	QuotedAt time.Time `json:"quoted_at"`
+}
+
+// currencies returns the currencies a transfer's postings are in: its own
+// first, then the other one of a multi-currency transfer.
+func (t *Transfer) currencies() []string {
+	if t.FX != nil {
+		return []string{t.Currency, t.FX.Quote}
+	}
+	return []string{t.Currency}
+}
+
+// currency returns the currency of a posting of the transfer.
+func (t *Transfer) currency(p *Posting) string {
+	if p.Currency != "" {
+		return p.Currency
+	}
+	return t.Currency
 }
 
 // Balancing records a balancing transfer: the amount asked for, which sides
@@ -278,12 +317,15 @@ func (t *Transfer) clone() *Transfer {
 type Line struct {
 	Account   string    `json:"account"`
 	Direction Direction `json:"direction"`
-	Posted    int64     `json:"posted"`
-	Pending   int64     `json:"pending"`
+	// Currency is set when the line is in another currency than the entry.
+	Currency string `json:"currency,omitempty"`
+	Posted   int64  `json:"posted"`
+	Pending  int64  `json:"pending"`
 }
 
 // Entry is an immutable journal entry. Within an entry, debits equal credits
-// for posted and for pending amounts.
+// in each currency, for posted and for pending amounts. An entry of a
+// multi-currency transfer has lines in two currencies.
 type Entry struct {
 	Seq        uint64    `json:"seq"`
 	Time       time.Time `json:"time"`
@@ -294,6 +336,17 @@ type Entry struct {
 	// ExpiresAt is the new timeout of an extend_pending entry, and zero on
 	// every other kind.
 	ExpiresAt time.Time `json:"expires_at,omitzero"`
+	// FX is the rate of a multi-currency transfer, on the entry that created
+	// it, and nil on every other entry.
+	FX *FX `json:"fx,omitempty"`
+}
+
+// currency returns the currency of one of the entry's lines.
+func (e *Entry) currency(ln *Line) string {
+	if ln.Currency != "" {
+		return ln.Currency
+	}
+	return e.Currency
 }
 
 // row is one entry as seen from one account, with the balance after it.

@@ -641,6 +641,9 @@ func FuzzCreateTransfer(f *testing.F) {
 	f.Add(`{"kind":"credit","unlimited":true,"reason":"line removed"}`)
 	f.Add(`{"kind":"credit","amount":-1,"unlimited":true}`)
 	f.Add(`{"transfers":[{"currency":"USD","postings":[{"account":"a","direction":"debit","amount":1},{"account":"b","direction":"credit","amount":1}]}]}`)
+	f.Add(`{"currency":"USD","postings":[{"account":"a","direction":"debit","amount":100},{"account":"x","direction":"credit","amount":100},` +
+		`{"account":"e","direction":"debit","amount":92,"currency":"EUR"},{"account":"g","direction":"credit","amount":92,"currency":"EUR"}],` +
+		`"fx":{"rate":"0.9234","source":"ecb","quoted_at":"2026-11-12T09:00:00Z"}}`)
 	l, err := ledger.Open(ledger.Options{SweepInterval: -1})
 	if err != nil {
 		f.Fatal(err)
@@ -652,6 +655,11 @@ func FuzzCreateTransfer(f *testing.F) {
 	// z is the account the lifecycle endpoints work on, so a close leaves
 	// a and b free to move money for later inputs.
 	l.Do(ctx, ledger.Command{CreateAccount: &ledger.AccountSpec{ID: "z", Currency: "USD", NormalBalance: ledger.Credit}}, nil)
+	// x and e are exchange accounts in USD and EUR, and g a EUR wallet, for
+	// conversions.
+	l.Do(ctx, ledger.Command{CreateAccount: &ledger.AccountSpec{ID: "x", Currency: "USD", NormalBalance: ledger.Credit, Exchange: true}}, nil)
+	l.Do(ctx, ledger.Command{CreateAccount: &ledger.AccountSpec{ID: "e", Currency: "EUR", NormalBalance: ledger.Credit, Exchange: true}}, nil)
+	l.Do(ctx, ledger.Command{CreateAccount: &ledger.AccountSpec{ID: "g", Currency: "EUR", NormalBalance: ledger.Credit}}, nil)
 	s, err := New(Config{Ledger: l, APIKeys: []string{apiKey}})
 	if err != nil {
 		f.Fatal(err)

@@ -324,7 +324,9 @@ func (ix *indexes) addTransferKind(tr *Transfer) {
 	seq := createdAt(tr)
 	ix.transfers.insert(seq)
 	add(ix.xferState, tr.State, seq)
-	add(ix.xferCurrency, tr.Currency, seq)
+	for _, c := range tr.currencies() {
+		add(ix.xferCurrency, c, seq)
+	}
 }
 
 func (ix *indexes) addTransferAccounts(tr *Transfer) {

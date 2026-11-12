@@ -195,7 +195,7 @@ func (f *TransferFilter) matches(tr *Transfer) bool {
 	if f.State != "" && tr.State != f.State {
 		return false
 	}
-	if f.Currency != "" && tr.Currency != f.Currency {
+	if f.Currency != "" && !slices.Contains(tr.currencies(), f.Currency) {
 		return false
 	}
 	if f.Reference != "" && tr.Reference != f.Reference {

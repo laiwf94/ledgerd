@@ -131,7 +131,10 @@ func (l *Ledger) step(name string) {
 // CheckInvariants verifies the whole ledger and returns a description of
 // each violation (empty when everything holds):
 //
-//  1. every journal entry balances: debits equal credits, posted and pending;
+//  1. every journal entry balances: debits equal credits in each currency,
+//     posted and pending; an entry spans at most two currencies, and the
+//     entry that creates a multi-currency transfer carries its rate, which
+//     what the entry moves through exchange accounts agrees with;
 //  2. per currency, the sum of all debits equals the sum of all credits;
 //  3. every account's balance equals the fold of the journal entries that
 //     touch it, and its running balances and version agree with that fold;
@@ -141,7 +144,8 @@ func (l *Ledger) step(name string) {
 //  5. every account's pending totals equal the open pending transfers'
 //     postings to it, and the open count matches;
 //  6. every transfer's posted and reversed amounts are consistent with its
-//     postings and its reversals;
+//     postings and its reversals, each posting is in its account's
+//     currency, and a multi-currency transfer's rate is its entry's;
 //  7. every hold's amounts are what its pending and increase entries
 //     reserved, it was increased or extended only while open, and its
 //     timeout is the one its last extension set;
@@ -160,16 +164,17 @@ func (l *Ledger) CheckInvariants() []string {
 // acctCheck is one account as of the view's head, with the fold of the
 // journal entries that touch it.
 type acctCheck struct {
-	id      string
-	cur     string
-	normal  Direction
-	init    bounds // the limits the account was opened with
-	bal     Balance
-	version uint64
-	rows    []row
-	life    []statusChange
-	limits  []limitChange
-	folded  Balance
+	id       string
+	cur      string
+	exchange bool
+	normal   Direction
+	init     bounds // the limits the account was opened with
+	bal      Balance
+	version  uint64
+	rows     []row
+	life     []statusChange
+	limits   []limitChange
+	folded   Balance
 }
 
 // lifeProblem checks an account's status history: each change is allowed
@@ -223,7 +228,7 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 				bad("account %s is listed but missing", id)
 				continue
 			}
-			accts = append(accts, acctCheck{id: id, cur: a.Currency, normal: a.NormalBalance, init: initialBounds(&a.Account),
+			accts = append(accts, acctCheck{id: id, cur: a.Currency, exchange: a.Exchange, normal: a.NormalBalance, init: initialBounds(&a.Account),
 				bal: im.bal, version: im.version, rows: im.rows, life: im.life, limits: im.limits})
 		}
 		l.mu.RUnlock()
@@ -254,8 +259,12 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 				}
 			}
 		}
-		var dp, cp, dq, cq wide
-		for _, ln := range e.Lines {
+		// sums[0] is the entry's own currency, sums[1] the other one of
+		// a multi-currency entry.
+		var sums [2]struct{ dp, cp, dq, cq wide }
+		other := ""
+		for j := range e.Lines {
+			ln := &e.Lines[j]
 			var b *Balance
 			k, ok := index[ln.Account]
 			if ok {
@@ -263,23 +272,45 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 			} else {
 				b = &Balance{}
 			}
+			c := 0
+			if ln.Currency != "" {
+				c = 1
+				switch {
+				case ln.Currency == e.Currency:
+					bad("entry %d spells out its own currency on a line", e.Seq)
+				case other == "":
+					other = ln.Currency
+				case ln.Currency != other:
+					bad("entry %d has lines in more than two currencies", e.Seq)
+				}
+			}
+			sm := &sums[c]
 			if ln.Direction == Debit {
-				dp.add(ln.Posted)
-				dq.add(ln.Pending)
+				sm.dp.add(ln.Posted)
+				sm.dq.add(ln.Pending)
 				b.DebitsPosted += ln.Posted
 				b.DebitsPending += ln.Pending
 			} else {
-				cp.add(ln.Posted)
-				cq.add(ln.Pending)
+				sm.cp.add(ln.Posted)
+				sm.cq.add(ln.Pending)
 				b.CreditsPosted += ln.Posted
 				b.CreditsPending += ln.Pending
 			}
-			if !ok || accts[k].cur != e.Currency {
+			if !ok || accts[k].cur != e.currency(ln) {
 				bad("entry %d posts to %s, which does not exist or holds another currency", e.Seq, ln.Account)
 			}
 		}
-		if dp != cp || dq != cq {
-			bad("entry %d does not balance", e.Seq)
+		for _, sm := range sums {
+			if sm.dp != sm.cp || sm.dq != sm.cq {
+				bad("entry %d does not balance", e.Seq)
+				break
+			}
+		}
+		if msg := entryFXProblem(&e, other, func(j int) bool {
+			k, ok := index[e.Lines[j].Account]
+			return ok && accts[k].exchange
+		}); msg != "" {
+			bad("entry %d %s", e.Seq, msg)
 		}
 	}
 
@@ -416,6 +447,14 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 			if msg := holdProblem(tr, v.entries); msg != "" {
 				bad("transfer %s %s", id, msg)
 			}
+			if msg := transferFXProblem(tr, v.entries, func(id string) string {
+				if k, ok := index[id]; ok {
+					return accts[k].cur
+				}
+				return ""
+			}); msg != "" {
+				bad("transfer %s %s", id, msg)
+			}
 			if b := tr.Balancing; b != nil && balancingProblem(tr) {
 				bad("transfer %s says it balanced %d of %d, which its postings do not match", id, b.Amount, b.Requested)
 			}
@@ -509,6 +548,64 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 		}
 	}
 	return v.head, out
+}
+
+// entryFXProblem checks an entry's rate: only an entry that creates a
+// transfer carries one, it does exactly when its lines are in two currencies,
+// its base is the entry's currency and its quote the other, and a posted or
+// pending entry moves through exchange accounts what the rate says. A
+// reversal is not held to the rate, since it may send back what is left
+// after earlier partial reversals, each of which was.
+func entryFXProblem(e *Entry, other string, exchange func(int) bool) string {
+	creates := e.Kind == KindPosted || e.Kind == KindPending || e.Kind == KindReversal
+	switch {
+	case e.FX == nil && (other == "" || !creates):
+		return ""
+	case e.FX == nil:
+		return fmt.Sprintf("is in %s and %s but has no rate", e.Currency, other)
+	case !creates:
+		return fmt.Sprintf("is a %s entry with a rate; only the entry that creates a transfer has one", e.Kind)
+	case other == "":
+		return fmt.Sprintf("has a rate but all its lines are in %s", e.Currency)
+	case e.FX.Base != e.Currency || e.FX.Quote != other:
+		return fmt.Sprintf("is in %s and %s but its rate is for %s to %s", e.Currency, other, e.FX.Base, e.FX.Quote)
+	case e.Kind == KindReversal:
+		return ""
+	}
+	return conversionProblem(e.FX, e.Currency, e.Lines, conversionAmount(e.Kind), exchange, true)
+}
+
+// transferFXProblem checks a transfer's currencies: each posting is in its
+// account's currency, only a multi-currency transfer names a currency on a
+// posting and it is the rate's quote, and the rate is the one the entry that
+// created the transfer carries. currencyOf returns an account's currency.
+func transferFXProblem(tr *Transfer, entries []Entry, currencyOf func(string) string) string {
+	for i := range tr.Postings {
+		p := &tr.Postings[i]
+		if p.Currency != "" && (tr.FX == nil || p.Currency != tr.FX.Quote) {
+			return fmt.Sprintf("posting to %s is in %s, which is not the transfer's other currency", p.Account, p.Currency)
+		}
+		if c := tr.currency(p); currencyOf(p.Account) != c {
+			return fmt.Sprintf("posting to %s is in %s, but the account holds %q", p.Account, c, currencyOf(p.Account))
+		}
+	}
+	if tr.FX != nil && len(currenciesOf(tr.Postings)) != 2 {
+		return fmt.Sprintf("has a rate but all its postings are in %s", tr.Currency)
+	}
+	if len(tr.Entries) == 0 || tr.Entries[0].Seq == 0 || tr.Entries[0].Seq > uint64(len(entries)) {
+		return "" // holdProblem reports it
+	}
+	if !sameFX(tr.FX, entries[tr.Entries[0].Seq-1].FX) {
+		return fmt.Sprintf("has rate %+v but the entry that created it has %+v", tr.FX, entries[tr.Entries[0].Seq-1].FX)
+	}
+	return ""
+}
+
+func sameFX(a, b *FX) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Base == b.Base && a.Quote == b.Quote && a.Rate == b.Rate && a.Source == b.Source && a.QuotedAt.Equal(b.QuotedAt)
 }
 
 // balancingProblem checks a balancing transfer's record against its

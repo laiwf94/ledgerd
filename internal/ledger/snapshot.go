@@ -57,8 +57,11 @@ const (
 	// written, and version 4 lacks balancing records for the same reason.
 	// Version 6 adds hold increases and extensions: entries carry the new
 	// timeout of an extend_pending entry, which has no lines. Older
-	// versions may hold neither kind.
-	snapVersion    = 6
+	// versions may hold neither kind. Version 7 adds multi-currency
+	// transfers: an account's exchange flag, a currency on each posting
+	// and line, and the rate on transfers and their creating entries.
+	// Older versions hold single-currency transfers only.
+	snapVersion    = 7
 	snapPrefix     = "snapshot-"
 	snapSuffix     = ".snap"
 	snapTmpSuffix  = ".tmp"
@@ -342,6 +345,9 @@ func (w *snapWriter) account(a *Account) {
 	w.str(string(a.NormalBalance))
 	w.flag(a.NonNegative)
 	w.flag(a.NonPositive)
+	if w.ver >= 7 {
+		w.flag(a.Exchange)
+	}
 	w.meta(a.Metadata)
 	w.when(a.CreatedAt)
 }
@@ -357,6 +363,9 @@ func (w *snapWriter) transfer(t *Transfer) {
 		w.i(p.Amount)
 		w.i(p.Posted)
 		w.i(p.Reversed)
+		if w.ver >= 7 {
+			w.str(p.Currency)
+		}
 	}
 	w.str(t.Reference)
 	w.meta(t.Metadata)
@@ -375,6 +384,22 @@ func (w *snapWriter) transfer(t *Transfer) {
 	if w.ver >= 5 {
 		w.balancing(t.Balancing)
 	}
+	if w.ver >= 7 {
+		w.fx(t.FX)
+	}
+}
+
+// fx writes a rate: a flag, then base, quote, rate, source and quote time.
+func (w *snapWriter) fx(f *FX) {
+	w.flag(f != nil)
+	if f == nil {
+		return
+	}
+	w.str(f.Base)
+	w.str(f.Quote)
+	w.str(f.Rate)
+	w.str(f.Source)
+	w.when(f.QuotedAt)
 }
 
 // balancing writes a transfer's balancing record: one byte with bit 0 for
@@ -454,9 +479,15 @@ func (w *snapWriter) encode(s *snapshot) error {
 			w.str(string(ln.Direction))
 			w.i(ln.Posted)
 			w.i(ln.Pending)
+			if w.ver >= 7 {
+				w.str(ln.Currency)
+			}
 		}
 		if w.ver >= 6 {
 			w.when(e.ExpiresAt)
+		}
+		if w.ver >= 7 {
+			w.fx(e.FX)
 		}
 		w.item()
 	}
@@ -856,7 +887,11 @@ func (r *snapReader) balance() Balance {
 
 func (r *snapReader) account() Account {
 	a := Account{ID: r.str(), Currency: r.sym(), Exponent: int(r.i()), NormalBalance: r.dir(),
-		NonNegative: r.flag(), NonPositive: r.flag(), Metadata: r.meta(), CreatedAt: r.when()}
+		NonNegative: r.flag(), NonPositive: r.flag()}
+	if r.ver >= 7 {
+		a.Exchange = r.flag()
+	}
+	a.Metadata, a.CreatedAt = r.meta(), r.when()
 	if r.err == nil {
 		if c, ok := money.Lookup(a.Currency); !ok || c.Exponent != a.Exponent || !ValidID(a.ID) {
 			r.fail("bad account %q", a.ID)
@@ -871,6 +906,11 @@ func (r *snapReader) transfer() *Transfer {
 		t.Postings = carve(&r.postings, n)
 		for j := range t.Postings {
 			t.Postings[j] = Posting{Account: r.acct(), Direction: r.dir(), Amount: r.i(), Posted: r.i(), Reversed: r.i()}
+			if r.ver >= 7 {
+				if t.Postings[j].Currency = r.currency(); t.Postings[j].Currency == t.Currency && r.err == nil {
+					r.fail("transfer %s spells out its own currency on a posting", t.ID)
+				}
+			}
 		}
 	}
 	t.Reference = r.str()
@@ -893,7 +933,42 @@ func (r *snapReader) transfer() *Transfer {
 	if r.ver >= 5 {
 		t.Balancing = r.balancing()
 	}
+	if r.ver >= 7 {
+		t.FX = r.fx()
+	}
+	if r.err == nil && (t.FX != nil) != (len(currenciesOf(t.Postings)) == 2) {
+		r.fail("transfer %s has postings in other currencies without a rate, or a rate without them", t.ID)
+	}
 	return t
+}
+
+// currency reads a posting's or line's currency: empty, or a known code
+// other than the one around it, which the caller checks.
+func (r *snapReader) currency() string {
+	c := r.sym()
+	if _, ok := money.Lookup(c); c != "" && !ok && r.err == nil {
+		r.fail("bad currency %q", c)
+	}
+	return c
+}
+
+// fx reads what snapWriter.fx wrote, refusing a rate ledgerd would not
+// have accepted.
+func (r *snapReader) fx() *FX {
+	if !r.flag() || r.err != nil {
+		return nil
+	}
+	f := &FX{Base: r.sym(), Quote: r.sym(), Rate: r.str(), Source: r.str(), QuotedAt: r.when()}
+	if r.err != nil {
+		return nil
+	}
+	_, ok1 := money.Lookup(f.Base)
+	_, ok2 := money.Lookup(f.Quote)
+	if _, err := money.ParseRate(f.Rate); err != nil || !ok1 || !ok2 || f.Base == f.Quote || f.QuotedAt.IsZero() {
+		r.fail("bad rate %s %s %q", f.Base, f.Quote, f.Rate)
+		return nil
+	}
+	return f
 }
 
 // balancing reads what snapWriter.balancing wrote: a zero byte is no record,
@@ -1054,6 +1129,11 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 		}
 		for j := range e.Lines {
 			ln := Line{Account: r.acct(), Direction: r.dir(), Posted: r.i(), Pending: r.i()}
+			if r.ver >= 7 {
+				if ln.Currency = r.currency(); ln.Currency == e.Currency && r.err == nil {
+					r.fail("entry %d spells out its own currency on a line", e.Seq)
+				}
+			}
 			if r.err != nil {
 				break
 			}
@@ -1075,6 +1155,14 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 		if r.ver >= 6 {
 			if e.ExpiresAt = r.when(); r.err == nil && e.ExpiresAt.IsZero() == (e.Kind == KindExtendPending) {
 				r.fail("entry %d (%s) has a timeout only an extend_pending entry may have", e.Seq, e.Kind)
+			}
+		}
+		if r.ver >= 7 {
+			if e.FX = r.fx(); e.FX != nil && r.err == nil && (e.FX.Base != e.Currency || !sameFX(e.FX, tr.FX) || createdAt(tr) != e.Seq) {
+				r.fail("entry %d has a rate that is not its transfer's, or does not create it", e.Seq)
+			}
+			if e.FX != nil {
+				e.FX = tr.FX // one copy, shared as replay shares it
 			}
 		}
 		st.entries = append(st.entries, e)
