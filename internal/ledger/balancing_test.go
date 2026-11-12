@@ -372,9 +372,9 @@ func TestSnapshotRefusesBadBalancingFlags(t *testing.T) {
 		t.Fatalf("round trip: %+v %v", got, err)
 	}
 	// The flags byte follows the entry references; the two amounts are one
-	// byte each.
+	// byte each, and the rate's absent flag one more.
 	bad := append([]byte(nil), w.buf...)
-	bad[len(bad)-3] = 4
+	bad[len(bad)-4] = 4
 	if _, err := read(bad); err == nil || !strings.Contains(err.Error(), "balancing flags") {
 		t.Fatalf("bad flags: %v", err)
 	}

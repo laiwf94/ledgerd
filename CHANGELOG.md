@@ -37,6 +37,18 @@ current formats.
   and carries the new `expires_at`. Balancing holds cannot grow, and
   neither change applies while one of the hold's accounts is frozen. The
   invariant checker ties each hold's amounts and timeout to its entries.
+- Multi-currency transfers: a posting may name its own `currency`, so one
+  transfer, one journal entry and one log record can convert between two
+  currencies. It must balance in each currency and carry `fx` (`rate` as a
+  plain decimal string, `source`, `quoted_at`), stored on the transfer and
+  on the entry that creates it. Accounts opened with `"exchange": true` are
+  exchange accounts; the rate is checked exactly (`math/big`) against what
+  moves through them, rounded either way to a minor unit, so fees and
+  spreads can be posted elsewhere in the entry. Explicit amounts for a
+  partial post, an increase or a partial reversal of a multi-currency
+  transfer are held to its rate; a reversal of both sides carries it.
+  Transfers are listed under both their currencies, and the invariant
+  checker verifies per-currency balance, rates and posting currencies.
 
 #### Changed
 
@@ -49,6 +61,8 @@ current formats.
   files still load.
 - Snapshot format 6 allows `increase_pending` and `extend_pending` entries
   and stores an extension's timeout. Format 1 to 5 files still load.
+- Snapshot format 7 stores the exchange flag, posting and line currencies
+  and rates. Format 1 to 6 files still load.
 - Amounts given per posting are summed with overflow checks, returning
   `overflow` instead of relying on the transfer's own totals.
 - Ledger errors carry `item` when they are about one transfer of a batch.

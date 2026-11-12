@@ -322,7 +322,7 @@ func (t *txn) createAccount(s *AccountSpec) (Outcome, *Error) {
 		return Outcome{}, errf(CodeInvalid, "unknown currency %q", s.Currency)
 	}
 	a := &account{Account: Account{ID: s.ID, Currency: cur.Code, Exponent: cur.Exponent, NormalBalance: s.NormalBalance,
-		NonNegative: s.NonNegative, NonPositive: s.NonPositive, Metadata: copyMap(s.Metadata), CreatedAt: t.now}}
+		NonNegative: s.NonNegative, NonPositive: s.NonPositive, Exchange: s.Exchange, Metadata: copyMap(s.Metadata), CreatedAt: t.now}}
 	t.accounts[s.ID] = a
 	st := a.state(t.st.head() + uint64(len(t.entries)))
 	return Outcome{Account: &st}, nil
@@ -389,8 +389,11 @@ func (t *txn) createTransfer(s *TransferSpec, id string) (Outcome, *Error) {
 		if tr.Balancing != nil {
 			p.Amount = tr.Balancing.Amount
 		}
-		tr.Postings[i] = Posting{Account: p.Account, Direction: p.Direction, Amount: p.Amount}
-		lines[i] = Line{Account: p.Account, Direction: p.Direction}
+		if p.Currency != "" && tr.FX == nil {
+			tr.FX = &FX{Base: s.Currency, Quote: p.Currency, Rate: s.FX.Rate, Source: s.FX.Source, QuotedAt: s.FX.QuotedAt}
+		}
+		tr.Postings[i] = Posting{Account: p.Account, Direction: p.Direction, Currency: p.Currency, Amount: p.Amount}
+		lines[i] = Line{Account: p.Account, Direction: p.Direction, Currency: p.Currency}
 		if s.Pending {
 			lines[i].Pending = p.Amount
 		} else {
@@ -398,7 +401,7 @@ func (t *txn) createTransfer(s *TransferSpec, id string) (Outcome, *Error) {
 			tr.Postings[i].Posted = p.Amount
 		}
 	}
-	seq, err := t.post(kind, id, s.Currency, lines)
+	seq, err := t.post(kind, id, s.Currency, lines, tr.FX, tr.FX)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -513,9 +516,9 @@ func (t *txn) postPending(s *PostSpec) (Outcome, *Error) {
 	}
 	lines := make([]Line, len(tr.Postings))
 	for i, p := range tr.Postings {
-		lines[i] = Line{Account: p.Account, Direction: p.Direction, Posted: amounts[i], Pending: -p.Amount}
+		lines[i] = Line{Account: p.Account, Direction: p.Direction, Currency: p.Currency, Posted: amounts[i], Pending: -p.Amount}
 	}
-	seq, err := t.post(KindPostPending, tr.ID, tr.Currency, lines)
+	seq, err := t.post(KindPostPending, tr.ID, tr.Currency, lines, nil, explicitRate(tr, s.Amounts))
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -554,10 +557,10 @@ func (t *txn) increasePending(s *IncreaseSpec) (Outcome, *Error) {
 	var lines []Line
 	for i, p := range tr.Postings {
 		if more[i] > 0 {
-			lines = append(lines, Line{Account: p.Account, Direction: p.Direction, Pending: more[i]})
+			lines = append(lines, Line{Account: p.Account, Direction: p.Direction, Currency: p.Currency, Pending: more[i]})
 		}
 	}
-	seq, err := t.post(KindIncreasePending, tr.ID, tr.Currency, lines)
+	seq, err := t.post(KindIncreasePending, tr.ID, tr.Currency, lines, nil, tr.FX)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -615,9 +618,9 @@ func (t *txn) release(id string, kind EntryKind, to TransferState) (Outcome, *Er
 	}
 	lines := make([]Line, len(tr.Postings))
 	for i, p := range tr.Postings {
-		lines[i] = Line{Account: p.Account, Direction: p.Direction, Pending: -p.Amount}
+		lines[i] = Line{Account: p.Account, Direction: p.Direction, Currency: p.Currency, Pending: -p.Amount}
 	}
-	seq, err := t.post(kind, tr.ID, tr.Currency, lines)
+	seq, err := t.post(kind, tr.ID, tr.Currency, lines, nil, nil)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -667,10 +670,16 @@ func (t *txn) reverse(s *ReverseSpec, id string) (Outcome, *Error) {
 			continue
 		}
 		d := p.Direction.flip()
-		lines = append(lines, Line{Account: p.Account, Direction: d, Posted: amounts[i]})
-		rev.Postings = append(rev.Postings, Posting{Account: p.Account, Direction: d, Amount: amounts[i], Posted: amounts[i]})
+		lines = append(lines, Line{Account: p.Account, Direction: d, Currency: p.Currency, Posted: amounts[i]})
+		rev.Postings = append(rev.Postings, Posting{Account: p.Account, Direction: d, Currency: p.Currency, Amount: amounts[i], Posted: amounts[i]})
 	}
-	seq, err := t.post(KindReversal, id, orig.Currency, lines)
+	// A reversal sends money back at the rate it went out at, so it carries
+	// the original's rate, and is a multi-currency transfer itself when it
+	// sends back both sides of the conversion.
+	if orig.FX != nil && len(currenciesOf(rev.Postings)) == 2 {
+		rev.FX = orig.FX
+	}
+	seq, err := t.post(KindReversal, id, orig.Currency, lines, rev.FX, explicitRate(orig, s.Amounts))
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -717,21 +726,32 @@ func resolve(tr *Transfer, a Amounts, limit []int64, what string) ([]int64, *Err
 			out[i] = p.Amount
 		}
 		// An increase has no upper limit per posting, so the sums can
-		// overflow even though each amount fits.
-		var debits, credits int64
+		// overflow even though each amount fits. A multi-currency
+		// transfer's amounts balance in each currency.
+		var sums [2]struct{ debits, credits int64 }
 		for i, p := range tr.Postings {
+			k := 0
+			if p.Currency != "" {
+				k = 1
+			}
 			ok := true
 			if p.Direction == Debit {
-				debits, ok = money.Add(debits, out[i])
+				sums[k].debits, ok = money.Add(sums[k].debits, out[i])
 			} else {
-				credits, ok = money.Add(credits, out[i])
+				sums[k].credits, ok = money.Add(sums[k].credits, out[i])
 			}
 			if !ok {
 				return nil, errf(CodeOverflow, "the amounts add up to more than %d", int64(math.MaxInt64))
 			}
 		}
-		if debits != credits {
-			return nil, errf(CodeInvalid, "debits (%d) must equal credits (%d)", debits, credits)
+		for k, cur := range tr.currencies() {
+			if sums[k].debits == sums[k].credits {
+				continue
+			}
+			if tr.FX == nil {
+				return nil, errf(CodeInvalid, "debits (%d) must equal credits (%d)", sums[k].debits, sums[k].credits)
+			}
+			return nil, errf(CodeInvalid, "%s debits (%d) must equal %s credits (%d)", cur, sums[k].debits, cur, sums[k].credits)
 		}
 		return out, nil
 	default:
@@ -740,10 +760,36 @@ func resolve(tr *Transfer, a Amounts, limit []int64, what string) ([]int64, *Err
 	}
 }
 
+// explicitRate is the rate a follow-up on a multi-currency transfer must
+// agree with: the transfer's when the client named the amounts, and none when
+// it takes what is left, which the earlier checked amounts already fix.
+func explicitRate(tr *Transfer, a Amounts) *FX {
+	if a.Amount == 0 && len(a.Postings) == 0 {
+		return nil
+	}
+	return tr.FX
+}
+
+// currenciesOf lists the currencies of a transfer's postings: "" for the
+// transfer's own, then the other one if any posting names it. A transfer is
+// multi-currency when it has two.
+func currenciesOf(ps []Posting) []string {
+	out := []string{""}
+	for _, p := range ps {
+		if p.Currency != "" {
+			return append(out, p.Currency)
+		}
+	}
+	return out
+}
+
 // post appends a journal entry after checking every line: the account
-// exists, its status allows the entry, it has the entry's currency, no total
-// overflows, and no balance limit is crossed. Nothing changes unless every line passes.
-func (t *txn) post(kind EntryKind, transferID, currency string, lines []Line) (uint64, *Error) {
+// exists, its status allows the entry, it has the line's currency, no total
+// overflows, and no balance limit is crossed. fx is stored with the entry.
+// When conv is set, the amounts the lines move through exchange accounts
+// must agree with its rate (see conversionProblem). Nothing changes unless
+// every check passes.
+func (t *txn) post(kind EntryKind, transferID, currency string, lines []Line, fx, conv *FX) (uint64, *Error) {
 	accts := make([]*account, len(lines))
 	next := make([]Balance, len(lines))
 	for i, ln := range lines {
@@ -754,8 +800,8 @@ func (t *txn) post(kind EntryKind, transferID, currency string, lines []Line) (u
 		if err := a.usable(kind); err != nil {
 			return 0, err
 		}
-		if a.Currency != currency {
-			return 0, errf(CodeCurrencyMismatch, "account %s holds %s, not %s", a.ID, a.Currency, currency)
+		if cur := lineCurrency(currency, &ln); a.Currency != cur {
+			return 0, errf(CodeCurrencyMismatch, "account %s holds %s, not %s", a.ID, a.Currency, cur)
 		}
 		nb, err := a.bal.with(ln)
 		if err != nil {
@@ -766,14 +812,27 @@ func (t *txn) post(kind EntryKind, transferID, currency string, lines []Line) (u
 		}
 		accts[i], next[i] = a, nb
 	}
+	if conv != nil {
+		exchange := func(i int) bool { return accts[i].Exchange }
+		if msg := conversionProblem(conv, currency, lines, conversionAmount(kind), exchange, fx != nil); msg != "" {
+			return 0, errf(CodeInvalid, "%s", msg)
+		}
+	}
 	seq := t.nextSeq()
 	for i, a := range accts {
 		a.bal = next[i]
 		a.version++
 		t.rows = append(t.rows, pendingRow{account: a.ID, row: row{seq: seq, line: i, balance: next[i]}})
 	}
-	t.entries = append(t.entries, Entry{Seq: seq, Time: t.now, Kind: kind, TransferID: transferID, Currency: currency, Lines: lines})
+	t.entries = append(t.entries, Entry{Seq: seq, Time: t.now, Kind: kind, TransferID: transferID, Currency: currency, Lines: lines, FX: fx})
 	return seq, nil
+}
+
+func lineCurrency(entry string, ln *Line) string {
+	if ln.Currency != "" {
+		return ln.Currency
+	}
+	return entry
 }
 
 // with returns the balance after a line. Every total stays non-negative, and

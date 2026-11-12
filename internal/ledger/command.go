@@ -22,6 +22,7 @@ const (
 	MaxIDLength        = 64
 	MaxIdempotencyKey  = 255
 	MaxScope           = 64
+	MaxFXSource        = 64
 	DefaultTimeout     = 24 * time.Hour
 	MaxTimeout         = 30 * 24 * time.Hour
 	defaultTimeoutSecs = int64(DefaultTimeout / time.Second)
@@ -41,12 +42,14 @@ const (
 
 // AccountSpec opens an account.
 type AccountSpec struct {
-	ID            string            `json:"id"`
-	Currency      string            `json:"currency"`
-	NormalBalance Direction         `json:"normal_balance"`
-	NonNegative   bool              `json:"non_negative,omitempty"`
-	NonPositive   bool              `json:"non_positive,omitempty"`
-	Metadata      map[string]string `json:"metadata,omitempty"`
+	ID            string    `json:"id"`
+	Currency      string    `json:"currency"`
+	NormalBalance Direction `json:"normal_balance"`
+	NonNegative   bool      `json:"non_negative,omitempty"`
+	NonPositive   bool      `json:"non_positive,omitempty"`
+	// Exchange opens a currency exchange account; see Account.Exchange.
+	Exchange bool              `json:"exchange,omitempty"`
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // PostingSpec is one requested leg of a transfer.
@@ -54,6 +57,18 @@ type PostingSpec struct {
 	Account   string    `json:"account"`
 	Direction Direction `json:"direction"`
 	Amount    int64     `json:"amount"`
+	// Currency is the posting's currency when it is not the transfer's,
+	// which makes a multi-currency transfer.
+	Currency string `json:"currency,omitempty"`
+}
+
+// FXSpec is the exchange rate of a multi-currency transfer: Rate major units
+// of the transfer's other currency for one of its own currency, as a plain
+// decimal, where the rate came from and when it was quoted.
+type FXSpec struct {
+	Rate     string    `json:"rate"`
+	Source   string    `json:"source"`
+	QuotedAt time.Time `json:"quoted_at"`
 }
 
 // Precondition makes a transfer conditional on an account's current state,
@@ -65,10 +80,14 @@ type Precondition struct {
 	PostedBalance *int64  `json:"posted_balance,omitempty"`
 }
 
-// TransferSpec creates a transfer: a balanced journal entry in one currency.
+// TransferSpec creates a transfer: a balanced journal entry. Its postings are
+// in Currency unless they say otherwise. A multi-currency transfer has
+// postings in exactly two currencies, balances in each, and gives the rate
+// it converts at in FX; see createTransfer for how the rate is checked.
 type TransferSpec struct {
 	Currency string        `json:"currency"`
 	Postings []PostingSpec `json:"postings"`
+	FX       *FXSpec       `json:"fx,omitempty"`
 	// Pending makes a two-phase transfer: the amounts are reserved until the
 	// transfer is posted or voided, or until TimeoutSeconds pass.
 	Pending        bool              `json:"pending,omitempty"`
@@ -402,8 +421,10 @@ func (s *TransferSpec) validate() *Error {
 		return errf(CodeInvalid, "a transfer needs between 2 and %d postings", MaxPostings)
 	}
 	seen := make(map[string]bool, len(s.Postings))
-	var debits, credits int64
-	for i, p := range s.Postings {
+	var sums [2]struct{ debits, credits int64 } // per currency: the transfer's, then the other
+	other := ""
+	for i := range s.Postings {
+		p := &s.Postings[i]
 		if !ValidID(p.Account) {
 			return errf(CodeInvalid, "postings[%d].account is not a valid account id", i)
 		}
@@ -417,18 +438,51 @@ func (s *TransferSpec) validate() *Error {
 		if p.Amount <= 0 {
 			return errf(CodeInvalid, "postings[%d].amount must be a positive number of minor units", i)
 		}
+		if p.Currency == s.Currency {
+			p.Currency = "" // the transfer's own currency is never spelled out
+		}
+		k := 0
+		if p.Currency != "" {
+			if err := validateCurrency(p.Currency); err != nil {
+				return errf(CodeInvalid, "postings[%d].%s", i, err.Message)
+			}
+			if other == "" {
+				other = p.Currency
+			} else if p.Currency != other {
+				return errf(CodeInvalid, "a transfer's postings may be in at most two currencies; %s, %s and %s are three", s.Currency, other, p.Currency)
+			}
+			k = 1
+		}
 		var ok bool
 		if p.Direction == Debit {
-			debits, ok = money.Add(debits, p.Amount)
+			sums[k].debits, ok = money.Add(sums[k].debits, p.Amount)
 		} else {
-			credits, ok = money.Add(credits, p.Amount)
+			sums[k].credits, ok = money.Add(sums[k].credits, p.Amount)
 		}
 		if !ok {
 			return errf(CodeInvalid, "postings add up to more than the largest amount")
 		}
 	}
-	if debits != credits {
-		return errf(CodeInvalid, "debits (%d) must equal credits (%d)", debits, credits)
+	if other == "" {
+		if sums[0].debits != sums[0].credits {
+			return errf(CodeInvalid, "debits (%d) must equal credits (%d)", sums[0].debits, sums[0].credits)
+		}
+		if s.FX != nil {
+			return errf(CodeInvalid, "fx applies only to a transfer with postings in two currencies")
+		}
+	} else {
+		for k, cur := range []string{s.Currency, other} {
+			if sums[k].debits != sums[k].credits {
+				return errf(CodeInvalid, "%s debits (%d) must equal %s credits (%d): a multi-currency transfer balances in each currency",
+					cur, sums[k].debits, cur, sums[k].credits)
+			}
+		}
+		if s.FX == nil {
+			return errf(CodeInvalid, "a transfer with postings in %s and %s needs fx: the rate, its source and when it was quoted", s.Currency, other)
+		}
+		if err := s.FX.validate(); err != nil {
+			return err
+		}
 	}
 	if (s.BalanceDebit || s.BalanceCredit) && len(s.Postings) != 2 {
 		return errf(CodeInvalid, "balance_debit and balance_credit work for two-posting transfers; this one has %d postings", len(s.Postings))
@@ -465,6 +519,23 @@ func (s *TransferSpec) validate() *Error {
 			return errf(CodeInvalid, "preconditions[%d] must set version or posted_balance", i)
 		}
 	}
+	return nil
+}
+
+func (f *FXSpec) validate() *Error {
+	if _, err := money.ParseRate(f.Rate); err != nil {
+		return errf(CodeInvalid, "fx.%v", err)
+	}
+	if f.Source == "" || !validText(f.Source, MaxFXSource) {
+		return errf(CodeInvalid, "fx.source must be 1 to %d characters of printable text, such as the rate provider", MaxFXSource)
+	}
+	if f.QuotedAt.IsZero() {
+		return errf(CodeInvalid, "fx.quoted_at must be the time the rate was quoted")
+	}
+	if y := f.QuotedAt.Year(); y < 1970 || y > 9999 {
+		return errf(CodeInvalid, "fx.quoted_at must be between 1970 and 9999")
+	}
+	f.QuotedAt = f.QuotedAt.UTC()
 	return nil
 }
 

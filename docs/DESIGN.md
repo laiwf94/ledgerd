@@ -24,7 +24,9 @@ is a good modern account) and TigerBeetle's
 
 An account has an ID, an ISO 4217 currency (the minor-unit exponent comes from a
 built-in table of active codes; codes without a minor unit such as XAU are
-refused), a *normal balance* side, optional limit flags and bounded metadata.
+refused), a *normal balance* side, optional limit flags, an optional
+`exchange` flag (see [multi-currency transfers](#multi-currency-transfers))
+and bounded metadata.
 An account keeps four running totals, all `int64` minor units:
 
 ```text
@@ -578,10 +580,10 @@ order. Items, in file order:
 
 | Tag | Item | Fields |
 |---|---|---|
-| `H` | header, first | `u` format version (6), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys |
-| `A` | account, by ID | `str` ID, `str` currency, `i` exponent, `str` normal balance, `bool` non-negative, `bool` non-positive, `meta`, `time` created; `i` debits posted, credits posted, debits pending, credits pending; `u` version; `u` count then per status change `u` journal head, `time`, `str` status, `str` reason; `u` count then per limit change `u` journal head, `time`, `str` kind, `i` amount (-1 for none), `str` reason |
-| `T` | transfer, by ID | `str` ID, state, currency; `u` posting count then per posting `str` account, `str` direction, `i` amount, posted, reversed; `str` reference, `meta`, `time` created, `time` expires, `str` reverses; `u` count then `str` reversal IDs; `u` count then per entry `u` sequence, `str` kind; from format 5 a balancing byte (0 none, else bit 0 `balance_debit`, bit 1 `balance_credit`) followed, when not 0, by `i` requested amount and `i` amount |
-| `E` | journal entry, by sequence from 1 | `u` sequence, `time`, `str` kind, transfer ID, currency; `u` line count then per line `str` account, `str` direction, `i` posted, `i` pending; from format 6 `time` expires, set only on an `extend_pending` entry, which alone has no lines |
+| `H` | header, first | `u` format version (7), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys |
+| `A` | account, by ID | `str` ID, `str` currency, `i` exponent, `str` normal balance, `bool` non-negative, `bool` non-positive, from format 7 `bool` exchange, `meta`, `time` created; `i` debits posted, credits posted, debits pending, credits pending; `u` version; `u` count then per status change `u` journal head, `time`, `str` status, `str` reason; `u` count then per limit change `u` journal head, `time`, `str` kind, `i` amount (-1 for none), `str` reason |
+| `T` | transfer, by ID | `str` ID, state, currency; `u` posting count then per posting `str` account, `str` direction, `i` amount, posted, reversed, and from format 7 `str` currency (empty for the transfer's own); `str` reference, `meta`, `time` created, `time` expires, `str` reverses; `u` count then `str` reversal IDs; `u` count then per entry `u` sequence, `str` kind; from format 5 a balancing byte (0 none, else bit 0 `balance_debit`, bit 1 `balance_credit`) followed, when not 0, by `i` requested amount and `i` amount; from format 7 a rate: `bool` set, then if set `str` base, quote, rate and source and `time` quoted, present exactly when a posting names another currency |
+| `E` | journal entry, by sequence from 1 | `u` sequence, `time`, `str` kind, transfer ID, currency; `u` line count then per line `str` account, `str` direction, `i` posted, `i` pending, and from format 7 `str` currency (empty for the entry's own); from format 6 `time` expires, set only on an `extend_pending` entry, which alone has no lines; from format 7 a rate as in `T`, only on the entry that creates a multi-currency transfer and equal to that transfer's |
 | `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result, 8 batch result, 16 error names a batch item); then if flagged: `str` code and message, and `u` item index if flag 16; an account as in `A` with `u` version, the four totals, `u` as-of sequence, then `str` status, `str` status reason and `time` changed, then `i` overdraft and credit limits (-1 for none) and `u` effective sequence; a transfer as in `T`; `i` count of reservations expired; finally `u` number of batch transfers if flag 8 |
 | `B` | one transfer of a batch result, right after its `I` item, in batch order | a transfer as in `T` |
 | `Z` | footer, alone in the last frame | `u` number of frames before it |
@@ -590,13 +592,15 @@ Each format carries a version: the log's `header` record, the manifest's
 first line and the snapshot's `H` item. A reader refuses a version it does
 not know, so a changed layout must come with a new version number. Snapshot
 format 2 added account status, format 3 limit changes, format 4 batch
-results, format 5 balancing records and format 6 hold increases and
+results, format 5 balancing records, format 6 hold increases and
 extensions (`increase_pending` and `extend_pending` entries, and the
-timeout an extension sets); format 1 and 2 files, which lack
-those fields, still load with every account open and at the limits its
-flags give, and format 3 to 5 files, written before batches, balancing
-transfers or hold changes existed, load as they are; a file older than 6
-holding either new entry kind is refused. A batch result is spread
+timeout an extension sets) and format 7 multi-currency transfers (the
+exchange flag, posting and line currencies, and rates); format 1 and 2
+files, which lack those fields, still load with every account open and at
+the limits its flags give, and format 3 to 6 files, written before
+batches, balancing transfers, hold changes or multi-currency transfers
+existed, load as they are; a file older than 6 holding either new entry
+kind is refused. A batch result is spread
 over `B` items because thousands of transfers can be more than one frame
 holds. New command kinds in `cmd` records keep
 the log at version 1: an older binary refuses a log holding a command it
@@ -806,6 +810,71 @@ reserved on its account; each extension's timeout is later than the one
 before; and an extended hold expires at its last extension's timeout. Only
 `extend_pending` entries have no lines and a timeout.
 
+## Multi-currency transfers
+
+A currency conversion is one transfer, so it is one journal entry and one
+log record: a crash can never leave the USD side done and the EUR side not.
+Its postings are in two currencies. `currency` is the transfer's own (the
+*base*), and a posting in the other (the *quote*) says so with its own
+`currency`. A transfer may name at most two; a three-way conversion is two
+transfers in an [atomic batch](#atomic-batches).
+
+```json
+{"currency": "USD",
+ "postings": [
+   {"account": "alice_usd", "direction": "debit",  "amount": 10000},
+   {"account": "fx_usd",    "direction": "credit", "amount": 10000},
+   {"account": "fx_eur",    "direction": "debit",  "amount": 9234, "currency": "EUR"},
+   {"account": "alice_eur", "direction": "credit", "amount": 9234, "currency": "EUR"}],
+ "fx": {"rate": "0.9234", "source": "ecb", "quoted_at": "2026-11-12T09:00:00+01:00"}}
+```
+
+**Balanced per currency.** Debits equal credits in USD and, separately, in
+EUR. Nothing ever adds cents to euro cents, so the per-currency totals the
+invariant checker sums across accounts stay exact, and every account still
+holds one currency: a posting is refused with `currency_mismatch` unless
+its currency is its account's.
+
+**The rate is recorded.** `fx` is required when there are two currencies
+and refused when there is one. `rate` is how many major units of the quote
+one major unit of the base buys, as a plain decimal string (never a JSON
+number, a fraction or an exponent: the ledger stores exactly what was
+sent), `source` says where it came from, and `quoted_at` when; it is kept in
+UTC. The transfer and the entry that creates it carry it as
+`{"base","quote","rate","source","quoted_at"}`; later entries of the same
+transfer (a post, void, expiry, increase) do not repeat it.
+
+**Exchange accounts.** An account opened with `"exchange": true` is the
+ledger's position in one currency on the far side of conversions: a USD
+exchange account takes in the dollars a customer sells, a EUR one pays out
+the euros. The rate is checked against what moves through the exchange
+accounts, not against every posting, so a fee or a spread can sit on
+another account in either currency within the same entry. In each currency
+the exchange accounts' net movement (credits minus debits) must be
+non-zero, the two nets must have opposite signs, and the quote net must be
+the base net times the rate, rescaled between the currencies' minor units,
+rounded either way to a whole unit: 100.01 USD at 0.9234 is 92.349234 EUR,
+so 92.34 and 92.35 pass and 92.36 does not. Any rounding rule a client uses
+passes; a stale amount or a wrong rate does not. The arithmetic is exact
+(`math/big`); the refusal is `invalid_argument` with the exact conversion
+in its message. The exchange accounts' balances are the ledger's open
+currency position, and their statements are its conversion history.
+
+**Holds, posts and reversals.** A multi-currency hold reserves in both
+currencies and a void or expiry releases both. Amounts a client names for
+a partial post, an increase or a partial reversal must balance in each
+currency and agree with the rate in the same way; taking what is left
+(posting a hold in full, reversing the remainder) is not checked again,
+because the parts already checked fix it, and rounding on each part may
+leave a remainder a unit off the rate. A reversal carries the original's
+rate when it sends back both currencies; reversing only a fee in the base
+currency is an ordinary single-currency reversal; reversing only one side
+of the conversion is refused. A balancing transfer has two postings, so it
+is never multi-currency.
+
+A transfer is listed under both its currencies (`GET
+/v1/transfers?currency=EUR` finds a USD to EUR conversion).
+
 ## Preconditions instead of locks
 
 Each account has a `version`, the number of entries that have touched it. A
@@ -978,7 +1047,11 @@ a reversal. Dates are UTC.
 
 `GET /v1/admin/invariants` and startup both run the checker:
 
-1. every journal entry balances, posted and pending;
+1. every journal entry balances in each currency, posted and pending; it
+   spans at most two currencies, carries a rate exactly when it creates a
+   transfer in two, for that pair, and a posted or pending one moves through
+   exchange accounts what its rate says (see
+   [multi-currency transfers](#multi-currency-transfers));
 2. per currency, total debits equal total credits across all accounts;
 3. every account's totals equal the fold of the entries that touch it, and
    its running balances and version agree with that fold;
@@ -990,8 +1063,9 @@ a reversal. Dates are UTC.
 5. every account's pending totals equal the open pending transfers' postings
    to it, and the count of open transfers matches;
 6. every transfer's posted and reversed amounts agree with its postings and
-   its reversals, and a balancing transfer's record agrees with its two
-   postings;
+   its reversals, a balancing transfer's record agrees with its two
+   postings, every posting is in its account's currency, and a
+   multi-currency transfer has the rate of the entry that created it;
 7. every transfer's entries exist and are its own, every hold reserves on
    each posting exactly what its `pending` and `increase_pending` entries
    reserved, it was increased or extended only while open, and it expires at
@@ -1097,6 +1171,9 @@ and snapshots.
 | Pending timeout | 1 s to 30 days, default 24 h | |
 | JSON body | 1 MiB, 16 MiB for a batch | Checked before decoding. |
 | Batch | 8,190 transfers, and at most 16 MiB in its log record | TigerBeetle's request size; one record, one fsync. |
+| Currencies per transfer | 2 | One rate per transfer; a three-way conversion is two transfers in a batch. |
+| Exchange rate | positive plain decimal, 30 digits | Exact, no floats or exponents; `big.Rat` checks it. |
+| Rate source | 1 to 64 chars | |
 | Statement CSV | 4 MiB, 10,000 lines | |
 | Reconciliation | 4 at once, period 366 days, window 31 days, 100,000 movements | Bounds memory per request. |
 | Statement page | 1,000 lines | |

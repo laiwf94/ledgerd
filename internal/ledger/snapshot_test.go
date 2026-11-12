@@ -395,6 +395,23 @@ func writeSmallSnapshot(t *testing.T, ver int) (dir string, clock *fakeClock) {
 			t.Fatal(err)
 		}
 	}
+	if ver >= 7 {
+		// Exchange accounts, a keyed conversion with a fee, a conversion
+		// hold posted in part, a partial reversal at the rate and a keyed
+		// refusal off the rate.
+		e.do(exchangeAcct("fx_usd", "USD"))
+		e.do(exchangeAcct("fx_eur", "EUR"))
+		e.do(openAcct("wallet_eur", "EUR", Credit, "nonneg"))
+		c, err := e.l.Do(ctx, convert("0.9234", dr("bank", 1010), cr("fx_usd", 1000), cr("sweep", 10),
+			eur(dr("fx_eur", 923)), eur(cr("wallet_eur", 923))), key("k8", "convert", "convert"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := e.do(convertHold("0.9234", 60, dr("bank", 2000), cr("fx_usd", 2000), eur(dr("fx_eur", 1847)), eur(cr("wallet_eur", 1847)))).Transfer
+		e.do(postCmd(h.ID, 0, PartialAmount{"bank", 1000}, PartialAmount{"fx_usd", 1000}, PartialAmount{"fx_eur", 923}, PartialAmount{"wallet_eur", 923}))
+		e.do(reverseCmd(c.Transfer.ID, 0, PartialAmount{"bank", 500}, PartialAmount{"fx_usd", 500}, PartialAmount{"fx_eur", 462}, PartialAmount{"wallet_eur", 462}))
+		e.l.Do(ctx, convert("0.9234", dr("bank", 100), cr("fx_usd", 100), eur(dr("fx_eur", 1)), eur(cr("wallet_eur", 1))), key("k8", "off", "off"))
+	}
 	e.l.Close()
 	if nums := snapshotFiles(t, e.dir); len(nums) != 1 {
 		t.Fatalf("snapshots %v", nums)
@@ -464,6 +481,23 @@ func TestSnapshotRoundTripsEveryField(t *testing.T) {
 		out, err = l.Do(ctx, extendCmd(hid, 120), key("k7", "extend", "extend"))
 		if err != nil || !out.Replayed || len(out.Transfer.Entries) != 4 || out.Transfer.Entries[3].Kind != KindExtendPending {
 			t.Fatalf("replayed extension: %v %+v", err, out.Transfer)
+		}
+	}
+	for _, l := range []*Ledger{fromSnap, full} {
+		out, err := l.Do(ctx, convert("0.9234", dr("bank", 1010), cr("fx_usd", 1000), cr("sweep", 10),
+			eur(dr("fx_eur", 923)), eur(cr("wallet_eur", 923))), key("k8", "convert", "convert"))
+		if err != nil || !out.Replayed || out.Transfer.FX == nil || out.Transfer.FX.Rate != "0.9234" || out.Transfer.Postings[3].Currency != "EUR" ||
+			len(out.Transfer.Reversals) != 0 {
+			t.Fatalf("replayed conversion: %v %+v", err, out.Transfer)
+		}
+		if a, _ := l.Account("fx_eur", 0); !a.Exchange || a.Balance.Posted != -923-923+462 {
+			t.Fatalf("fx_eur %+v", a)
+		}
+		if a, _ := l.Account("wallet_eur", 0); a.Balance.Posted != 923+923-462 {
+			t.Fatalf("wallet_eur %+v", a)
+		}
+		if _, err := l.Do(ctx, convert("0.9234", dr("bank", 100), cr("fx_usd", 100), eur(dr("fx_eur", 1)), eur(cr("wallet_eur", 1))), key("k8", "off", "off")); codeOf(err) != CodeInvalid {
+			t.Fatalf("replayed refused conversion: %v", err)
 		}
 	}
 	// The expiry schedule came back: the 5 second hold expires on time, and

@@ -39,7 +39,7 @@ existing holds can still be voided or expire, unfrozen again, or closed once
 its balance is zero and it holds no reservations; a closed account takes no
 more entries.
 
-A transfer has 2 to 64 postings in one currency, debits must equal credits,
+A transfer has 2 to 64 postings in one currency (or two, for a conversion), debits must equal credits in each,
 and either every posting applies or none does. Amounts are `int64` minor
 units and every addition is overflow-checked; there is no floating point
 anywhere. A transfer can be pending: it reserves funds until it is posted
@@ -67,6 +67,15 @@ hold, and its timeout can move later. Each change is checked against the
 limits like a new hold, logged, and listed in the transfer's `entries`
 (`increase_pending`, `extend_pending`); an extension moves no money, so
 balances and versions stay as they are.
+
+A currency conversion is one transfer with postings in two currencies, so a
+crash can never split it. It balances in each currency on its own and
+carries an `fx` block (`rate` as a decimal string, `source`, `quoted_at`),
+stored with its journal entry. The conversion goes through exchange
+accounts (opened with `"exchange": true`, one per currency), and the rate
+is checked exactly against what they move, rounded either way to a minor
+unit, so fees and spreads can sit on other accounts in the same entry. See
+[multi-currency transfers](docs/DESIGN.md#multi-currency-transfers).
 
 ## Retries, crashes and audits
 
@@ -147,7 +156,7 @@ JSON bodies and an optional `Idempotency-Key` header.
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/accounts` | Open an account. |
+| `POST /v1/accounts` | Open an account; `"exchange": true` for a currency exchange account. |
 | `GET /v1/accounts` | List accounts in ID order with balances; `?currency=&metadata[key]=value&limit=&cursor=`. Pages carry `has_more` and an opaque, signed `next_cursor`. |
 | `GET /v1/accounts/{id}` | Account, balance, `status` (`open`, `frozen`, `closed`, with `status_reason` and `status_changed_at`) and `limits` (`overdraft`, `credit`, null where none); `?as_of_seq=N` for all of them as of entry N. |
 | `GET /v1/accounts/{id}/statement` | Entries touching the account with running balances; `?after_seq=&limit=`. |
@@ -157,7 +166,7 @@ JSON bodies and an optional `Idempotency-Key` header.
 | `POST /v1/accounts/{id}/unfreeze` | Return a frozen account to open; optional reason. |
 | `POST /v1/accounts/{id}/close` | Close an account whose posted balance is zero and that holds no reservations (else `failed_precondition`); optional reason. Final: anything touching it afterwards gets `account_closed`. |
 | `POST /v1/accounts/{id}/reconcile` | Match a `text/csv` statement; `?window_days=&from=&to=`. Read only. |
-| `POST /v1/transfers` | Create a transfer; `"pending": true` for two-phase. `"balance_debit"` / `"balance_credit"` (two postings only) cut the amount to what that account's limits allow, an unset limit counting as zero; `balancing` in the response has `requested_amount` and `amount`, and nothing to move is 422 `limit_exceeded`. |
+| `POST /v1/transfers` | Create a transfer; `"pending": true` for two-phase. `"balance_debit"` / `"balance_credit"` (two postings only) cut the amount to what that account's limits allow, an unset limit counting as zero; `balancing` in the response has `requested_amount` and `amount`, and nothing to move is 422 `limit_exceeded`. A posting with its own `currency` makes a multi-currency transfer: two currencies at most, balanced in each, with `"fx":{"rate":"0.9234","source":"...","quoted_at":"..."}` checked against the exchange accounts' amounts. |
 | `POST /v1/transfers/batch` | Create up to 8,190 transfers atomically: `{"transfers":[...]}`, each as for `POST /v1/transfers`. 201 with `results` in order, each `{"status":"created","transfer":{...}}`. If one is refused, nothing happens: the status and `error` are that transfer's, `error.item` is its index, and `results` has it as `failed` and the rest as `not_applied`. One `Idempotency-Key` covers the whole batch. Bodies up to 16 MiB. |
 | `GET /v1/transfers` | List transfers in creation order, `order=desc` for newest first; `?account=&state=&currency=&reference=&metadata[key]=value&limit=&cursor=`. `reference=` finds the transfers that carry an external reference. Same cursors as accounts. |
 | `GET /v1/transfers/{id}` | A transfer with its postings, state, links and entries. |
@@ -204,6 +213,7 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 | Idempotency | Replays across restarts, errors replayed, key reuse, scope per API key, retention expiry, concurrent duplicates held in flight by a blocked fsync. |
 | Balancing transfers | Debit and credit balancing on credit- and debit-normal accounts, with and without limits, both flags at once, holds, batches and refusals each move exactly the expected amount; the room saturates at the int64 limits; a keyed retry, the log and a snapshot all return the original amount after balances change; the checker refuses a balancing record its postings do not match. Deliberately wrong rooms fail these tests. |
 | Hold changes | Holds grow by an amount or per posting, up to and not past each limit, and refusals change nothing; extensions change no balance, version or statement, the old timeout never fires and the newest does; keyed retries, a restart from the log and one from a snapshot give the same holds and schedule, and `ledgerd verify` reports sound. The checker refuses a hold whose amounts, entries or timeout its journal entries do not bear out. Deliberately dropped amount updates and timeout schedules fail these tests. |
+| Multi-currency | Conversions balance in each currency and record their rate on the transfer and its entry; the rate is checked against the exchange accounts' amounts with exact arithmetic across exponents (USD to JPY), any rounding passes and a unit further does not, fees and spreads stay outside it, and every misuse (three currencies, no rate, wrong account currency, no exchange account, both sides in) is refused without a trace. Multi-currency holds, partial posts, increases and reversals are held to the rate; voids and expiries release both currencies. Keyed retries, batches, a restart from the log and one from a snapshot give the same state, and `ledgerd verify` reports sound. The checker refuses every kind of rate or currency damage. A disabled rate check, a dropped reversal line currency and a dropped snapshot rate each fail these tests. |
 | Atomic batches | A batch refused at any transfer, after earlier transfers moved money in and out, created holds or changed versions, must leave every account, transfer, index, timeout and the journal exactly as before, also when it shares a group commit with other commands and inside one transaction, where its generated IDs must be free again. Deliberately broken rollbacks fail these tests. The largest batch (8,190 transfers, a log record over a megabyte) is one fsync and survives a restart from the log alone and `ledgerd verify`; any batch that passes validation fits in one log record. |
 | Reconciliation | The amount-and-date pass is compared with a maximum bipartite matching on random inputs; a worst case of 10,000 lines against 100,000 identical movements must stay fast. |
 | Parsers | Go fuzzing of the decimal amount parser, the log reader, the CSV parser, the transfer, freeze, close and limit endpoints, and the listing query strings with every cursor they return followed: accepted input round-trips; nothing returns a 500, breaks an invariant or an index, and no walk repeats an item or fails to end. |
