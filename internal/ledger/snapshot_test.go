@@ -382,6 +382,19 @@ func writeSmallSnapshot(t *testing.T, ver int) (dir string, clock *fakeClock) {
 		c.CreateTransfer.Pending, c.CreateTransfer.TimeoutSeconds = true, 60
 		e.do(c)
 	}
+	if ver >= 6 {
+		// A keyed increase and two extensions of one hold, so the journal
+		// has entries with no lines and with a timeout.
+		h := e.do(hold(60, dr("bank", 20), cr("shop", 20))).Transfer
+		if _, err := e.l.Do(ctx, increaseCmd(h.ID, 5), key("k7", "grow", "grow")); err != nil {
+			t.Fatal(err)
+		}
+		e.do(extendCmd(h.ID, 90))
+		e.clock.Advance(time.Second)
+		if _, err := e.l.Do(ctx, extendCmd(h.ID, 120), key("k7", "extend", "extend")); err != nil {
+			t.Fatal(err)
+		}
+	}
 	e.l.Close()
 	if nums := snapshotFiles(t, e.dir); len(nums) != 1 {
 		t.Fatalf("snapshots %v", nums)
@@ -442,6 +455,15 @@ func TestSnapshotRoundTripsEveryField(t *testing.T) {
 		out, err = l.Do(ctx, balancing(true, false, dr("sweep", 100), cr("pool", 100)), key("k6", "sweep", "sweep"))
 		if err != nil || !out.Replayed || !reflect.DeepEqual(out.Transfer.Balancing, &Balancing{Debit: true, Requested: 100, Amount: 40}) {
 			t.Fatalf("replayed balancing transfer: %v %+v", err, out.Transfer)
+		}
+		hid := extendedHold(t, l)
+		out, err = l.Do(ctx, increaseCmd(hid, 5), key("k7", "grow", "grow"))
+		if err != nil || !out.Replayed || out.Transfer.Postings[0].Amount != 25 || len(out.Transfer.Entries) != 2 {
+			t.Fatalf("replayed increase: %v %+v", err, out.Transfer)
+		}
+		out, err = l.Do(ctx, extendCmd(hid, 120), key("k7", "extend", "extend"))
+		if err != nil || !out.Replayed || len(out.Transfer.Entries) != 4 || out.Transfer.Entries[3].Kind != KindExtendPending {
+			t.Fatalf("replayed extension: %v %+v", err, out.Transfer)
 		}
 	}
 	// The expiry schedule came back: the 5 second hold expires on time, and

@@ -62,6 +62,12 @@ that is not set counting as zero. A sweep of "everything up to 1,000" moves
 what is there, a loan repayment stops at what is owed, and the response's
 `balancing` gives `requested_amount` and the `amount` that moved.
 
+A hold can grow while it is open, as when a hotel adds a night to a card
+hold, and its timeout can move later. Each change is checked against the
+limits like a new hold, logged, and listed in the transfer's `entries`
+(`increase_pending`, `extend_pending`); an extension moves no money, so
+balances and versions stay as they are.
+
 ## Retries, crashes and audits
 
 Retries are safe. An `Idempotency-Key` gets you Stripe's behaviour: the same
@@ -157,6 +163,8 @@ JSON bodies and an optional `Idempotency-Key` header.
 | `GET /v1/transfers/{id}` | A transfer with its postings, state, links and entries. |
 | `POST /v1/transfers/{id}/post` | Post a pending transfer: all, `{"amount":n}`, or per-posting amounts. |
 | `POST /v1/transfers/{id}/void` | Release a pending transfer. |
+| `POST /v1/transfers/{id}/increase` | Reserve more on a pending transfer: `{"amount":n}` for two postings, or balanced per-posting `postings`. Checked against limits; balancing holds can't grow. |
+| `POST /v1/transfers/{id}/extend` | Move a pending transfer's timeout to `{"timeout_seconds":n}` from now; it must be later than the current one. |
 | `POST /v1/transfers/{id}/reverse` | Reverse a posted transfer, fully or partly, as a new linked transfer. |
 | `GET /v1/admin/invariants` | Run the invariant checker. Admin token, or loopback without one. |
 | `GET /healthz`, `GET /readyz`, `GET /metrics` | Liveness, readiness (fails after a storage error), Prometheus metrics. |
@@ -195,6 +203,7 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 | Storage failures | Injected write and fsync errors, also at each step of a segment roll: the ledger stops accepting writes, keeps serving reads, and after a restart a keyed retry reports what actually reached the disk. A failure or power cut at any step of a snapshot write (including between the rename and the directory fsync) loses nothing and drops no segment early. |
 | Idempotency | Replays across restarts, errors replayed, key reuse, scope per API key, retention expiry, concurrent duplicates held in flight by a blocked fsync. |
 | Balancing transfers | Debit and credit balancing on credit- and debit-normal accounts, with and without limits, both flags at once, holds, batches and refusals each move exactly the expected amount; the room saturates at the int64 limits; a keyed retry, the log and a snapshot all return the original amount after balances change; the checker refuses a balancing record its postings do not match. Deliberately wrong rooms fail these tests. |
+| Hold changes | Holds grow by an amount or per posting, up to and not past each limit, and refusals change nothing; extensions change no balance, version or statement, the old timeout never fires and the newest does; keyed retries, a restart from the log and one from a snapshot give the same holds and schedule, and `ledgerd verify` reports sound. The checker refuses a hold whose amounts, entries or timeout its journal entries do not bear out. Deliberately dropped amount updates and timeout schedules fail these tests. |
 | Atomic batches | A batch refused at any transfer, after earlier transfers moved money in and out, created holds or changed versions, must leave every account, transfer, index, timeout and the journal exactly as before, also when it shares a group commit with other commands and inside one transaction, where its generated IDs must be free again. Deliberately broken rollbacks fail these tests. The largest batch (8,190 transfers, a log record over a megabyte) is one fsync and survives a restart from the log alone and `ledgerd verify`; any batch that passes validation fits in one log record. |
 | Reconciliation | The amount-and-date pass is compared with a maximum bipartite matching on random inputs; a worst case of 10,000 lines against 100,000 identical movements must stay fast. |
 | Parsers | Go fuzzing of the decimal amount parser, the log reader, the CSV parser, the transfer, freeze, close and limit endpoints, and the listing query strings with every cursor they return followed: accepted input round-trips; nothing returns a 500, breaks an invariant or an index, and no walk repeats an item or fails to end. |

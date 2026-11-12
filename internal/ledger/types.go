@@ -204,6 +204,12 @@ const (
 	KindVoidPending   EntryKind = "void_pending"   // reservation released by request
 	KindExpirePending EntryKind = "expire_pending" // reservation released by timeout
 	KindReversal      EntryKind = "reversal"       // posted amounts sent back
+	// KindIncreasePending adds to an open reservation: its lines reserve
+	// more on each posting it grows.
+	KindIncreasePending EntryKind = "increase_pending"
+	// KindExtendPending moves an open reservation's timeout later. It moves
+	// no money, so it has no lines; ExpiresAt is the new timeout.
+	KindExtendPending EntryKind = "extend_pending"
 )
 
 // Posting is one leg of a transfer.
@@ -285,6 +291,9 @@ type Entry struct {
 	TransferID string    `json:"transfer_id"`
 	Currency   string    `json:"currency"`
 	Lines      []Line    `json:"lines"`
+	// ExpiresAt is the new timeout of an extend_pending entry, and zero on
+	// every other kind.
+	ExpiresAt time.Time `json:"expires_at,omitzero"`
 }
 
 // row is one entry as seen from one account, with the balance after it.

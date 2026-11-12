@@ -142,7 +142,10 @@ func (l *Ledger) step(name string) {
 //     postings to it, and the open count matches;
 //  6. every transfer's posted and reversed amounts are consistent with its
 //     postings and its reversals;
-//  7. every account's status history follows the life-cycle rules, no entry
+//  7. every hold's amounts are what its pending and increase entries
+//     reserved, it was increased or extended only while open, and its
+//     timeout is the one its last extension set;
+//  8. every account's status history follows the life-cycle rules, no entry
 //     moved money through an account while it was frozen or closed, and a
 //     closed account has a zero balance.
 //
@@ -239,6 +242,17 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 		}
 		if e.Kind == KindPosted || e.Kind == KindPending || e.Kind == KindReversal {
 			tids = append(tids, e.TransferID)
+		}
+		if extend := e.Kind == KindExtendPending; extend != (len(e.Lines) == 0) || extend == e.ExpiresAt.IsZero() {
+			bad("entry %d (%s) has %d lines and timeout %v; only an extend_pending entry has a timeout, and it alone has no lines",
+				e.Seq, e.Kind, len(e.Lines), e.ExpiresAt)
+		}
+		if e.Kind == KindIncreasePending {
+			for _, ln := range e.Lines {
+				if ln.Posted != 0 || ln.Pending <= 0 {
+					bad("entry %d increases a hold but moves %d posted and %d pending on %s", e.Seq, ln.Posted, ln.Pending, ln.Account)
+				}
+			}
 		}
 		var dp, cp, dq, cq wide
 		for _, ln := range e.Lines {
@@ -399,6 +413,9 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 			if tr.State == StatePending {
 				open++
 			}
+			if msg := holdProblem(tr, v.entries); msg != "" {
+				bad("transfer %s %s", id, msg)
+			}
 			if b := tr.Balancing; b != nil && balancingProblem(tr) {
 				bad("transfer %s says it balanced %d of %d, which its postings do not match", id, b.Amount, b.Requested)
 			}
@@ -508,4 +525,69 @@ func balancingProblem(tr *Transfer) bool {
 		}
 	}
 	return tr.Postings[0].Direction == tr.Postings[1].Direction
+}
+
+// holdProblem checks a transfer against the journal entries it lists: each
+// one exists and belongs to it with the kind it says, increases and
+// extensions appear only on a hold and only while it is open, each posting
+// of a hold reserves exactly what its pending and increase entries put on its
+// account, and the timeout is the one the last extension set. It returns ""
+// when all of that holds.
+func holdProblem(tr *Transfer, entries []Entry) string {
+	hold := len(tr.Entries) > 0 && tr.Entries[0].Kind == KindPending
+	var reserved []int64
+	if hold {
+		reserved = make([]int64, len(tr.Postings))
+	}
+	var extended *Entry
+	open := hold
+	for k, ref := range tr.Entries {
+		if ref.Seq == 0 || ref.Seq > uint64(len(entries)) {
+			return fmt.Sprintf("lists entry %d, which is not in the journal", ref.Seq)
+		}
+		e := &entries[ref.Seq-1]
+		if e.TransferID != tr.ID || e.Kind != ref.Kind {
+			return fmt.Sprintf("lists entry %d as %s, but it is %s of %s", ref.Seq, ref.Kind, e.Kind, e.TransferID)
+		}
+		switch ref.Kind {
+		case KindIncreasePending, KindExtendPending:
+			if !open || k == 0 {
+				return fmt.Sprintf("has a %s entry %d while it is not an open hold", ref.Kind, ref.Seq)
+			}
+			if ref.Kind == KindExtendPending {
+				if extended != nil && !e.ExpiresAt.After(extended.ExpiresAt) {
+					return fmt.Sprintf("extension %d does not move its timeout later", ref.Seq)
+				}
+				extended = e
+			}
+		case KindPostPending, KindVoidPending, KindExpirePending:
+			open = false
+			continue
+		}
+		if !hold || (ref.Kind != KindPending && ref.Kind != KindIncreasePending) {
+			continue
+		}
+		for _, ln := range e.Lines {
+			found := false
+			for i, p := range tr.Postings {
+				if p.Account == ln.Account && p.Direction == ln.Direction {
+					reserved[i] += ln.Pending
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Sprintf("entry %d reserves on %s, which is not one of its postings", ref.Seq, ln.Account)
+			}
+		}
+	}
+	for i, p := range tr.Postings {
+		if hold && p.Amount != reserved[i] {
+			return fmt.Sprintf("posting to %s holds %d but its entries reserved %d", p.Account, p.Amount, reserved[i])
+		}
+	}
+	if extended != nil && !tr.ExpiresAt.Equal(extended.ExpiresAt) {
+		return fmt.Sprintf("expires at %v but its last extension set %v", tr.ExpiresAt, extended.ExpiresAt)
+	}
+	return ""
 }

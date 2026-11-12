@@ -55,7 +55,10 @@ const (
 	// every account in them is open with the limits it was created with.
 	// Version 3 lacks batch results, which no ledger could hold when it was
 	// written, and version 4 lacks balancing records for the same reason.
-	snapVersion    = 5
+	// Version 6 adds hold increases and extensions: entries carry the new
+	// timeout of an extend_pending entry, which has no lines. Older
+	// versions may hold neither kind.
+	snapVersion    = 6
 	snapPrefix     = "snapshot-"
 	snapSuffix     = ".snap"
 	snapTmpSuffix  = ".tmp"
@@ -452,6 +455,9 @@ func (w *snapWriter) encode(s *snapshot) error {
 			w.i(ln.Posted)
 			w.i(ln.Pending)
 		}
+		if w.ver >= 6 {
+			w.when(e.ExpiresAt)
+		}
 		w.item()
 	}
 	for _, q := range s.idem {
@@ -711,7 +717,7 @@ func (r *snapReader) dir() Direction {
 }
 
 var (
-	snapKinds  = []EntryKind{KindPosted, KindPending, KindPostPending, KindVoidPending, KindExpirePending, KindReversal}
+	snapKinds  = []EntryKind{KindPosted, KindPending, KindPostPending, KindVoidPending, KindExpirePending, KindReversal, KindIncreasePending, KindExtendPending}
 	snapStates = []TransferState{StatePending, StatePosted, StateVoided, StateExpired}
 )
 
@@ -719,6 +725,9 @@ func (r *snapReader) kind() EntryKind {
 	b := r.raw()
 	for _, k := range snapKinds {
 		if string(b) == string(k) {
+			if r.ver < 6 && (k == KindIncreasePending || k == KindExtendPending) {
+				break
+			}
 			return k
 		}
 	}
@@ -1037,10 +1046,12 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 		}
 		e.TransferID = tr.ID
 		n := r.count(4)
-		if r.err == nil && n == 0 {
-			r.fail("entry %d has no lines", e.Seq)
+		if r.err == nil && (n == 0) != (e.Kind == KindExtendPending) {
+			r.fail("entry %d (%s) has %d lines", e.Seq, e.Kind, n)
 		}
-		e.Lines = carve(&r.lines, n)
+		if n > 0 {
+			e.Lines = carve(&r.lines, n) // an extension has none, and keeps nil as replay does
+		}
 		for j := range e.Lines {
 			ln := Line{Account: r.acct(), Direction: r.dir(), Posted: r.i(), Pending: r.i()}
 			if r.err != nil {
@@ -1060,6 +1071,11 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 			*b = nb
 			a := st.accounts[ln.Account]
 			a.rows = append(a.rows, row{seq: e.Seq, line: j, balance: nb})
+		}
+		if r.ver >= 6 {
+			if e.ExpiresAt = r.when(); r.err == nil && e.ExpiresAt.IsZero() == (e.Kind == KindExtendPending) {
+				r.fail("entry %d (%s) has a timeout only an extend_pending entry may have", e.Seq, e.Kind)
+			}
 		}
 		st.entries = append(st.entries, e)
 	}

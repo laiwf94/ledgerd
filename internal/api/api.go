@@ -153,6 +153,8 @@ func New(cfg Config) (*Server, error) {
 	s.route("GET /v1/transfers/{id}", s.getTransfer, authKey)
 	s.route("POST /v1/transfers/{id}/post", s.postTransfer, authKey)
 	s.route("POST /v1/transfers/{id}/void", s.voidTransfer, authKey)
+	s.route("POST /v1/transfers/{id}/increase", s.increaseTransfer, authKey)
+	s.route("POST /v1/transfers/{id}/extend", s.extendTransfer, authKey)
 	s.route("POST /v1/transfers/{id}/reverse", s.reverseTransfer, authKey)
 	s.route("GET /v1/admin/invariants", s.invariants, authAdmin)
 	s.route("/", func(http.ResponseWriter, *http.Request) error {
@@ -720,6 +722,36 @@ func (s *Server) voidTransfer(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	return s.execute(w, r, ledger.Command{Void: &ledger.VoidSpec{TransferID: id}}, body, http.StatusOK)
+}
+
+// increaseTransfer reserves more on a pending transfer. The body says how
+// much more, like the body of a partial post.
+func (s *Server) increaseTransfer(w http.ResponseWriter, r *http.Request) error {
+	id, err := pathID(r)
+	if err != nil {
+		return err
+	}
+	var body ledger.Amounts
+	if err := decode(r, &body, false); err != nil {
+		return err
+	}
+	return s.execute(w, r, ledger.Command{IncreasePending: &ledger.IncreaseSpec{TransferID: id, Amounts: body}}, body, http.StatusOK)
+}
+
+// extendTransfer moves a pending transfer's timeout to timeout_seconds from
+// now.
+func (s *Server) extendTransfer(w http.ResponseWriter, r *http.Request) error {
+	id, err := pathID(r)
+	if err != nil {
+		return err
+	}
+	var body struct {
+		TimeoutSeconds int64 `json:"timeout_seconds"`
+	}
+	if err := decode(r, &body, false); err != nil {
+		return err
+	}
+	return s.execute(w, r, ledger.Command{ExtendPending: &ledger.ExtendSpec{TransferID: id, TimeoutSeconds: body.TimeoutSeconds}}, body, http.StatusOK)
 }
 
 func (s *Server) reverseTransfer(w http.ResponseWriter, r *http.Request) error {
