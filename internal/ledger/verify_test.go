@@ -287,8 +287,11 @@ func TestVerifyNewestSnapshotWithoutRecord(t *testing.T) {
 // Damage stops the replay but not the checksums: later segments are still
 // read and reported.
 func TestVerifyKeepsCheckingAfterDamage(t *testing.T) {
-	dir, _ := verifyFixture(t, 1024)
+	dir, _ := verifyFixture(t, 512)
 	paths, _ := wal.SegmentPaths(filepath.Join(dir, walDir))
+	if len(paths) < 4 {
+		t.Fatalf("the fixture kept %d segments; the test damages the first and third and needs a sound one after them", len(paths))
+	}
 	data, _ := os.ReadFile(paths[0])
 	data[20] ^= 1
 	os.WriteFile(paths[0], data, 0o600)

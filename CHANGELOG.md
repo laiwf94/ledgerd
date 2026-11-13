@@ -67,6 +67,17 @@ current formats.
   `overflow` instead of relying on the transfer's own totals.
 - Ledger errors carry `item` when they are about one transfer of a batch.
 
+#### Tests
+
+- The reference model covers atomic batches (with rollback and the refused
+  item), balancing transfers, hold increases and extensions, and
+  conversions between USD, EUR and JPY through exchange accounts, including
+  partial posts, increases and reversals of them. It checks every returned
+  transfer in full (currencies, rate, balancing record, timeout, entries,
+  reversals) and, after every round, that debits equal credits in each
+  currency, posted and pending. The power-cut and snapshot tests run the
+  same workload.
+
 ### Listings, indexes and account lifecycle (#25)
 
 #### Added

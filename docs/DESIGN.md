@@ -1113,6 +1113,39 @@ accounts, sets and removes overdraft and credit limits (often below what an
 account already uses), opens new accounts with metadata, and puts
 references and metadata on transfers and reversals.
 
+It also sends every richer transfer the API has:
+
+- **atomic batches** of one to three random transfers, some followed by a
+  "fund, then sweep" pair whose sweep depends on the funding before it, so
+  a refusal at any item must undo the transfers before it;
+- **balancing transfers** with `balance_debit`, `balance_credit` or both,
+  often sweeps asking for more than there is, on every combination of
+  normal side and limit, posted and pending;
+- **hold changes**: increases by an amount, by a scaled share of every
+  posting or by random per-posting amounts (including ones that overflow),
+  and extensions to 1 to 8 seconds from now, which may or may not be later
+  than the current timeout;
+- **conversions** between USD, EUR and JPY (so the rate rescales between
+  exponents both ways) through an exchange account in each currency,
+  sometimes with a fee in the base currency, rounded down or up, a few
+  units off the rate, or through an account that is not an exchange
+  account; and partial posts, increases and reversals of them with amounts
+  scaled to keep the rate within rounding or miss it, amounts for only one
+  currency, and amounts that balance in sum but not in each currency.
+
+The model has its own rules for each: a batch runs its transfers in order
+and puts its maps and journal head back if one is refused, reporting the
+item; a balancing transfer moves the lesser of the request and each flagged
+account's room, worked out on the normal side with an unset limit counting
+as zero; an increase reserves more through the same line checks as a new
+hold and is refused on a balancing hold; an extension writes an entry with
+no lines and moves only the timeout; and a conversion is checked against
+its own `big.Rat` arithmetic and exponent table, not the ledger's
+`money` package. Returned and stored transfers are compared in full,
+including posting currencies, the rate and its source and quote time, the
+balancing record, the timeout, the list of entries with their sequence
+numbers and the reversals.
+
 The order the writer chose is read back from the log (every operation carries
 an idempotency key, so even refusals are recorded), and a separate
 single-threaded model replays the same operations in that order. The model
@@ -1126,6 +1159,9 @@ round these must agree with the ledger:
   the same as of an earlier journal entry (a point-in-time read checked
   against the model's histories), and its limit history;
 - every invariant;
+- per currency, across all accounts, debits posted equal credits posted and
+  debits pending equal credits pending, summed from what the ledger
+  returns;
 - the listings. Account listings are walked with every currency and
   metadata filter the workload uses, and transfer listings with a sample of
   filters by state, currency, account, reference, metadata and
@@ -1149,10 +1185,18 @@ pending, reversals not indexed by reference) also fails the model test with
 
 The test also asserts that the workload reached every outcome (each error
 code including `account_frozen` and `account_closed`, each operation
-including every lifecycle and limit command, expiries, replays, crashes), so
-a passing run cannot be a vacuous one. The power-cut and snapshot tests use
-the same generator, so lifecycle and limit commands also cross power cuts
-and snapshots.
+including every lifecycle and limit command, batches committed and rolled
+back after an earlier item, increases and extensions, balancing transfers
+that moved, were cut and found no room, conversions accepted, refused off
+the rate and reversed, expiries, replays, crashes), so a passing run cannot
+be a vacuous one. Deliberately broken versions of the ledger fail it: the
+balancing room on the wrong side, no clamp, a rollback that keeps accounts
+or the open count, the rate check off or a unit too lenient, per-posting
+amounts summed across currencies, an increase that does not grow the
+posting, an extension that does not move the timeout or ignores a frozen
+account, increases allowed on balancing holds, and a reversal that drops
+the rate. The power-cut and snapshot tests use the same generator and
+accounts, so all of these also cross power cuts and snapshots.
 
 ## Limits
 

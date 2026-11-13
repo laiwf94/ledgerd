@@ -89,15 +89,10 @@ func runPowerModel(t *testing.T, seed int64, cuts int, seen map[string]int, stat
 	}()
 
 	m := newModel(clock.Now())
-	g := &gen{r: r, m: m, accts: []string{"a", "b", "c", "d", "e", "f", "g", "h"}}
+	g := newGen(r, m)
 	results := map[string]mResult{}
 	hashes := map[string][32]byte{}
-	setup := []Command{
-		openAcct("a", "USD", Debit), openAcct("b", "USD", Credit), openAcct("c", "USD", Credit, "nonneg"),
-		openAcct("d", "USD", Debit, "nonneg"), openAcct("e", "USD", Debit, "nonpos"), openAcct("f", "USD", Credit, "nonpos"),
-		openAcct("g", "EUR", Credit),
-	}
-	for i, c := range setup {
+	for i, c := range modelSetup() {
 		o := newOp(fmt.Sprintf("setup-%d", i), c)
 		if _, err := l.Do(context.Background(), o.command(), &Idem{Key: o.key, Hash: o.hash}); err != nil {
 			t.Fatal(err)
@@ -142,16 +137,12 @@ func runPowerModel(t *testing.T, seed int64, cuts int, seen map[string]int, stat
 				t.Fatalf("round %d: log has key %s that no operation sent", round, k)
 			}
 			c := o.command()
-			res := m.exec(&c, rec.ID)
-			if (rec.Type == recReject) != (res.code != "") || (rec.Err != nil && rec.Err.Code != res.code) {
-				t.Fatalf("round %d op %s (%s): ledger recorded %s %+v, model says %q", round, k, o.body, rec.Type, rec.Err, res.code)
+			res := m.exec(&c, rec.ID, rec.IDs...)
+			if msg := recordDiffers(rec, res); msg != "" {
+				t.Fatalf("round %d op %s (%s): %s", round, k, o.body, msg)
 			}
 			results[k], hashes[k] = res, o.hash
-			if res.code == "" {
-				seen["ok:"+opName(&c)]++
-			} else {
-				seen[string(res.code)]++
-			}
+			noteOutcome(seen, &c, res)
 		}
 		return executed
 	}
@@ -289,19 +280,14 @@ func runPowerModel(t *testing.T, seed int64, cuts int, seen map[string]int, stat
 			case !known:
 				t.Fatalf("round %d op %s (%s): acknowledged with %v but lost by the power cut", round, o.key, o.body, a.err)
 			}
-			if codeOf(a.err) != want.code {
-				t.Fatalf("round %d op %s (%s): got %v, model says %q", round, o.key, o.body, a.err, want.code)
+			if msg := resultDiffers(a, want); msg != "" {
+				t.Fatalf("round %d op %s (%s): %s", round, o.key, o.body, msg)
 			}
 			if a.out.Replayed {
 				seen["replayed"]++
 			}
 			if !executed[o.key] && !a.out.Replayed {
 				t.Fatalf("round %d op %s: acknowledged, not marked replayed, and not in the log", round, o.key)
-			}
-			if want.code == "" && want.transfer != "" {
-				if a.out.Transfer == nil || transferSnapshot(a.out.Transfer) != want.snapshot {
-					t.Fatalf("round %d op %s: got transfer %+v, model returned %s", round, o.key, a.out.Transfer, want.snapshot)
-				}
 			}
 		}
 		for _, o := range ops {
