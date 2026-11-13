@@ -226,6 +226,7 @@ To run the suite and the ledger benchmarks:
 $ go test -race ./...                 # full suite
 $ go test -run=^$ -bench=. ./internal/ledger/
 $ go test -run=^$ -bench=Recovery -benchtime=3x ./internal/ledger/   # restart time at 1 million entries
+$ go test -run=^$ -bench=Batch -benchtime=3s ./internal/ledger/ ./internal/api/   # batches of 1, 100 and 8,190
 ```
 
 ## Numbers
@@ -244,6 +245,12 @@ With one client there is nothing to batch, so both modes are bound by the
 flush. The gain grows with the number of transfers that queue up while a
 flush is in progress. Without the disk, the writer and state machine run
 about 390,000 transfers/s, and a balance-as-of read takes 0.11 µs.
+
+One client sending atomic batches of 8,190 transfers commits about 156,000
+transfers/s on disk with one fsync per batch, against 3,650/s sending
+single transfers, at about 6 allocations and 167 log bytes per transfer (4
+vCPU 2.1 GHz Xeon VM; batches of 1 and 100 and the HTTP figures are in
+[docs/DESIGN.md](docs/DESIGN.md#what-a-batch-costs)).
 
 ## Further reading
 
