@@ -715,6 +715,40 @@ Validation errors about one transfer name it the same way. One
 the original, or the original refusal naming the same transfer, even once
 the batch would succeed.
 
+### What a batch costs
+
+`BenchmarkBatch` (`internal/ledger`) submits batches of 1, 100 and 8,190
+two-posting transfers from one client, back to back, into 64 accounts, and
+compares them with a plain `create_transfer`. Each command is its own group
+commit, so on disk every batch is one log write and one fsync, which the
+benchmark checks. Snapshots are off, so it measures the commit path alone.
+`BenchmarkBatchHTTP` (`internal/api`) sends the same commands through the
+HTTP handler without a network, so it adds authentication, JSON decoding
+and the response. Allocations and bytes are counted across the whole
+process while the timer runs, writer and background goroutines included.
+Medians of three 3-second runs on a 4 vCPU 2.1 GHz Xeon VM, where an fsync
+takes about 0.2 ms:
+
+| Command | In memory | On disk | Over HTTP (in memory) | Allocs per transfer (memory / HTTP) | Heap bytes per transfer (memory / HTTP) | Log bytes per transfer |
+|---|---|---|---|---|---|---|
+| `create_transfer` | 54,000 /s | 3,650 /s | 19,800 /s | 26 / 90 | 4,200 / 14,600 | 270 |
+| batch of 1 | 45,700 /s | 4,170 /s | 17,200 /s | 34 / 109 | 4,950 / 15,900 | 286 |
+| batch of 100 | 155,000 /s | 82,200 /s | 93,100 /s | 7.5 / 12.5 | 3,640 / 5,310 | 168 |
+| batch of 8,190 | 164,000 /s | 156,000 /s | 103,000 /s | 6.1 / 10.1 | 4,000 / 6,550 | 167 |
+
+A batch of 1 costs a little more than a plain transfer (eight allocations
+and about 3 µs for the batch wrapper and its savepoint), so a client with
+one transfer should send it on its own. From 100 transfers up, the cost per
+transfer stops depending on the round trip to the writer and the fsync: a
+batch of 8,190 on disk runs as fast as in memory, about 40 times one client
+sending single transfers, and its log record takes 167 bytes per transfer
+against 270, since the command's fields are written once for the batch.
+What is left per transfer, about 6 µs and 4 KB, is mostly what the ledger
+keeps: the journal entry and its lines, two history rows, the transfer and
+its index entries, plus the record's JSON. Over HTTP, decoding and encoding
+add about 4 µs and 2.5 KB per transfer at 8,190; a full batch takes about
+87 ms to commit, 1.1 MB in and 2.9 MB out.
+
 ## Balancing transfers
 
 A transfer may carry `balance_debit`, `balance_credit` or both

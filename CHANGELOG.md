@@ -77,6 +77,11 @@ current formats.
   reversals) and, after every round, that debits equal credits in each
   currency, posted and pending. The power-cut and snapshot tests run the
   same workload.
+- `BenchmarkBatch` and `BenchmarkBatchHTTP` measure throughput, allocations,
+  heap bytes and log bytes per transfer for batches of 1, 100 and 8,190
+  transfers against a plain transfer, in memory, on disk and through the
+  HTTP handler. One client reaches about 156,000 transfers/s on disk with
+  batches of 8,190, against 3,650/s with single transfers.
 
 ### Listings, indexes and account lifecycle (#25)
 
