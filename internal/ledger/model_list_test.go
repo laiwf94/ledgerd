@@ -64,7 +64,8 @@ func (m *model) listTransfers(f TransferFilter, desc bool) []*mTransfer {
 	var out []*mTransfer
 	for _, id := range m.order {
 		t := m.xfers[id]
-		if f.State != "" && t.state != f.State || f.Currency != "" && t.cur != f.Currency ||
+		inCurrency := t.cur == f.Currency || t.fx != nil && t.fx.quote == f.Currency
+		if f.State != "" && t.state != f.State || f.Currency != "" && !inCurrency ||
 			f.Reference != "" && t.ref != f.Reference || !mMetaMatch(t.meta, f.Metadata) {
 			continue
 		}
@@ -157,7 +158,7 @@ func listingFilters(m *model, r *rand.Rand) ([]AccountFilter, []TransferFilter) 
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	tfs := []TransferFilter{{}, {Currency: "USD"}, {Currency: "EUR"}, {Account: "acct_missing"},
+	tfs := []TransferFilter{{}, {Currency: "USD"}, {Currency: "EUR"}, {Currency: "JPY"}, {Account: "acct_missing"},
 		{Reference: "ref-missing"}, {Metadata: map[string]string{"kind": "missing"}}}
 	for _, s := range []TransferState{StatePending, StatePosted, StateVoided, StateExpired} {
 		tfs = append(tfs, TransferFilter{State: s})

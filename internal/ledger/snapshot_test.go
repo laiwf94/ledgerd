@@ -177,9 +177,8 @@ func randomWorkload(t testing.TB, l *Ledger, clock *fakeClock, r *rand.Rand, ops
 	t.Helper()
 	ctx := context.Background()
 	m := newModel(clock.Now())
-	g := &gen{r: r, m: m, accts: []string{"a", "b", "c", "d", "e", "f", "g", "h"}}
-	for _, c := range []Command{openAcct("a", "USD", Debit), openAcct("b", "USD", Credit), openAcct("c", "USD", Credit, "nonneg"),
-		openAcct("d", "USD", Debit, "nonneg"), openAcct("e", "USD", Debit, "nonpos"), openAcct("g", "EUR", Credit)} {
+	g := newGen(r, m)
+	for _, c := range modelSetup() {
 		l.Do(ctx, c, nil)
 		m.exec(&c, "")
 	}
@@ -200,11 +199,14 @@ func randomWorkload(t testing.TB, l *Ledger, clock *fakeClock, r *rand.Rand, ops
 		}
 		out, err := l.Do(ctx, c, idem)
 		if err == nil && !out.Replayed {
-			id := ""
+			id, ids := "", []string(nil)
 			if out.Transfer != nil && (c.CreateTransfer != nil || c.Reverse != nil) {
 				id = out.Transfer.ID
 			}
-			m.exec(&c, id)
+			for _, tr := range out.Transfers {
+				ids = append(ids, tr.ID)
+			}
+			m.exec(&c, id, ids...)
 		}
 		g.done = append(g.done, o)
 	}

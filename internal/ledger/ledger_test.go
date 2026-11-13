@@ -136,6 +136,8 @@ func openAcct(id, cur string, normal Direction, flags ...string) Command {
 			s.NonNegative = true
 		case "nonpos":
 			s.NonPositive = true
+		case "exchange":
+			s.Exchange = true
 		}
 	}
 	return Command{CreateAccount: s}
