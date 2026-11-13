@@ -70,12 +70,11 @@ creates; journal entries are the immutable records of what happened to it.
 | reversal | `reversal` | posted += amount on the opposite side |
 
 A transfer has 2 to 64 postings, each a debit or credit to a distinct
-account, all in the transfer's one currency. Debits must equal credits or the
-transfer is refused. One currency per entry is a deliberate constraint: an FX
-conversion is two entries through per-currency FX accounts. Allowing
-multi-currency entries balanced per currency would make the conversion atomic
-and is a contained change to `post`, but it also needs FX-rate provenance in
-the entry, which is out of scope.
+account. The postings are in the transfer's currency, or in two currencies
+for a conversion, and debits must equal credits in each currency or the
+transfer is refused. A conversion is one entry, so a crash cannot leave one
+side done; it carries its rate, source and quote time, and its details are
+in [multi-currency transfers](#multi-currency-transfers).
 
 Money is `int64` minor units, never floating point. Every addition is
 overflow-checked; in addition, posted plus pending on each side of an account
