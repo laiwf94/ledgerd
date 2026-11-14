@@ -708,6 +708,9 @@ func FuzzListQuery(f *testing.F) {
 		"%zz", "account=" + strings.Repeat("x", 70)} {
 		f.Add(q)
 	}
+	for _, q := range fuzzEntrySeeds() {
+		f.Add(q)
+	}
 	l, err := ledger.Open(ledger.Options{SweepInterval: -1})
 	if err != nil {
 		f.Fatal(err)
@@ -816,6 +819,44 @@ func FuzzListQuery(f *testing.F) {
 				}
 				dup[id] = true
 			}
+		}
+		// The entry feed: a walk that follows next_after_seq ends at the
+		// head and returns each entry once, in sequence order.
+		path := "/v1/entries?" + query
+		var last uint64
+		for pages := 0; ; pages++ {
+			if pages > 200 {
+				t.Fatalf("GET /v1/entries?%s: the walk never ended", query)
+			}
+			code, body := get(t, path)
+			if code != http.StatusOK {
+				break
+			}
+			var page struct {
+				Entries      []struct{ Seq uint64 }
+				HasMore      bool   `json:"has_more"`
+				NextAfterSeq uint64 `json:"next_after_seq"`
+				HeadSeq      uint64 `json:"head_seq"`
+			}
+			if err := json.Unmarshal(body, &page); err != nil {
+				t.Fatalf("GET %s: %v", path, err)
+			}
+			for _, e := range page.Entries {
+				if e.Seq <= last || e.Seq > page.NextAfterSeq {
+					t.Fatalf("GET %s: entry %d after %d, page ends at %d", path, e.Seq, last, page.NextAfterSeq)
+				}
+				last = e.Seq
+			}
+			if page.HasMore != (page.NextAfterSeq < page.HeadSeq) || page.NextAfterSeq > page.HeadSeq {
+				t.Fatalf("GET %s: has_more %v, next %d, head %d", path, page.HasMore, page.NextAfterSeq, page.HeadSeq)
+			}
+			if !page.HasMore {
+				break
+			}
+			// Replace after_seq, keeping the other parameters as given.
+			vals, _ := url.ParseQuery(query)
+			vals.Set("after_seq", fmt.Sprint(page.NextAfterSeq))
+			path = "/v1/entries?" + vals.Encode()
 		}
 		if v := append(l.CheckInvariants(), l.CheckIndexes()...); len(v) > 0 {
 			t.Fatalf("invariants broken after %q: %v", query, v)

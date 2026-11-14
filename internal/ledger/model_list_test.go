@@ -3,6 +3,7 @@ package ledger
 import (
 	"fmt"
 	"math/rand"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -224,7 +225,7 @@ func checkListings(l *Ledger, m *model, r *rand.Rand) error {
 			}
 		}
 	}
-	return nil
+	return checkFeed(l, m, r)
 }
 
 func accountIDs(as []AccountState) []string {
@@ -359,4 +360,139 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// The model checks the journal feed as well. Each round it walks the feed
+// with filters on every kind, currency and a sample of accounts, from the
+// start and from a random sequence, changing the page size from page to
+// page, and requires the walk to be exactly the model's own journal after
+// that sequence filtered the same way: every entry's sequence, kind,
+// transfer and lines. The walk must end at the model's head.
+
+// feedFilters returns feed filters that reach every kind of filter: none,
+// each kind, several kinds, each currency, accounts, combinations and
+// values nothing has.
+func feedFilters(m *model, r *rand.Rand) []EntryFilter {
+	all := []EntryKind{KindPosted, KindPending, KindPostPending, KindVoidPending, KindExpirePending, KindReversal,
+		KindIncreasePending, KindExtendPending}
+	fs := []EntryFilter{{}, {Currency: "USD"}, {Currency: "EUR"}, {Currency: "JPY"}, {Currency: "GBP"}, {Account: "acct_missing"},
+		{Kinds: all}, {Kinds: []EntryKind{KindPostPending, KindVoidPending, KindExpirePending}}}
+	for _, k := range all {
+		fs = append(fs, EntryFilter{Kinds: []EntryKind{k}})
+	}
+	ids := make([]string, 0, len(m.accts))
+	for id := range m.accts {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if len(ids) > 0 {
+		pick := func() string { return ids[r.Intn(len(ids))] }
+		for range 4 {
+			fs = append(fs, EntryFilter{Account: pick()})
+		}
+		fs = append(fs,
+			EntryFilter{Account: pick(), Kinds: []EntryKind{all[r.Intn(len(all))], all[r.Intn(len(all))]}},
+			EntryFilter{Account: pick(), Currency: []string{"USD", "EUR", "JPY"}[r.Intn(3)]},
+			EntryFilter{Currency: "EUR", Kinds: []EntryKind{KindPosted, KindReversal}})
+	}
+	r.Shuffle(len(fs), func(i, j int) { fs[i], fs[j] = fs[j], fs[i] })
+	return fs[:min(len(fs), feedWalksPerRound)]
+}
+
+const feedWalksPerRound = 8
+
+// feedEntry describes an entry for comparison, with every line's currency
+// spelled out.
+func feedEntry(e *Entry) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d %s %s", e.Seq, e.Kind, e.TransferID)
+	for i := range e.Lines {
+		ln := &e.Lines[i]
+		fmt.Fprintf(&b, " [%s %s %s %d %d]", ln.Account, ln.Direction, e.currency(ln), ln.Posted, ln.Pending)
+	}
+	return b.String()
+}
+
+// feed is the model's answer: its journal after after, filtered by f.
+func (m *model) feed(f EntryFilter, after uint64) []string {
+	owner := make([]string, m.head)
+	for _, t := range m.xfers {
+		for _, ref := range t.entries {
+			owner[ref.Seq-1] = t.id
+		}
+	}
+	var out []string
+	for i := after; i < m.head; i++ {
+		e := m.journal[i]
+		if len(f.Kinds) > 0 && !slices.Contains(f.Kinds, e.kind) {
+			continue
+		}
+		t := m.xfers[owner[i]]
+		on, inCur := false, f.Currency == "" || t.cur == f.Currency || t.fx != nil && t.fx.quote == f.Currency
+		for _, ln := range e.lines {
+			on = on || ln.acct == f.Account
+		}
+		if f.Account != "" && !on || !inCur {
+			continue
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "%d %s %s", i+1, e.kind, t.id)
+		for _, ln := range e.lines {
+			fmt.Fprintf(&b, " [%s %s %s %d %d]", ln.acct, ln.dir, ln.cur, ln.posted, ln.pending)
+		}
+		out = append(out, b.String())
+	}
+	return out
+}
+
+func modelWalkFeed(l *Ledger, f EntryFilter, after uint64, r *rand.Rand, head uint64) ([]string, error) {
+	var out []string
+	for pages := 0; pages < maxPages; pages++ {
+		p, err := l.Entries(f, after, pageSize(r))
+		if err != nil {
+			return nil, err
+		}
+		if p.Head != head {
+			return nil, fmt.Errorf("feed page read at head %d, model is at %d", p.Head, head)
+		}
+		if p.Next < after || p.Next > p.Head {
+			return nil, fmt.Errorf("feed %+v after %d: next %d outside [%d, %d]", f, after, p.Next, after, p.Head)
+		}
+		for i := range p.Entries {
+			if s := p.Entries[i].Seq; s <= after || s > p.Next {
+				return nil, fmt.Errorf("feed %+v after %d: entry %d on a page that ends at %d", f, after, s, p.Next)
+			}
+			out = append(out, feedEntry(&p.Entries[i]))
+		}
+		if !p.HasMore() {
+			return out, nil
+		}
+		after = p.Next
+	}
+	return nil, fmt.Errorf("feed %+v never ended", f)
+}
+
+// checkFeed walks the feed with each of a sample of filters and compares
+// each walk with the model. It reports the first difference.
+func checkFeed(l *Ledger, m *model, r *rand.Rand) error {
+	for _, f := range feedFilters(m, r) {
+		var after uint64
+		if r.Intn(2) == 0 && m.head > 0 {
+			after = uint64(r.Int63n(int64(m.head) + 1))
+		}
+		got, err := modelWalkFeed(l, f, after, r, m.head)
+		if err != nil {
+			return err
+		}
+		want := m.feed(f, after)
+		if len(got) != len(want) {
+			return fmt.Errorf("feed %+v after %d: %d entries, model has %d", f, after, len(got), len(want))
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				return fmt.Errorf("feed %+v after %d item %d:\nfeed  %s\nmodel %s", f, after, i, got[i], want[i])
+			}
+		}
+	}
+	return nil
 }
