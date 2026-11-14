@@ -82,6 +82,13 @@ current formats.
   transfers against a plain transfer, in memory, on disk and through the
   HTTP handler. One client reaches about 156,000 transfers/s on disk with
   batches of 8,190, against 3,650/s with single transfers.
+- `TestRicherTransfersSurviveKillNine` runs a split payout batch with a
+  balancing sweep, a hotel hold that grows, is extended and is posted at
+  checkout, and a USD to EUR conversion through the real binary, then runs
+  them under load while the server is killed with `SIGKILL` twice. On each
+  restored copy `ledgerd verify` passes, every acknowledged request replays
+  its answer byte for byte, balances match the acknowledged requests,
+  debits equal credits in each currency and every conversion is whole.
 
 ### Listings, indexes and account lifecycle (#25)
 
