@@ -93,6 +93,7 @@ type Ledger struct {
 
 	auditMu   sync.Mutex        // one invariant check at a time
 	auditStep func(step string) // tests: called while the checker holds no lock
+	feedHook  func(seq uint64)  // tests: called before the feed examines an entry, holding no lock
 
 	queue   chan *request
 	quit    chan struct{}

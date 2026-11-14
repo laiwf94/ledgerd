@@ -1091,6 +1091,72 @@ unfiltered in either order, 7 µs for one account's transfers and 14 µs for
 pending ones (one in ten); a reference carried by 20 transfers is answered
 in about 1.2 µs.
 
+### Following the journal
+
+`GET /v1/entries` is the journal feed (`Ledger.Entries`,
+`internal/ledger/feed.go`): every journal entry in sequence order, as the
+journal holds it (sequence, time, kind, transfer, lines with their posted
+and pending amounts, and the rate or new timeout where the entry has one).
+A consumer keeps the sequence of the last entry it processed and asks for
+`after_seq=` that; sequences start at 1, are dense and never reused, so the
+consumer resumes exactly where it stopped, after a restart of either side.
+The position is a plain number rather than a signed cursor: it is the same
+number every entry, statement line and `as_of_seq` carries, and a consumer
+may change its filters when it resumes. An `after_seq` past the head is
+refused, which tells a consumer pointed at the wrong ledger, or at a copy
+restored from before its position, that it is ahead of the data.
+
+Filters are `account=` (entries with a line on that account), `kind=` (a
+comma-separated list of entry kinds) and `currency=` (entries in that
+currency: an entry of a transfer in it, or of a conversion that has it as
+its other currency); an entry must match all of them. A hold extension has
+no lines, so it matches no account filter, and it is in its transfer's
+currencies.
+
+The journal is append-only and an entry never changes once it is committed,
+which is what the invariant checker already relies on to read the journal
+prefix without a lock. A feed request takes the read lock only to note the
+journal slice (and, with an account filter, the account's history rows,
+also append-only), releases it, and scans, filters and encodes with no lock
+held; a currency filter that meets a hold extension looks up its
+transfer's other currency under the read lock, an O(1) map read. A feed
+reader therefore never holds up a commit, however large its pages or slow
+its connection, and a commit never changes a page being read.
+`TestEntriesDoNotBlockCommits` commits a transfer at every entry the feed
+examines and fails if one has to wait.
+
+With an account filter the walk reads only that account's history rows,
+so it costs the account's entries, not the journal's. Other filters scan
+the journal from `after_seq`; one request examines at most
+`max(64 × limit, 65,536)` entries, and when that budget runs out the page
+comes back short, possibly empty. The response's `next_after_seq` is the
+last sequence the page examined, not the last one it returned: an entry
+that did not match will never match, so resuming from there skips nothing
+and returns nothing twice. A page that fills stops at its last entry when
+another match follows; one that runs out of matches reports the head it
+read, so a filtered consumer polling at the tail does not rescan the same
+entries. `has_more` is `next_after_seq < head_seq`: the feed has entries it
+has not examined yet, and the consumer should ask again at once rather than
+wait. `limit` is 1 to 1,000 (default 100).
+
+The feed is served from the journal in memory, not by reading segment
+files. The log is a command log, so a segment holds commands rather than
+entries, and segments behind the oldest kept snapshot are deleted; the
+journal is rebuilt from the snapshot and the segments after it at startup
+and holds every entry since sequence 1, so the feed serves the whole
+history after segments are dropped (`TestEntriesAfterSegmentsDropped`).
+
+The reference-model test walks the feed every round, with filters on every
+kind, each currency and a sample of accounts, from the start and from a
+random sequence, with page sizes that change from page to page, and
+requires each walk to equal the model's own journal filtered the same way,
+entry for entry and line for line. `TestEntriesFollowConcurrentWrites` and
+`TestEntriesFollowOverHTTP` follow the feed while clients write and require
+every entry exactly once, in order. On the 4-vCPU 2.1 GHz Xeon VM with
+200,000 entries among 1,000 accounts (`BenchmarkEntries`), a page of 100
+takes about 14 µs unfiltered, 12 µs for one account's entries and 90 µs
+for a kind that is one entry in a hundred.
+
 ## Matching a bank statement
 
 `POST /v1/accounts/{id}/reconcile` takes a CSV statement

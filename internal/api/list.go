@@ -204,3 +204,60 @@ func (s *Server) listTransfers(w http.ResponseWriter, r *http.Request) error {
 	writeJSON(w, http.StatusOK, resp)
 	return nil
 }
+
+// listEntries serves the journal feed: entries after after_seq in sequence
+// order. The position is a plain sequence number rather than a signed
+// cursor, so a consumer stores it as the last entry it processed and may
+// change its filters when it resumes; next_after_seq is always present, and
+// has_more says whether entries the page did not examine already exist.
+func (s *Server) listEntries(w http.ResponseWriter, r *http.Request) error {
+	q, err := parseListQuery(r, func(name string) bool {
+		return name == "after_seq" || name == "account" || name == "kind" || name == "currency"
+	})
+	if err != nil {
+		return err
+	}
+	if q.cursor != "" {
+		return badRequest("the entry feed resumes from after_seq, not a cursor")
+	}
+	var f ledger.EntryFilter
+	var after uint64
+	for name, v := range q.filters {
+		if v == "" {
+			return badRequest("%s must not be empty", name)
+		}
+		switch name {
+		case "after_seq":
+			n, err := queryUint(r, "after_seq", 0, 1<<63)
+			if err != nil {
+				return err
+			}
+			after = n
+		case "account":
+			f.Account = v
+		case "kind":
+			kinds, err := ledger.ParseEntryKinds(v)
+			if err != nil {
+				return err
+			}
+			f.Kinds = kinds
+		case "currency":
+			f.Currency = v
+		}
+	}
+	page, err := s.l.Entries(f, after, q.limit)
+	if err != nil {
+		return err
+	}
+	resp := struct {
+		Entries      []ledger.Entry `json:"entries"`
+		HasMore      bool           `json:"has_more"`
+		NextAfterSeq uint64         `json:"next_after_seq"`
+		HeadSeq      uint64         `json:"head_seq"`
+	}{Entries: page.Entries, HasMore: page.HasMore(), NextAfterSeq: page.Next, HeadSeq: page.Head}
+	if resp.Entries == nil {
+		resp.Entries = []ledger.Entry{}
+	}
+	writeJSON(w, http.StatusOK, resp)
+	return nil
+}

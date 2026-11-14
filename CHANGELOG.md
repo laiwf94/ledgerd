@@ -8,6 +8,20 @@ current formats.
 
 ## Unreleased
 
+### Change feed, live stream, webhooks and export (#27)
+
+#### Added
+
+- The journal feed: `GET /v1/entries?after_seq=` returns journal entries
+  in sequence order with their lines, filtered by `account=`, `kind=` (a
+  comma-separated list) and `currency=`. Every page carries
+  `next_after_seq`, the last sequence it examined, so a consumer resumes
+  exactly where it stopped and never rescans entries a filter skipped, plus
+  `has_more` and `head_seq`. A request holds the state lock only to note the
+  journal's length, so feed readers never hold up commits. The feed serves
+  the whole journal, also after the segments holding its first entries have
+  been dropped behind snapshots.
+
 ### Batches, balancing transfers, holds and multi-currency (#26)
 
 #### Added

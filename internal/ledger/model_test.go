@@ -118,6 +118,16 @@ type model struct {
 	order []string // transfer IDs in creation order
 	head  uint64   // journal entries written
 	now   time.Time
+	// journal holds what each entry did: journal[i] is entry i+1. Which
+	// transfer an entry belongs to is in that transfer's entries.
+	journal []mEntry
+}
+
+// mEntry is the model's journal entry: its kind and its lines, or none for
+// an extend_pending entry.
+type mEntry struct {
+	kind  EntryKind
+	lines []mLine
 }
 
 func newModel(now time.Time) *model {
@@ -214,6 +224,7 @@ func (m *model) apply(lines []mLine, kind EntryKind, conv *mFX, required bool) C
 		return CodeInvalid
 	}
 	m.head++
+	m.journal = append(m.journal, mEntry{kind: kind, lines: lines})
 	for _, n := range next {
 		n.rows = append(n.rows[:len(n.rows):len(n.rows)], mRow{seq: m.head, dp: n.dp.Int64(), cp: n.cp.Int64(), dq: n.dq.Int64(), cq: n.cq.Int64()})
 		m.accts[n.id] = n
@@ -514,7 +525,7 @@ func (m *model) exec(c *Command, id string, ids ...string) mResult {
 			}
 			r := m.createTransfer(&c.CreateBatch.Transfers[i], tid)
 			if r.code != "" {
-				m.accts, m.xfers, m.order, m.head = accts, xfers, m.order[:order], head
+				m.accts, m.xfers, m.order, m.head, m.journal = accts, xfers, m.order[:order], head, m.journal[:head]
 				return mResult{code: r.code, item: i}
 			}
 			res.transfers = append(res.transfers, r.snapshot)
@@ -614,6 +625,7 @@ func (m *model) exec(c *Command, id string, ids ...string) mResult {
 		}
 		// An entry with no lines: the journal moves on, no account does.
 		m.head++
+		m.journal = append(m.journal, mEntry{kind: KindExtendPending})
 		t.expiresAt = at
 		t.entries = append(t.entries, EntryRef{Seq: m.head, Kind: KindExtendPending})
 		return mResult{item: -1, transfer: t.id, snapshot: m.snapshot(t)}

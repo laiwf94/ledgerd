@@ -170,6 +170,7 @@ JSON bodies and an optional `Idempotency-Key` header.
 | `POST /v1/transfers/batch` | Create up to 8,190 transfers atomically: `{"transfers":[...]}`, each as for `POST /v1/transfers`. 201 with `results` in order, each `{"status":"created","transfer":{...}}`. If one is refused, nothing happens: the status and `error` are that transfer's, `error.item` is its index, and `results` has it as `failed` and the rest as `not_applied`. One `Idempotency-Key` covers the whole batch. Bodies up to 16 MiB. |
 | `GET /v1/transfers` | List transfers in creation order, `order=desc` for newest first; `?account=&state=&currency=&reference=&metadata[key]=value&limit=&cursor=`. `reference=` finds the transfers that carry an external reference. Same cursors as accounts. |
 | `GET /v1/transfers/{id}` | A transfer with its postings, state, links and entries. |
+| `GET /v1/entries` | The journal feed: entries in sequence order with their lines; `?after_seq=&account=&kind=posted,pending&currency=&limit=`. Every page has `next_after_seq` (pass it back as `after_seq` to resume exactly where you stopped), `has_more` and `head_seq`. Reads never hold up writes. |
 | `POST /v1/transfers/{id}/post` | Post a pending transfer: all, `{"amount":n}`, or per-posting amounts. |
 | `POST /v1/transfers/{id}/void` | Release a pending transfer. |
 | `POST /v1/transfers/{id}/increase` | Reserve more on a pending transfer: `{"amount":n}` for two postings, or balanced per-posting `postings`. Checked against limits; balancing holds can't grow. |
@@ -187,6 +188,17 @@ $ curl -s "localhost:8080/v1/accounts?metadata%5Bcohort%5D=march&limit=1" -H "$A
 {"accounts":[{"id":"acme","status":"frozen",...}],"has_more":true,"next_cursor":"AQEm...","as_of_seq":6}
 $ curl -s "localhost:8080/v1/accounts?metadata%5Bcohort%5D=march&limit=1&cursor=AQEm..." -H "$AUTH"
 {"accounts":[{"id":"zenith","status":"open",...}],"has_more":false,"as_of_seq":6}
+```
+
+To follow every journal entry, keep the last sequence you processed and
+ask for what comes after it. `next_after_seq` can be past the last entry
+returned when a filter skipped entries; resume from it, and poll again once
+`has_more` is false:
+
+```console
+$ curl -s "localhost:8080/v1/entries?account=alice&after_seq=0&limit=2" -H "$AUTH"
+{"entries":[{"seq":1,"kind":"posted","transfer_id":"tr_...","lines":[...]},{"seq":7,"kind":"pending",...}],
+ "has_more":true,"next_after_seq":7,"head_seq":12}
 ```
 
 Errors look like `{"error":{"code":"limit_exceeded","message":"...","request_id":"..."}}`
@@ -216,8 +228,9 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 | Hold changes | Holds grow by an amount or per posting, up to and not past each limit, and refusals change nothing; extensions change no balance, version or statement, the old timeout never fires and the newest does; keyed retries, a restart from the log and one from a snapshot give the same holds and schedule, and `ledgerd verify` reports sound. The checker refuses a hold whose amounts, entries or timeout its journal entries do not bear out. Deliberately dropped amount updates and timeout schedules fail these tests. |
 | Multi-currency | Conversions balance in each currency and record their rate on the transfer and its entry; the rate is checked against the exchange accounts' amounts with exact arithmetic across exponents (USD to JPY), any rounding passes and a unit further does not, fees and spreads stay outside it, and every misuse (three currencies, no rate, wrong account currency, no exchange account, both sides in) is refused without a trace. Multi-currency holds, partial posts, increases and reversals are held to the rate; voids and expiries release both currencies. Keyed retries, batches, a restart from the log and one from a snapshot give the same state, and `ledgerd verify` reports sound. The checker refuses every kind of rate or currency damage. A disabled rate check, a dropped reversal line currency and a dropped snapshot rate each fail these tests. |
 | Atomic batches | A batch refused at any transfer, after earlier transfers moved money in and out, created holds or changed versions, must leave every account, transfer, index, timeout and the journal exactly as before, also when it shares a group commit with other commands and inside one transaction, where its generated IDs must be free again. Deliberately broken rollbacks fail these tests. The largest batch (8,190 transfers, a log record over a megabyte) is one fsync and survives a restart from the log alone and `ledgerd verify`; any batch that passes validation fits in one log record. |
+| Journal feed | The reference model walks the feed with every kind of filter from random positions with changing page sizes and must get exactly its own journal, entry for entry; consumers that follow the feed while clients write, in-process and over HTTP, see every entry once and in order; a commit is made at every entry the feed examines and must never wait for it; the feed is unchanged after a restart that dropped the segments holding its first entries. |
 | Reconciliation | The amount-and-date pass is compared with a maximum bipartite matching on random inputs; a worst case of 10,000 lines against 100,000 identical movements must stay fast. |
-| Parsers | Go fuzzing of the decimal amount parser, the log reader, the CSV parser, the transfer, freeze, close and limit endpoints, and the listing query strings with every cursor they return followed: accepted input round-trips; nothing returns a 500, breaks an invariant or an index, and no walk repeats an item or fails to end. |
+| Parsers | Go fuzzing of the decimal amount parser, the log reader, the CSV parser, the transfer, freeze, close and limit endpoints, and the listing and feed query strings with every cursor and position they return followed: accepted input round-trips; nothing returns a 500, breaks an invariant or an index, and no walk repeats an item or fails to end. |
 | API | Every endpoint and error code over real HTTP, a full card-payment flow, auth and admin rules, body limits, timeouts and request IDs. `examples/demo.sh` runs in CI against the real binary, twice and across a restart, and every step's outcome is checked (each refusal with its error code), followed by `ledgerd verify` on the data directory. |
 | Concurrency | The whole suite runs under the race detector in CI. |
 

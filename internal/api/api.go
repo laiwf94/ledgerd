@@ -151,6 +151,7 @@ func New(cfg Config) (*Server, error) {
 	s.route("POST /v1/transfers/batch", s.createBatch, authKey, MaxBatchBodyBytes)
 	s.route("GET /v1/transfers", s.listTransfers, authKey)
 	s.route("GET /v1/transfers/{id}", s.getTransfer, authKey)
+	s.route("GET /v1/entries", s.listEntries, authKey)
 	s.route("POST /v1/transfers/{id}/post", s.postTransfer, authKey)
 	s.route("POST /v1/transfers/{id}/void", s.voidTransfer, authKey)
 	s.route("POST /v1/transfers/{id}/increase", s.increaseTransfer, authKey)
