@@ -641,6 +641,50 @@ kills left torn tails, half-written snapshots, interrupted rolls, leftover
 manifests and segments an interrupted drop had not yet removed, all
 reported as repairable.
 
+### Richer transfers across a kill
+
+`TestRicherTransfersSurviveKillNine` (`cmd/ledgerd/richer_e2e_test.go`)
+runs this week's three motivating cases through the real binary, first one
+step at a time with every balance checked after each step, then under load
+across crashes:
+
+- **A split payout.** One batch captures a 100.00 order into a
+  non-negative escrow account, pays 60.00 and 25.00 to two sellers and 5.00
+  of VAT, and sweeps what is left to the platform with a `balance_debit`
+  transfer asking for 10,000.00; the sweep moves exactly 10.00 and the five
+  entries are consecutive. A second batch promises 55.00 out of a 50.00
+  capture and is refused with `limit_exceeded` at item 2; the capture and
+  the first payment are not applied.
+- **A hotel hold that grows.** A 500.00 card holds 200.00 at check-in, the
+  minibar adds 60.00 with an increase, a 300.00 upgrade is refused because
+  the card has only 240.00 left, a late checkout extends the hold by two
+  days, and checkout posts 245.00 of the 260.00 held. The transfer's
+  entries are `pending`, `increase_pending`, `extend_pending`,
+  `post_pending`, and the card ends at 255.00.
+- **A USD to EUR conversion.** 100.00 USD at 0.9234 with a 1.00 USD fee is
+  one transfer with five postings and one entry, its rate and quote time
+  (in UTC) recorded. The same conversion two cents short of the rate is
+  refused with the exact conversion in the message, and nothing moves.
+
+Then 6 clients run payouts, stays (hold, increase, extend, post) and
+conversions on accounts of their own, two of them converting only, and the
+server is killed with `SIGKILL` twice once it has acknowledged 600 more
+requests and written a new snapshot, so every kill lands with conversions
+and usually a batch unanswered. Each time the directory is copied,
+`ledgerd verify` must exit 0 or 2 on the copy and the next server runs on
+it. On that server every acknowledged request, walk-through and load alike,
+must replay its original answer byte for byte; the request each client had
+unanswered is resent and may be a replay or run now. Then every account's
+four totals must equal the acknowledged requests, debits must equal credits
+in USD and in EUR, the invariant checker must be clean, and listing every
+transfer through `fx_usd` must find exactly the acknowledged conversions,
+each posted with one entry, both currencies balanced and the rate. A batch
+or conversion written in part would leave a balance, a currency sum or that
+listing wrong. Across runs, unanswered batches, conversions, holds,
+increases, extensions and posts were each found both written and not
+written. After a clean stop the copy verifies as sound and restarts to the
+same balances. The test takes about 1.3 s, or 8 s under `-race`.
+
 ## Retrying with an idempotency key
 
 The semantics are Stripe's
