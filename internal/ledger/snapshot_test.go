@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -721,9 +722,24 @@ func TestSegmentsAreDroppedBehindSnapshots(t *testing.T) {
 	if lg.FirstIndex() == 1 || len(segs) != lg.Segments() || len(files) != len(segs) {
 		t.Fatalf("first record %d, %d segments, %d listed, %d files", lg.FirstIndex(), lg.Segments(), len(segs), len(files))
 	}
-	// Two snapshots 20 records apart, plus the segments they fall in.
-	if lg.Segments() > 8 || e.l.mSegDropped.Value() == 0 {
-		t.Fatalf("%d segments kept, %d dropped", lg.Segments(), e.l.mSegDropped.Value())
+	// Exactly the segments from the one holding the oldest kept snapshot's
+	// record are kept. The two snapshots are usually 20 records apart, but
+	// one is only marked once the previous one is on disk, so on a busy
+	// machine they can be further apart and keep more segments.
+	kept := snapshotFiles(t, e.dir)
+	e.l.snapMu.Lock()
+	index, ok := e.l.snapIndex[kept[len(kept)-1]]
+	e.l.snapMu.Unlock()
+	first := func(i int) uint64 {
+		n, err := strconv.ParseUint(strings.TrimSuffix(filepath.Base(segs[i]), ".seg"), 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if !ok || e.l.mSegDropped.Value() == 0 || first(0) > index || (len(segs) > 1 && first(1) <= index) {
+		t.Fatalf("oldest kept snapshot %v at record %d (known %v), %d segments kept from record %d, %d dropped",
+			kept, index, ok, len(segs), first(0), e.l.mSegDropped.Value())
 	}
 	want := digest(e.l)
 	e.restart()
