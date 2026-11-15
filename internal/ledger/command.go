@@ -197,6 +197,11 @@ type Command struct {
 	CloseAccount    *StatusSpec   `json:"close_account,omitempty"`
 	SetLimit        *LimitSpec    `json:"set_limit,omitempty"`
 	CreateBatch     *BatchSpec    `json:"create_batch,omitempty"`
+
+	CreateWebhook   *WebhookSpec         `json:"create_webhook,omitempty"`
+	DeleteWebhook   *WebhookRef          `json:"delete_webhook,omitempty"`
+	WebhookProgress *WebhookProgressSpec `json:"webhook_progress,omitempty"`
+	ReplayWebhook   *WebhookReplaySpec   `json:"replay_webhook,omitempty"`
 }
 
 // Idem identifies a request for idempotency. Scope separates callers (the API
@@ -285,7 +290,8 @@ func validateCurrency(code string) *Error {
 func (c *Command) Validate() *Error {
 	n := 0
 	for _, set := range []bool{c.CreateAccount != nil, c.CreateTransfer != nil, c.Post != nil, c.Void != nil, c.Reverse != nil,
-		c.IncreasePending != nil, c.ExtendPending != nil, c.FreezeAccount != nil, c.UnfreezeAccount != nil, c.CloseAccount != nil, c.SetLimit != nil, c.CreateBatch != nil} {
+		c.IncreasePending != nil, c.ExtendPending != nil, c.FreezeAccount != nil, c.UnfreezeAccount != nil, c.CloseAccount != nil, c.SetLimit != nil, c.CreateBatch != nil,
+		c.CreateWebhook != nil, c.DeleteWebhook != nil, c.WebhookProgress != nil, c.ReplayWebhook != nil} {
 		if set {
 			n++
 		}
@@ -322,6 +328,14 @@ func (c *Command) Validate() *Error {
 		return c.SetLimit.validate()
 	case c.CreateBatch != nil:
 		return c.validateBatch()
+	case c.CreateWebhook != nil:
+		return c.CreateWebhook.validate()
+	case c.DeleteWebhook != nil:
+		return c.DeleteWebhook.validate()
+	case c.WebhookProgress != nil:
+		return c.WebhookProgress.validate()
+	case c.ReplayWebhook != nil:
+		return c.ReplayWebhook.validate()
 	default:
 		r := c.Reverse
 		if !ValidID(r.TransferID) {

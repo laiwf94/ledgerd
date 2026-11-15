@@ -579,12 +579,13 @@ order. Items, in file order:
 
 | Tag | Item | Fields |
 |---|---|---|
-| `H` | header, first | `u` format version (7), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys |
+| `H` | header, first | `u` format version (8), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys; from format 8 `u` count of webhook endpoints and `u` newest webhook version |
 | `A` | account, by ID | `str` ID, `str` currency, `i` exponent, `str` normal balance, `bool` non-negative, `bool` non-positive, from format 7 `bool` exchange, `meta`, `time` created; `i` debits posted, credits posted, debits pending, credits pending; `u` version; `u` count then per status change `u` journal head, `time`, `str` status, `str` reason; `u` count then per limit change `u` journal head, `time`, `str` kind, `i` amount (-1 for none), `str` reason |
 | `T` | transfer, by ID | `str` ID, state, currency; `u` posting count then per posting `str` account, `str` direction, `i` amount, posted, reversed, and from format 7 `str` currency (empty for the transfer's own); `str` reference, `meta`, `time` created, `time` expires, `str` reverses; `u` count then `str` reversal IDs; `u` count then per entry `u` sequence, `str` kind; from format 5 a balancing byte (0 none, else bit 0 `balance_debit`, bit 1 `balance_credit`) followed, when not 0, by `i` requested amount and `i` amount; from format 7 a rate: `bool` set, then if set `str` base, quote, rate and source and `time` quoted, present exactly when a posting names another currency |
 | `E` | journal entry, by sequence from 1 | `u` sequence, `time`, `str` kind, transfer ID, currency; `u` line count then per line `str` account, `str` direction, `i` posted, `i` pending, and from format 7 `str` currency (empty for the entry's own); from format 6 `time` expires, set only on an `extend_pending` entry, which alone has no lines; from format 7 a rate as in `T`, only on the entry that creates a multi-currency transfer and equal to that transfer's |
-| `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result, 8 batch result, 16 error names a batch item); then if flagged: `str` code and message, and `u` item index if flag 16; an account as in `A` with `u` version, the four totals, `u` as-of sequence, then `str` status, `str` status reason and `time` changed, then `i` overdraft and credit limits (-1 for none) and `u` effective sequence; a transfer as in `T`; `i` count of reservations expired; finally `u` number of batch transfers if flag 8 |
+| `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result, 8 batch result, 16 error names a batch item, 32 webhook result); then if flagged: `str` code and message, and `u` item index if flag 16; an account as in `A` with `u` version, the four totals, `u` as-of sequence, then `str` status, `str` status reason and `time` changed, then `i` overdraft and credit limits (-1 for none) and `u` effective sequence; a transfer as in `T`; `i` count of reservations expired; `u` number of batch transfers if flag 8; finally an endpoint as in `W` if flag 32 |
 | `B` | one transfer of a batch result, right after its `I` item, in batch order | a transfer as in `T` |
+| `W` | webhook endpoint, by ID, from format 8 | `str` ID, URL, secret, account filter; `u` count then `str` kinds; `str` currency filter; `u` max batch, `time` created, `u` version, `u` position, `u` next dead letter ID; `u` count then per dead letter `u` ID, after sequence, through sequence, entries, attempts, `str` error, `time` failed, `bool` replaying |
 | `Z` | footer, alone in the last frame | `u` number of frames before it |
 
 Each format carries a version: the log's `header` record, the manifest's
@@ -593,12 +594,13 @@ not know, so a changed layout must come with a new version number. Snapshot
 format 2 added account status, format 3 limit changes, format 4 batch
 results, format 5 balancing records, format 6 hold increases and
 extensions (`increase_pending` and `extend_pending` entries, and the
-timeout an extension sets) and format 7 multi-currency transfers (the
-exchange flag, posting and line currencies, and rates); format 1 and 2
+timeout an extension sets), format 7 multi-currency transfers (the
+exchange flag, posting and line currencies, and rates) and format 8 webhook
+endpoints; format 1 and 2
 files, which lack those fields, still load with every account open and at
-the limits its flags give, and format 3 to 6 files, written before
-batches, balancing transfers, hold changes or multi-currency transfers
-existed, load as they are; a file older than 6 holding either new entry
+the limits its flags give, and format 3 to 7 files, written before
+batches, balancing transfers, hold changes, multi-currency transfers or
+webhooks existed, load as they are; a file older than 6 holding either new entry
 kind is refused. A batch result is spread
 over `B` items because thousands of transfers can be more than one frame
 holds. New command kinds in `cmd` records keep
@@ -1246,6 +1248,132 @@ included, and a transfer's round trip from its request to its event
 arriving on a stream waiting at the head, fsync included, takes about
 0.4 ms.
 
+### Signed webhooks
+
+A webhook endpoint is a URL that ledgerd POSTs journal entries to, in
+sequence order, until the receiver answers 2xx. It is registered with
+`POST /v1/webhooks` under an ID the client picks, with the feed's filters
+(`account`, `kinds`, `currency`), a `max_batch` of 1 to 1,000 entries per
+delivery (default 100) and an optional `after_seq`: by default delivery
+starts at the journal head, so only new entries are sent; 0 sends the whole
+journal. At most 4,096 endpoints exist at once.
+
+**State in the log.** An endpoint, how far delivery to it has got and its
+dead letters are ledger state, changed only by logged commands, exactly as
+balances are:
+
+| Command | Issued by | Effect |
+|---|---|---|
+| `create_webhook` | `POST /v1/webhooks` | registers the endpoint at its starting position |
+| `delete_webhook` | `DELETE /v1/webhooks/{id}` | removes it; delivery stops |
+| `webhook_progress` | the dispatcher, after a delivery | moves the position, records or clears a dead letter |
+| `replay_webhook` | `POST /v1/webhooks/{id}/replay` | moves the position back, or marks dead letters for redelivery |
+
+So the delivery position is fsynced in the same group commits as the
+transfers, survives `SIGKILL` and power loss like any acknowledged command,
+is carried by snapshots (format 8), dropped segments and all, and is
+compared by `ledgerd verify` when it checks a snapshot against the log.
+Webhook commands write no journal entries, so they change no balance,
+version or feed position and wake no entry stream. They take idempotency
+keys like every other write.
+
+The position is the last journal sequence the endpoint has dealt with:
+delivered, dead-lettered, or examined and not matched by its filter. Every
+change gives the endpoint a new version from one counter for the whole
+ledger, so a version is never reused, even by an endpoint deleted and
+created again under the same ID. A `webhook_progress` names the version it
+was computed from and is refused with `failed_precondition` once anything
+else changed the endpoint. A delivery that was in flight when an operator
+replayed or deleted the endpoint therefore can never move the position
+forward over the replay: the worker reads the endpoint again and carries on
+from where the replay put it.
+
+**Delivery.** The dispatcher (`internal/webhook`) runs one goroutine per
+endpoint. Each reads the feed from the endpoint's position with its filter,
+up to `max_batch` entries, without the state lock (see
+[following the journal](#following-the-journal)), and POSTs them as one
+delivery:
+
+```text
+POST <url>
+Content-Type: application/json
+Ledgerd-Webhook-Id: orders.1041.1043
+Ledgerd-Signature: t=1763190000,v1=5f2c...e9
+
+{"id":"orders.1041.1043","endpoint":"orders","entries":[{"seq":1041,...},{"seq":1042,...},{"seq":1043,...}]}
+```
+
+The signature is HMAC-SHA256, keyed with the endpoint's secret, over the
+Unix timestamp, a full stop and the raw body, as Stripe signs its
+webhooks. A receiver recomputes it in constant time and rejects a timestamp
+more than five minutes from its clock, so a captured delivery cannot be
+replayed later (`webhook.Verify` does both, and accepts several `v1` values
+so a receiver keeps working while a secret is rotated). The secret is 24 to
+256 printable characters; one is generated (`whsec_` and 32 random bytes)
+when the client gives none. It is returned on creation and when the
+endpoint is read by ID, never in listings or logs. It is stored in the log
+and snapshots as given; encrypting data at rest is later work in the plan.
+The delivery ID is the endpoint and the first and last sequence, so every
+attempt at the same entries carries the same ID.
+
+Only after a 2xx does the worker log `webhook_progress` with the new
+position. A crash, a lost response, a storage error or a refused progress
+command means the same entries are sent again; nothing is ever skipped.
+Delivery is therefore at least once and, per endpoint, in sequence order;
+a receiver that must not apply an entry twice keeps the highest sequence it
+has applied and ignores entries at or below it (a replay, flagged `"replay":
+true`, is the one deliberate exception). A filtered endpoint whose filter
+matches nothing still has its position logged once its scan runs 4,096
+entries ahead, so a restart does not rescan a long unmatched stretch.
+
+**Retries and dead letters.** Any answer but 2xx, a redirect, a connection
+error or an attempt over `LEDGERD_WEBHOOK_TIMEOUT` (10 s) is a failure. The
+next attempt waits `LEDGERD_WEBHOOK_BACKOFF` (1 s) doubled for each failure
+so far, capped at `LEDGERD_WEBHOOK_BACKOFF_MAX` (1 h), with the lower half
+jittered so endpoints that failed together do not retry together. After
+`LEDGERD_WEBHOOK_MAX_ATTEMPTS` (20, about nine hours) the delivery becomes a
+dead letter: its range of sequences, entry count, attempts, last error and
+time, logged in the same `webhook_progress` that moves the position past
+it, and the worker carries on with the next entries. Attempts are counted
+in memory, so a restart gives a failing delivery a fresh set. An endpoint
+holds at most 1,000 dead letters; with that many, the next failed delivery
+is not dead-lettered but retried at the longest delay, so nothing is
+dropped while an operator looks.
+
+**Replay.** `POST /v1/webhooks/{id}/replay` takes one of `after_seq`
+(move the position back, never forward, so everything after it is
+delivered again), `dead_letters` (a list of IDs) or `all_dead_letters`. A
+marked dead letter is redelivered, with the endpoint's filter over its
+range, which the append-only journal still holds unchanged, before the
+worker carries on from its position. Accepted, it is removed; refused
+every attempt, it stays with its attempts added and is no longer marked.
+
+**Cost.** The writer does nothing per endpoint: workers read the journal
+themselves and wait on `EntriesGrown` at the head and on a second wake-up,
+`WebhooksChanged`, that the writer closes after a commit that changes an
+endpoint, at no cost while nobody waits. An idle endpoint is a goroutine
+and its endpoint record. A delivery costs one HTTP request and one small
+log record, which shares its fsync with whatever else is committing.
+
+`internal/webhook` tests every behaviour against real HTTP receivers that
+verify each signature: 100 transfers from 4 concurrent writers arrive
+exactly once and in order, at an endpoint delivering from the start and
+one from the head; a filtered endpoint skips 4,596 unmatched entries and
+logs its position past them; a 500, a 302 and a 429 are retried with
+growing delays under the same delivery ID; a timed-out attempt and an
+unreachable endpoint fail and dead-letter with their errors; a dead letter
+survives a restart, a failed replay adds its attempts and a successful one
+removes it; a replay made while a delivery is blocked in the receiver wins
+over that delivery's progress; positions survive restarts and snapshots
+while the receiver is down and no entry is delivered twice; when the
+receiver accepted but the disk failed before the position was logged, the
+entries are sent again after the restart; 1,003 failing deliveries fill
+the dead-letter list and the rest are held, not dropped, until the receiver
+recovers. In `internal/ledger` the snapshot round trip, every-byte cut and
+bit-flip tests include endpoints with filters, dead letters in each state
+and keyed results, and `ledgerd verify` reports a snapshot whose endpoints
+differ from the log.
+
 ## Matching a bank statement
 
 `POST /v1/accounts/{id}/reconcile` takes a CSV statement
@@ -1305,7 +1433,10 @@ a reversal. Dates are UTC.
 8. every account's status history follows the rules (open to frozen and
    back, open or frozen to closed, never out of closed, in journal order),
    no entry touched an account while it was closed or, other than a void or
-   expiry, while it was frozen, and a closed account holds nothing.
+   expiry, while it was frozen, and a closed account holds nothing;
+9. every webhook endpoint's position and dead letters lie within the
+   journal, its version within the versions handed out, and its dead letter
+   IDs increase (see [signed webhooks](#signed-webhooks)).
 
 The checker is linear in the journal size, but commits do not wait for it.
 It checks a frozen, copy-on-write view of the committed state as of the

@@ -386,6 +386,9 @@ type Outcome struct {
 	Transfer *Transfer
 	// Transfers are a batch's transfers, in the order it gave them.
 	Transfers []*Transfer
+	// Webhook is the endpoint a webhook command created or changed, or the
+	// one it deleted.
+	Webhook *Webhook
 	// Replayed is true when the result was returned from the idempotency
 	// store instead of executing the command again.
 	Replayed bool

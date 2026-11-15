@@ -99,6 +99,9 @@ type Ledger struct {
 	// one waits, so a commit with no waiting stream allocates nothing.
 	growMu sync.Mutex
 	grown  chan struct{}
+	// hookCh is closed when a commit changes a webhook endpoint, the same way.
+	hookMu sync.Mutex
+	hookCh chan struct{}
 
 	queue   chan *request
 	quit    chan struct{}
@@ -786,11 +789,15 @@ func (l *Ledger) process(batch []*request) {
 		l.mRecords.Add(uint64(len(recs)))
 		l.sinceSnap += len(recs)
 	}
+	hooks := t.hooks != nil
 	l.mu.Lock()
 	t.commit()
 	l.mu.Unlock()
 	if len(t.entries) > 0 {
 		l.wakeEntryWaiters()
+	}
+	if hooks {
+		l.wakeWebhookWaiters()
 	}
 	l.mCommitted.Add(uint64(committed))
 	l.mRejected.Add(uint64(rejected))

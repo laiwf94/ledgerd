@@ -14,6 +14,10 @@
 //	LEDGERD_MAX_BATCH        most commands sharing one fsync (default 1024; 1 disables group commit)
 //	LEDGERD_SNAPSHOT_EVERY   log records between snapshots (default 100000; 0 disables snapshots)
 //	LEDGERD_SEGMENT_BYTES    size at which a log segment is sealed (default 67108864; 4096 to 4294967296)
+//	LEDGERD_WEBHOOK_TIMEOUT       time one webhook delivery attempt may take (default 10s, 1s to 5m)
+//	LEDGERD_WEBHOOK_BACKOFF       delay after a delivery's first failed attempt, doubling after each (default 1s)
+//	LEDGERD_WEBHOOK_BACKOFF_MAX   longest delay between attempts (default 1h)
+//	LEDGERD_WEBHOOK_MAX_ATTEMPTS  attempts before a delivery becomes a dead letter (default 20, 1 to 1000)
 //	LEDGERD_LOG_LEVEL        debug, info, warn or error (default info)
 package main
 
@@ -35,6 +39,7 @@ import (
 	"github.com/laiwf94/ledgerd/internal/api"
 	"github.com/laiwf94/ledgerd/internal/ledger"
 	"github.com/laiwf94/ledgerd/internal/metrics"
+	"github.com/laiwf94/ledgerd/internal/webhook"
 )
 
 func main() {
@@ -60,13 +65,18 @@ type config struct {
 	snapEvery  int
 	segBytes   int64
 	logLevel   slog.Level
+
+	hookTimeout, hookBackoff, hookBackoffMax time.Duration
+	hookAttempts                             int
 }
 
 const maxIdempotencyTTL = 30 * 24 * time.Hour
 
 func loadConfig(getenv func(string) string) (config, error) {
 	c := config{addr: ":8080", idemTTL: ledger.DefaultIdempotencyTTL, maxBatch: ledger.DefaultMaxBatch,
-		snapEvery: ledger.DefaultSnapshotEvery, segBytes: ledger.DefaultSegmentBytes}
+		snapEvery: ledger.DefaultSnapshotEvery, segBytes: ledger.DefaultSegmentBytes,
+		hookTimeout: webhook.DefaultTimeout, hookBackoff: webhook.DefaultBackoffBase, hookBackoffMax: webhook.DefaultBackoffMax,
+		hookAttempts: webhook.DefaultMaxAttempts}
 	if v := getenv("LEDGERD_ADDR"); v != "" {
 		c.addr = v
 	}
@@ -115,6 +125,33 @@ func loadConfig(getenv func(string) string) (config, error) {
 		}
 		c.segBytes = n
 	}
+	for _, d := range []struct {
+		name     string
+		dst      *time.Duration
+		min, max time.Duration
+	}{
+		{"LEDGERD_WEBHOOK_TIMEOUT", &c.hookTimeout, time.Second, 5 * time.Minute},
+		{"LEDGERD_WEBHOOK_BACKOFF", &c.hookBackoff, time.Millisecond, time.Hour},
+		{"LEDGERD_WEBHOOK_BACKOFF_MAX", &c.hookBackoffMax, time.Millisecond, 24 * time.Hour},
+	} {
+		if v := getenv(d.name); v != "" {
+			n, err := time.ParseDuration(v)
+			if err != nil || n < d.min || n > d.max {
+				return c, fmt.Errorf("%s must be a duration between %s and %s", d.name, d.min, d.max)
+			}
+			*d.dst = n
+		}
+	}
+	if c.hookBackoffMax < c.hookBackoff {
+		return c, errors.New("LEDGERD_WEBHOOK_BACKOFF_MAX must not be shorter than LEDGERD_WEBHOOK_BACKOFF")
+	}
+	if v := getenv("LEDGERD_WEBHOOK_MAX_ATTEMPTS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 1000 {
+			return c, errors.New("LEDGERD_WEBHOOK_MAX_ATTEMPTS must be between 1 and 1000")
+		}
+		c.hookAttempts = n
+	}
 	if v := getenv("LEDGERD_LOG_LEVEL"); v != "" {
 		if err := c.logLevel.UnmarshalText([]byte(v)); err != nil {
 			return c, fmt.Errorf("LEDGERD_LOG_LEVEL: %v", err)
@@ -156,6 +193,13 @@ func run(ctx context.Context, getenv func(string) string, logOut io.Writer, read
 	stats := l.Stats()
 	log.Info("recovered", "head", stats.Head, "accounts", stats.Accounts, "transfers", stats.Transfers,
 		"open_pending", stats.OpenPending, "log_bytes", stats.LogBytes, "log_segments", stats.LogSegments, "duration_ms", time.Since(start).Milliseconds())
+
+	hooks, err := webhook.Start(webhook.Options{Ledger: l, Timeout: cfg.hookTimeout, BackoffBase: cfg.hookBackoff,
+		BackoffMax: cfg.hookBackoffMax, MaxAttempts: cfg.hookAttempts, Logger: log, Metrics: reg})
+	if err != nil {
+		return err
+	}
+	defer hooks.Close() // before the ledger closes: a delivery in flight is sent again on the next start
 
 	srv, err := api.New(api.Config{Ledger: l, APIKeys: cfg.apiKeys, AdminToken: cfg.adminToken, CursorSecret: cfg.cursorKey,
 		Logger: log, Metrics: reg})

@@ -35,6 +35,8 @@ type state struct {
 	open      int      // pending transfers
 	order     []string // account IDs in the order they were added; append-only
 	ix        *indexes // secondary indexes; see index.go
+	hooks     map[string]*Webhook
+	hookGen   uint64 // the newest webhook version handed out; see webhook.go
 
 	// view is set while the invariant checker scans a frozen copy of the
 	// state. commit saves into it whatever it is about to overwrite.
@@ -42,7 +44,7 @@ type state struct {
 }
 
 func newState() *state {
-	return &state{accounts: map[string]*account{}, transfers: map[string]*Transfer{}, ix: newIndexes()}
+	return &state{accounts: map[string]*account{}, transfers: map[string]*Transfer{}, ix: newIndexes(), hooks: map[string]*Webhook{}}
 }
 
 func (s *state) head() uint64 { return uint64(len(s.entries)) }
@@ -96,7 +98,9 @@ type txn struct {
 	rows      []pendingRow
 	expiries  []expiry
 	open      int
-	sp        *savepoint // set while a batch runs; see begin
+	sp        *savepoint          // set while a batch runs; see begin
+	hooks     map[string]*Webhook // changed webhook endpoints, nil for deleted ones
+	hookGen   uint64              // webhook versions handed out by this txn
 }
 
 // savepoint is what a txn looked like when a batch began, so a failed batch
@@ -246,6 +250,7 @@ func (t *txn) commit() {
 		heap.Push(&t.st.expiries, e)
 	}
 	t.st.open += t.open
+	t.commitHooks()
 }
 
 // exec executes one command. id is the ID for a transfer the command creates
@@ -309,6 +314,14 @@ func (t *txn) apply(c *Command, id string) (Outcome, *Error) {
 		return t.changeStatus(c.CloseAccount, StatusClosed)
 	case c.SetLimit != nil:
 		return t.setLimit(c.SetLimit)
+	case c.CreateWebhook != nil:
+		return t.createWebhook(c.CreateWebhook)
+	case c.DeleteWebhook != nil:
+		return t.deleteWebhook(c.DeleteWebhook)
+	case c.WebhookProgress != nil:
+		return t.webhookProgress(c.WebhookProgress)
+	case c.ReplayWebhook != nil:
+		return t.replayWebhook(c.ReplayWebhook)
 	}
 	return Outcome{}, errf(CodeInvalid, "empty command")
 }

@@ -352,6 +352,15 @@ func stateDiff(l *Ledger, s *snapshot, st *state) string {
 		return fmt.Sprintf("the snapshot has %d open pending transfers, the log %d", st.open, l.st.open)
 	case !reflect.DeepEqual(liveExpiries(l.st), liveExpiries(st)):
 		return "the pending transfer timeouts differ"
+	case l.st.hookGen != st.hookGen:
+		return fmt.Sprintf("the log has handed out webhook versions up to %d, the snapshot %d", l.st.hookGen, st.hookGen)
+	case !reflect.DeepEqual(l.st.hooks, st.hooks):
+		for id, h := range l.st.hooks {
+			if g, ok := st.hooks[id]; !ok || !reflect.DeepEqual(h, g) {
+				return fmt.Sprintf("webhook %s differs", id)
+			}
+		}
+		return fmt.Sprintf("the snapshot holds %d webhook endpoints, the log %d", len(st.hooks), len(l.st.hooks))
 	}
 	if d := indexDiff(l.st.ix, st.ix); d != "" {
 		return "secondary indexes differ: " + d

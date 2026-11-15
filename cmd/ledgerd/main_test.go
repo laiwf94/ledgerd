@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/laiwf94/ledgerd/internal/ledger"
+	"github.com/laiwf94/ledgerd/internal/webhook"
 )
 
 func env(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
@@ -24,32 +25,42 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.addr != ":8080" || len(c.apiKeys) != 2 || c.idemTTL != ledger.DefaultIdempotencyTTL || c.maxBatch != ledger.DefaultMaxBatch || c.adminToken != "" ||
-		c.snapEvery != ledger.DefaultSnapshotEvery || c.segBytes != ledger.DefaultSegmentBytes {
+		c.snapEvery != ledger.DefaultSnapshotEvery || c.segBytes != ledger.DefaultSegmentBytes ||
+		c.hookTimeout != webhook.DefaultTimeout || c.hookBackoff != webhook.DefaultBackoffBase || c.hookBackoffMax != webhook.DefaultBackoffMax ||
+		c.hookAttempts != webhook.DefaultMaxAttempts {
 		t.Fatalf("defaults wrong: %+v", c)
 	}
 	c, err = loadConfig(env(map[string]string{"LEDGERD_API_KEYS": "k", "LEDGERD_ADDR": ":9", "LEDGERD_DATA_DIR": "/d",
 		"LEDGERD_ADMIN_TOKEN": "t", "LEDGERD_IDEMPOTENCY_TTL": "1h", "LEDGERD_MAX_BATCH": "1", "LEDGERD_LOG_LEVEL": "debug",
-		"LEDGERD_SNAPSHOT_EVERY": "500", "LEDGERD_SEGMENT_BYTES": "1048576", "LEDGERD_CURSOR_SECRET": "cursor-secret-0123"}))
+		"LEDGERD_SNAPSHOT_EVERY": "500", "LEDGERD_SEGMENT_BYTES": "1048576", "LEDGERD_CURSOR_SECRET": "cursor-secret-0123",
+		"LEDGERD_WEBHOOK_TIMEOUT": "3s", "LEDGERD_WEBHOOK_BACKOFF": "250ms", "LEDGERD_WEBHOOK_BACKOFF_MAX": "10m", "LEDGERD_WEBHOOK_MAX_ATTEMPTS": "7"}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.addr != ":9" || c.dataDir != "/d" || c.adminToken != "t" || c.idemTTL != time.Hour || c.maxBatch != 1 || c.logLevel.String() != "DEBUG" ||
-		c.snapEvery != 500 || c.segBytes != 1<<20 || c.cursorKey != "cursor-secret-0123" {
+		c.snapEvery != 500 || c.segBytes != 1<<20 || c.cursorKey != "cursor-secret-0123" ||
+		c.hookTimeout != 3*time.Second || c.hookBackoff != 250*time.Millisecond || c.hookBackoffMax != 10*time.Minute || c.hookAttempts != 7 {
 		t.Fatalf("overrides wrong: %+v", c)
 	}
 }
 
 func TestLoadConfigErrors(t *testing.T) {
 	cases := map[string]map[string]string{
-		"LEDGERD_API_KEYS is required":     {},
-		"LEDGERD_IDEMPOTENCY_TTL must be":  {"LEDGERD_API_KEYS": "k", "LEDGERD_IDEMPOTENCY_TTL": "5s"},
-		"LEDGERD_IDEMPOTENCY_TTL must be ": {"LEDGERD_API_KEYS": "k", "LEDGERD_IDEMPOTENCY_TTL": "soon"},
-		"LEDGERD_MAX_BATCH must be":        {"LEDGERD_API_KEYS": "k", "LEDGERD_MAX_BATCH": "0"},
-		"LEDGERD_LOG_LEVEL":                {"LEDGERD_API_KEYS": "k", "LEDGERD_LOG_LEVEL": "loud"},
-		"LEDGERD_SNAPSHOT_EVERY must be":   {"LEDGERD_API_KEYS": "k", "LEDGERD_SNAPSHOT_EVERY": "-1"},
-		"LEDGERD_SEGMENT_BYTES must be":    {"LEDGERD_API_KEYS": "k", "LEDGERD_SEGMENT_BYTES": "4095"},
-		"LEDGERD_SEGMENT_BYTES must be ":   {"LEDGERD_API_KEYS": "k", "LEDGERD_SEGMENT_BYTES": "big"},
-		"LEDGERD_CURSOR_SECRET must be":    {"LEDGERD_API_KEYS": "k", "LEDGERD_CURSOR_SECRET": "short"},
+		"LEDGERD_API_KEYS is required":          {},
+		"LEDGERD_IDEMPOTENCY_TTL must be":       {"LEDGERD_API_KEYS": "k", "LEDGERD_IDEMPOTENCY_TTL": "5s"},
+		"LEDGERD_IDEMPOTENCY_TTL must be ":      {"LEDGERD_API_KEYS": "k", "LEDGERD_IDEMPOTENCY_TTL": "soon"},
+		"LEDGERD_MAX_BATCH must be":             {"LEDGERD_API_KEYS": "k", "LEDGERD_MAX_BATCH": "0"},
+		"LEDGERD_LOG_LEVEL":                     {"LEDGERD_API_KEYS": "k", "LEDGERD_LOG_LEVEL": "loud"},
+		"LEDGERD_SNAPSHOT_EVERY must be":        {"LEDGERD_API_KEYS": "k", "LEDGERD_SNAPSHOT_EVERY": "-1"},
+		"LEDGERD_SEGMENT_BYTES must be":         {"LEDGERD_API_KEYS": "k", "LEDGERD_SEGMENT_BYTES": "4095"},
+		"LEDGERD_SEGMENT_BYTES must be ":        {"LEDGERD_API_KEYS": "k", "LEDGERD_SEGMENT_BYTES": "big"},
+		"LEDGERD_CURSOR_SECRET must be":         {"LEDGERD_API_KEYS": "k", "LEDGERD_CURSOR_SECRET": "short"},
+		"LEDGERD_WEBHOOK_TIMEOUT must be":       {"LEDGERD_API_KEYS": "k", "LEDGERD_WEBHOOK_TIMEOUT": "10m"},
+		"LEDGERD_WEBHOOK_BACKOFF must be":       {"LEDGERD_API_KEYS": "k", "LEDGERD_WEBHOOK_BACKOFF": "later"},
+		"LEDGERD_WEBHOOK_BACKOFF_MAX must be":   {"LEDGERD_API_KEYS": "k", "LEDGERD_WEBHOOK_BACKOFF_MAX": "0s"},
+		"LEDGERD_WEBHOOK_BACKOFF_MAX must not":  {"LEDGERD_API_KEYS": "k", "LEDGERD_WEBHOOK_BACKOFF": "1m", "LEDGERD_WEBHOOK_BACKOFF_MAX": "1s"},
+		"LEDGERD_WEBHOOK_MAX_ATTEMPTS must be":  {"LEDGERD_API_KEYS": "k", "LEDGERD_WEBHOOK_MAX_ATTEMPTS": "0"},
+		"LEDGERD_WEBHOOK_MAX_ATTEMPTS must be ": {"LEDGERD_API_KEYS": "k", "LEDGERD_WEBHOOK_MAX_ATTEMPTS": "many"},
 	}
 	for want, e := range cases {
 		if _, err := loadConfig(env(e)); err == nil || !strings.Contains(err.Error(), strings.TrimSpace(want)) {

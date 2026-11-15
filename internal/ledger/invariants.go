@@ -47,6 +47,8 @@ type frozen struct {
 	transfers int
 	accounts  map[string]accountImage
 	replaced  map[string]*Transfer
+	hooks     map[string]*Webhook // the endpoints as of head; committed ones never change
+	hookGen   uint64
 }
 
 // accountImage is what commit changes in place on an account.
@@ -111,7 +113,11 @@ func (l *Ledger) freeze() *frozen {
 	st := l.st
 	n, na := len(st.entries), len(st.order)
 	v := &frozen{st: st, head: uint64(n), entries: st.entries[:n:n], ids: st.order[:na:na], open: st.open,
-		transfers: len(st.transfers), accounts: map[string]accountImage{}, replaced: map[string]*Transfer{}}
+		transfers: len(st.transfers), accounts: map[string]accountImage{}, replaced: map[string]*Transfer{},
+		hooks: make(map[string]*Webhook, len(st.hooks)), hookGen: st.hookGen}
+	for id, h := range st.hooks {
+		v.hooks[id] = h
+	}
 	st.view = v
 	return v
 }
@@ -152,6 +158,9 @@ func (l *Ledger) step(name string) {
 //  8. every account's status history follows the life-cycle rules, no entry
 //     moved money through an account while it was frozen or closed, and a
 //     closed account has a zero balance.
+//  9. every webhook endpoint's position and dead letters lie within the
+//     journal, its version within the versions handed out, and its dead
+//     letter IDs increase.
 //
 // It checks a frozen view of the committed state (see frozen), so commits
 // continue while it runs: they wait for at most one chunk of auditChunk
@@ -510,6 +519,7 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 	if open != v.open {
 		bad("open pending count is %d but %d transfers are pending", v.open, open)
 	}
+	hookProblems(v.hooks, v.hookGen, v.head, bad)
 	for i := range accts {
 		a := &accts[i]
 		var r Balance

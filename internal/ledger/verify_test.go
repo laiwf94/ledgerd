@@ -29,10 +29,21 @@ func verifyFixture(t *testing.T, segBytes int64) (string, *fakeClock) {
 	// Whatever the random workload left, the fixture holds an open
 	// reservation, on accounts of its own so no freeze or close blocks it.
 	for _, c := range []Command{openAcct("fx_src", "USD", Debit), openAcct("fx_dst", "USD", Credit),
-		hold(3600, dr("fx_src", 5), cr("fx_dst", 5))} {
+		hold(3600, dr("fx_src", 5), cr("fx_dst", 5)), hookCmd("w", "https://example.test/w", nil)} {
 		if _, err := l.Do(context.Background(), c, nil); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// A webhook endpoint moved back by a replay, then past a dead letter.
+	ctx := context.Background()
+	h, _ := l.Webhook("w")
+	if _, err := l.Do(ctx, Command{ReplayWebhook: &WebhookReplaySpec{ID: "w", AfterSeq: ptr(h.Cursor - 2)}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	h, _ = l.Webhook("w")
+	if _, err := l.Do(ctx, Command{WebhookProgress: &WebhookProgressSpec{ID: "w", Version: h.Version, Through: h.Cursor + 2,
+		Dead: &DeadLetterSpec{AfterSeq: h.Cursor, ThroughSeq: h.Cursor + 1, Entries: 1, Attempts: 3, Error: "the endpoint answered 500"}}}, nil); err != nil {
+		t.Fatal(err)
 	}
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
@@ -385,6 +396,9 @@ func TestStateDiff(t *testing.T) {
 		"open pending":       func(l *Ledger) { l.st.open++ },
 		"timeouts differ":    func(l *Ledger) { l.st.expiries = nil },
 		"idempotency key":    func(l *Ledger) { clear(l.idem) },
+		"webhook w differs":  func(l *Ledger) { c := *l.st.hooks["w"]; c.Cursor++; l.st.hooks["w"] = &c },
+		"webhook endpoints":  func(l *Ledger) { delete(l.st.hooks, "w") },
+		"webhook versions":   func(l *Ledger) { l.st.hookGen++ },
 	}
 	l, s, st := load()
 	if d := stateDiff(l, s, st); d != "" {

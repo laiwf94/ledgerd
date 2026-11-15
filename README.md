@@ -172,6 +172,11 @@ JSON bodies and an optional `Idempotency-Key` header.
 | `GET /v1/transfers/{id}` | A transfer with its postings, state, links and entries. |
 | `GET /v1/entries` | The journal feed: entries in sequence order with their lines; `?after_seq=&account=&kind=posted,pending&currency=&limit=`. Every page has `next_after_seq` (pass it back as `after_seq` to resume exactly where you stopped), `has_more` and `head_seq`. Reads never hold up writes. |
 | `GET /v1/entries/stream` | The journal feed live, as Server-Sent Events: one `entry` event per entry with its sequence as the event id, the same filters and `after_seq`; resumes after `Last-Event-ID` on reconnect, sends `heartbeat` events carrying its position while idle, and disconnects consumers that stop reading. |
+| `POST /v1/webhooks` | Register a webhook endpoint: `{"id","url"}`, optional `secret` (generated and returned when left out), the feed's `account`, `kinds` and `currency` filters, `max_batch` (1 to 1,000, default 100) and `after_seq` (default: the journal head, so only new entries). |
+| `GET /v1/webhooks` | Every endpoint with its `delivered_through_seq` and `dead_letter_count`, without secrets. |
+| `GET /v1/webhooks/{id}` | One endpoint with its secret, position and dead letters. |
+| `DELETE /v1/webhooks/{id}` | Remove an endpoint; delivery to it stops. |
+| `POST /v1/webhooks/{id}/replay` | Deliver again: `{"after_seq":N}` moves the position back, `{"dead_letters":[1,2]}` or `{"all_dead_letters":true}` redelivers dead letters. |
 | `POST /v1/transfers/{id}/post` | Post a pending transfer: all, `{"amount":n}`, or per-posting amounts. |
 | `POST /v1/transfers/{id}/void` | Release a pending transfer. |
 | `POST /v1/transfers/{id}/increase` | Reserve more on a pending transfer: `{"amount":n}` for two postings, or balanced per-posting `postings`. Checked against limits; balancing holds can't grow. |
@@ -219,6 +224,23 @@ id: 12
 data: {"head_seq":12}
 ```
 
+Or register a webhook endpoint and receive entries as signed POSTs. Each
+delivery carries up to `max_batch` entries in sequence order and a
+`Ledgerd-Signature: t=<unix>,v1=<hex>` header, an HMAC-SHA256 of the
+timestamp, a full stop and the body under the endpoint's secret; check it
+in constant time and refuse old timestamps (`webhook.Verify` in
+`internal/webhook` does both). Delivery is at least once and in order per
+endpoint: the position moves only after a 2xx, failures are retried with
+exponential backoff for about nine hours, and then kept as dead letters you
+can replay:
+
+```console
+$ curl -s localhost:8080/v1/webhooks -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"id":"payouts","url":"https://example.com/ledger-hook","account":"shop","kinds":["posted"]}'
+{"id":"payouts","url":"https://example.com/ledger-hook","secret":"whsec_...","account":"shop","kinds":["posted"],
+ "max_batch":100,"version":1,"delivered_through_seq":12,"dead_letters":[],"head_seq":12, ...}
+```
+
 Errors look like `{"error":{"code":"limit_exceeded","message":"...","request_id":"..."}}`
 with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 `permission_denied` 403, `not_found` 404, `already_exists` / `invalid_state` /
@@ -248,6 +270,7 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 | Atomic batches | A batch refused at any transfer, after earlier transfers moved money in and out, created holds or changed versions, must leave every account, transfer, index, timeout and the journal exactly as before, also when it shares a group commit with other commands and inside one transaction, where its generated IDs must be free again. Deliberately broken rollbacks fail these tests. The largest batch (8,190 transfers, a log record over a megabyte) is one fsync and survives a restart from the log alone and `ledgerd verify`; any batch that passes validation fits in one log record. |
 | Journal feed | The reference model walks the feed with every kind of filter from random positions with changing page sizes and must get exactly its own journal, entry for entry; consumers that follow the feed while clients write, in-process and over HTTP, see every entry once and in order; a commit is made at every entry the feed examines and must never wait for it; the feed is unchanged after a restart that dropped the segments holding its first entries. |
 | Live entry stream | Consumers read history and then live entries over Server-Sent Events, drop, and resume with `Last-Event-ID`, also while 4 clients write, and must see every entry once and in order; a filtered stream hears heartbeats whose ids follow the head; a consumer that never reads is disconnected within the write timeout and its slot freed, which fails without the per-write deadline; a stream outlives the server's read and write timeouts and ends on shutdown. |
+| Webhooks | Real HTTP receivers check every signature: entries from concurrent writers arrive exactly once and in order, filtered endpoints skip what they do not match, failures retry with growing delays under the same delivery ID, timeouts and unreachable endpoints become dead letters that survive restarts and replay, a replay made during a delivery wins over it, positions survive restarts and snapshots while the receiver is down, a delivery whose position the disk failed to log is sent again, and a full dead-letter list holds entries rather than dropping them. Snapshots with every kind of endpoint state are cut at every byte and bit-flipped. |
 | Reconciliation | The amount-and-date pass is compared with a maximum bipartite matching on random inputs; a worst case of 10,000 lines against 100,000 identical movements must stay fast. |
 | Parsers | Go fuzzing of the decimal amount parser, the log reader, the CSV parser, the transfer, freeze, close and limit endpoints, and the listing and feed query strings with every cursor and position they return followed: accepted input round-trips; nothing returns a 500, breaks an invariant or an index, and no walk repeats an item or fails to end. |
 | API | Every endpoint and error code over real HTTP, a full card-payment flow, auth and admin rules, body limits, timeouts and request IDs. `examples/demo.sh` runs in CI against the real binary, twice and across a restart, and every step's outcome is checked (each refusal with its error code), followed by `ledgerd verify` on the data directory. |
@@ -300,6 +323,7 @@ internal/money     currency table, checked arithmetic, exact decimal parsing
 internal/wal       checksummed append-only log in sealed segments: batched append, replay, segment drop
 internal/ledger    accounts, transfers, journal, writer with group commit, idempotency, snapshots, queries, invariants
 internal/recon     statement CSV parser and matcher
+internal/webhook   webhook dispatcher: signed deliveries, retries with backoff, dead letters
 internal/api       HTTP API, auth, errors, logging, metrics wiring
 internal/metrics   Prometheus text exposition
 examples/demo.sh   walkthrough against a running server

@@ -24,8 +24,9 @@ package ledger
 // (unsigned and signed varints, length-prefixed strings). Items never span
 // frames. The first item is the header (format version, snapshot number,
 // journal head, time, and the number of accounts, transfers, entries and keys
-// that follow); then come the accounts, transfers, entries and keys, and last
-// a footer with the number of frames before it. Anything else, including
+// that follow, then the number of webhook endpoints and the newest webhook
+// version); then come the accounts, transfers, entries, keys and webhook
+// endpoints, and last a footer with the number of frames before it. Anything else, including
 // bytes after the footer, makes the file invalid.
 
 import (
@@ -60,8 +61,10 @@ const (
 	// versions may hold neither kind. Version 7 adds multi-currency
 	// transfers: an account's exchange flag, a currency on each posting
 	// and line, and the rate on transfers and their creating entries.
-	// Older versions hold single-currency transfers only.
-	snapVersion    = 7
+	// Older versions hold single-currency transfers only. Version 8 adds
+	// webhook endpoints, with their positions and dead letters, and the
+	// endpoint a keyed webhook command returned. Older versions hold none.
+	snapVersion    = 8
 	snapPrefix     = "snapshot-"
 	snapSuffix     = ".snap"
 	snapTmpSuffix  = ".tmp"
@@ -74,6 +77,7 @@ const (
 	snapItemEntry  = 'E'
 	snapItemIdem   = 'I'
 	snapItemBatch  = 'B' // one transfer of a batch result; follows its key
+	snapItemHook   = 'W'
 	snapItemFooter = 'Z'
 )
 
@@ -110,6 +114,8 @@ type snapshot struct {
 	transfers []*Transfer // committed transfers are immutable, so these are shared
 	entries   []Entry     // a prefix of the journal, which is append-only
 	idem      []snapIdem  // in the order they were stored
+	hooks     []*Webhook  // committed endpoints are immutable, so these are shared
+	hookGen   uint64
 }
 
 func snapName(num uint64) string { return fmt.Sprintf("%s%020d%s", snapPrefix, num, snapSuffix) }
@@ -129,6 +135,10 @@ func (l *Ledger) capture(num uint64, now time.Time) *snapshot {
 	}
 	for _, tr := range st.transfers {
 		s.transfers = append(s.transfers, tr)
+	}
+	s.hookGen = st.hookGen
+	for _, h := range st.hooks {
+		s.hooks = append(s.hooks, h)
 	}
 	// Keys past their retention are left out: once the segments before the
 	// snapshot are dropped, nothing on disk holds them any more.
@@ -152,6 +162,7 @@ func (l *Ledger) capture(num uint64, now time.Time) *snapshot {
 func writeSnapshot(fsys wal.FS, dir string, s *snapshot) (int64, error) {
 	sort.Slice(s.accounts, func(i, j int) bool { return s.accounts[i].ID < s.accounts[j].ID })
 	sort.Slice(s.transfers, func(i, j int) bool { return s.transfers[i].ID < s.transfers[j].ID })
+	sort.Slice(s.hooks, func(i, j int) bool { return s.hooks[i].ID < s.hooks[j].ID })
 	final := filepath.Join(dir, snapName(s.num))
 	tmp := final + snapTmpSuffix
 	f, err := fsys.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -389,6 +400,36 @@ func (w *snapWriter) transfer(t *Transfer) {
 	}
 }
 
+// hook writes a webhook endpoint: its definition, version and position,
+// then its dead letters.
+func (w *snapWriter) hook(h *Webhook) {
+	w.str(h.ID)
+	w.str(h.URL)
+	w.str(h.Secret)
+	w.str(h.Account)
+	w.u(uint64(len(h.Kinds)))
+	for _, k := range h.Kinds {
+		w.str(string(k))
+	}
+	w.str(h.Currency)
+	w.u(uint64(h.MaxBatch))
+	w.when(h.CreatedAt)
+	w.u(h.Version)
+	w.u(h.Cursor)
+	w.u(h.NextDeadLetter)
+	w.u(uint64(len(h.DeadLetters)))
+	for _, d := range h.DeadLetters {
+		w.u(d.ID)
+		w.u(d.AfterSeq)
+		w.u(d.ThroughSeq)
+		w.u(uint64(d.Entries))
+		w.u(uint64(d.Attempts))
+		w.str(d.Error)
+		w.when(d.FailedAt)
+		w.flag(d.Replaying)
+	}
+}
+
 // fx writes a rate: a flag, then base, quote, rate, source and quote time.
 func (w *snapWriter) fx(f *FX) {
 	w.flag(f != nil)
@@ -432,6 +473,10 @@ func (w *snapWriter) encode(s *snapshot) error {
 	w.u(uint64(len(s.transfers)))
 	w.u(uint64(len(s.entries)))
 	w.u(uint64(len(s.idem)))
+	if w.ver >= 8 {
+		w.u(uint64(len(s.hooks)))
+		w.u(s.hookGen)
+	}
 	w.item()
 	for i := range s.accounts {
 		a := &s.accounts[i]
@@ -512,6 +557,9 @@ func (w *snapWriter) encode(s *snapshot) error {
 		if w.ver >= 4 && q.e.err != nil && q.e.err.Item != nil {
 			flags |= 16
 		}
+		if w.ver >= 8 && q.e.out.Webhook != nil {
+			flags |= 32
+		}
 		w.buf = append(w.buf, flags)
 		if q.e.err != nil {
 			w.str(string(q.e.err.Code))
@@ -543,6 +591,9 @@ func (w *snapWriter) encode(s *snapshot) error {
 		if flags&8 != 0 {
 			w.u(uint64(len(q.e.out.Transfers)))
 		}
+		if flags&32 != 0 {
+			w.hook(q.e.out.Webhook)
+		}
 		w.item()
 		// A batch result can hold thousands of transfers, more than one
 		// frame takes, so each is an item of its own.
@@ -552,6 +603,13 @@ func (w *snapWriter) encode(s *snapshot) error {
 				w.transfer(t)
 				w.item()
 			}
+		}
+	}
+	if w.ver >= 8 {
+		for _, h := range s.hooks {
+			w.tag(snapItemHook)
+			w.hook(h)
+			w.item()
 		}
 	}
 	w.flush()
@@ -1001,6 +1059,66 @@ func (r *snapReader) expect(tag byte) {
 }
 
 // entryIndex finds seq in a transfer's entry references, which are few.
+// hook reads a webhook endpoint and checks it as create_webhook and
+// webhook_progress would have: a valid definition, a version no newer than
+// gen, a position and dead letters within head, and dead letter IDs that
+// increase and stay below the next one. A returned endpoint in an
+// idempotency record passes ^0 as head, since it may be older than the
+// journal holds now but never newer.
+func (r *snapReader) hook(gen, head uint64) *Webhook {
+	h := &Webhook{ID: r.str(), URL: r.str(), Secret: r.str(), Account: r.str()}
+	n := r.count(1)
+	if n > MaxFeedKinds && r.err == nil {
+		r.fail("webhook %s filters on %d kinds", h.ID, n)
+	}
+	for j := 0; j < n && r.err == nil; j++ {
+		h.Kinds = append(h.Kinds, r.kind())
+	}
+	h.Currency = r.str()
+	h.MaxBatch = int(min(r.u(), MaxWebhookBatch+1))
+	h.CreatedAt = r.when()
+	h.Version, h.Cursor, h.NextDeadLetter = r.u(), r.u(), r.u()
+	nd := r.count(8)
+	if nd > MaxDeadLetters && r.err == nil {
+		r.fail("webhook %s holds %d dead letters", h.ID, nd)
+	}
+	if r.err != nil {
+		return nil
+	}
+	h.DeadLetters = make([]DeadLetter, 0, nd)
+	var last uint64
+	for j := 0; j < nd && r.err == nil; j++ {
+		d := DeadLetter{ID: r.u(), AfterSeq: r.u(), ThroughSeq: r.u(), Entries: int(min(r.u(), MaxWebhookBatch+1)),
+			Attempts: int(min(r.u(), 1<<31)), Error: r.str(), FailedAt: r.when(), Replaying: r.flag()}
+		if r.err == nil && (d.ID <= last || d.ID >= h.NextDeadLetter || d.ThroughSeq <= d.AfterSeq || d.ThroughSeq > head ||
+			d.Entries < 1 || d.Entries > MaxWebhookBatch || d.Attempts < 1 || !validWebhookError(d.Error)) {
+			r.fail("webhook %s has a malformed dead letter", h.ID)
+		}
+		last = d.ID
+		h.DeadLetters = append(h.DeadLetters, d)
+	}
+	if r.err != nil {
+		return nil
+	}
+	spec := WebhookSpec{ID: h.ID, URL: h.URL, Secret: h.Secret, Account: h.Account, Kinds: h.Kinds, Currency: h.Currency, MaxBatch: h.MaxBatch}
+	switch {
+	case h.MaxBatch < 1:
+		r.fail("webhook %s has max_batch %d", h.ID, h.MaxBatch)
+	case spec.validate() != nil:
+		r.fail("webhook %s is not a valid endpoint: %v", h.ID, spec.validate())
+	case h.Version == 0 || h.Version > gen:
+		r.fail("webhook %s has version %d, outside 1 to %d", h.ID, h.Version, gen)
+	case h.Cursor > head:
+		r.fail("webhook %s is at position %d, past the head %d", h.ID, h.Cursor, head)
+	case h.NextDeadLetter == 0:
+		r.fail("webhook %s has no next dead letter id", h.ID)
+	}
+	if r.err != nil {
+		return nil
+	}
+	return h
+}
+
 func entryIndex(t *Transfer, seq uint64) int {
 	for i, ref := range t.Entries {
 		if ref.Seq == seq {
@@ -1038,6 +1156,13 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 	}
 	s.num, s.head, s.time = r.u(), r.u(), r.when()
 	nAccounts, nTransfers, nEntries, nIdem := r.u(), r.u(), r.u(), r.u()
+	var nHooks, hookGen uint64
+	if r.ver >= 8 {
+		nHooks, hookGen = r.u(), r.u()
+		if nHooks > MaxWebhooks && r.err == nil {
+			r.fail("%d webhook endpoints", nHooks)
+		}
+	}
 	if r.err == nil && nEntries != s.head {
 		r.fail("head %d but %d entries", s.head, nEntries)
 	}
@@ -1206,6 +1331,9 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 		if r.ver >= 4 {
 			known = 31
 		}
+		if r.ver >= 8 {
+			known = 63
+		}
 		if flags&^known != 0 || flags&16 != 0 && flags&1 == 0 {
 			r.fail("bad idempotency flags")
 			break
@@ -1253,7 +1381,24 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 				q.e.out.Transfers = append(q.e.out.Transfers, r.transfer())
 			}
 		}
+		if flags&32 != 0 {
+			q.e.out.Webhook = r.hook(hookGen, ^uint64(0))
+		}
 		s.idem = append(s.idem, q)
+	}
+
+	st.hookGen = hookGen
+	for k := uint64(0); k < nHooks && r.err == nil; k++ {
+		r.expect(snapItemHook)
+		h := r.hook(hookGen, s.head)
+		if r.err != nil {
+			break
+		}
+		if _, dup := st.hooks[h.ID]; dup {
+			r.fail("webhook %s appears twice", h.ID)
+			break
+		}
+		st.hooks[h.ID] = h
 	}
 
 	r.expect(snapItemFooter)

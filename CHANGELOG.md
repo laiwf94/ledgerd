@@ -34,6 +34,26 @@ current formats.
   `ledgerd_entry_stream_slow_disconnects_total` and
   `ledgerd_entry_stream_refused_total`. Shutdown ends open streams instead
   of waiting for them.
+- Signed webhooks: `POST /v1/webhooks` registers an endpoint with the
+  feed's filters, a batch size and a starting position; `GET`, `DELETE` and
+  `POST /v1/webhooks/{id}/replay` read, remove and replay it. Each delivery
+  POSTs up to `max_batch` entries in sequence order with a
+  `Ledgerd-Signature` header, HMAC-SHA256 over the timestamp and body under
+  the endpoint's secret (generated when not given). The position moves only
+  after a 2xx, with a logged `webhook_progress` command, so delivery is at
+  least once and in order per endpoint across crashes and restarts.
+  Failures are retried with jittered exponential backoff
+  (`LEDGERD_WEBHOOK_TIMEOUT`, `LEDGERD_WEBHOOK_BACKOFF`,
+  `LEDGERD_WEBHOOK_BACKOFF_MAX`, `LEDGERD_WEBHOOK_MAX_ATTEMPTS`), then kept
+  as dead letters (up to 1,000 per endpoint, after which entries are held
+  rather than dropped) that a replay redelivers. Endpoints, positions and
+  dead letters are ledger state: logged, in snapshots (format 8), compared
+  by `ledgerd verify` and checked by the invariant checker. Metrics:
+  `ledgerd_webhook_attempts_total`, `ledgerd_webhook_dead_letters_total`,
+  `ledgerd_webhook_redeliveries_total`,
+  `ledgerd_webhook_entries_delivered_total`,
+  `ledgerd_webhook_attempt_duration_seconds`, `ledgerd_webhook_endpoints`
+  and `ledgerd_webhook_backlog_entries`.
 
 ### Batches, balancing transfers, holds and multi-currency (#26)
 

@@ -138,6 +138,9 @@ func sameState(t testing.TB, what string, a, b *Ledger) {
 	if a.st.open != b.st.open {
 		t.Fatalf("%s: open pending %d and %d", what, a.st.open, b.st.open)
 	}
+	if a.st.hookGen != b.st.hookGen || !reflect.DeepEqual(a.st.hooks, b.st.hooks) {
+		t.Fatalf("%s: webhook endpoints differ: %d and %d", what, len(a.st.hooks), len(b.st.hooks))
+	}
 	if d := indexDiff(a.st.ix, b.st.ix); d != "" {
 		t.Fatalf("%s: secondary indexes differ: %s", what, d)
 	}
@@ -414,6 +417,9 @@ func writeSmallSnapshot(t *testing.T, ver int) (dir string, clock *fakeClock) {
 		e.do(postCmd(h.ID, 0, PartialAmount{"bank", 1000}, PartialAmount{"fx_usd", 1000}, PartialAmount{"fx_eur", 923}, PartialAmount{"wallet_eur", 923}))
 		e.do(reverseCmd(c.Transfer.ID, 0, PartialAmount{"bank", 500}, PartialAmount{"fx_usd", 500}, PartialAmount{"fx_eur", 462}, PartialAmount{"wallet_eur", 462}))
 		e.l.Do(ctx, convert("0.9234", dr("bank", 100), cr("fx_usd", 100), eur(dr("fx_eur", 1)), eur(cr("wallet_eur", 1))), key("k8", "off", "off"))
+	}
+	if ver >= 8 {
+		writeSmallWebhooks(t, e)
 	}
 	e.l.Close()
 	if nums := snapshotFiles(t, e.dir); len(nums) != 1 {
