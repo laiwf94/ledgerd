@@ -21,6 +21,19 @@ current formats.
   journal's length, so feed readers never hold up commits. The feed serves
   the whole journal, also after the segments holding its first entries have
   been dropped behind snapshots.
+- The live entry stream: `GET /v1/entries/stream` sends journal entries as
+  Server-Sent Events with the feed's filters, each with its sequence as the
+  event id, and resumes after `Last-Event-ID` when a client reconnects.
+  Idle streams send `heartbeat` events whose id is the stream's position;
+  each write has its own deadline (`StreamWriteTimeout`, 10 s), so a
+  consumer that stops reading is disconnected; at most `MaxStreams` (1,024)
+  are open. Streams read the in-memory journal themselves and wait on a
+  wake-up the writer closes after each commit that appends entries, so the
+  writer does no work per stream. Metrics: `ledgerd_entry_streams`,
+  `ledgerd_entry_stream_events_total`,
+  `ledgerd_entry_stream_slow_disconnects_total` and
+  `ledgerd_entry_stream_refused_total`. Shutdown ends open streams instead
+  of waiting for them.
 
 ### Batches, balancing transfers, holds and multi-currency (#26)
 

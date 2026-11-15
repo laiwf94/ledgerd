@@ -60,6 +60,15 @@ type Config struct {
 	// derived from the API keys, so cursors survive restarts but stop
 	// working when the key set changes.
 	CursorSecret string
+	// StreamHeartbeat is how long an idle entry stream waits before it
+	// sends a heartbeat; DefaultStreamHeartbeat when zero.
+	StreamHeartbeat time.Duration
+	// StreamWriteTimeout is how long a write to an entry stream may take
+	// before the consumer counts as too slow and is disconnected;
+	// DefaultStreamWriteTimeout when zero.
+	StreamWriteTimeout time.Duration
+	// MaxStreams caps the open entry streams; DefaultMaxStreams when zero.
+	MaxStreams int
 }
 
 // Server is the HTTP API.
@@ -73,6 +82,7 @@ type Server struct {
 	mux     *http.ServeMux
 	recon   chan struct{}
 	cursors cursorCodec
+	streams *streams
 }
 
 // New builds a server. It returns an error for unsafe configuration.
@@ -132,6 +142,7 @@ func New(cfg Config) (*Server, error) {
 	if s.timeout <= 0 {
 		s.timeout = DefaultTimeout
 	}
+	s.streams = newStreams(cfg, s.m)
 
 	s.mux = http.NewServeMux()
 	s.route("GET /healthz", s.healthz, authNone)
@@ -152,6 +163,7 @@ func New(cfg Config) (*Server, error) {
 	s.route("GET /v1/transfers", s.listTransfers, authKey)
 	s.route("GET /v1/transfers/{id}", s.getTransfer, authKey)
 	s.route("GET /v1/entries", s.listEntries, authKey)
+	s.route("GET /v1/entries/stream", s.streamEntries, authKey)
 	s.route("POST /v1/transfers/{id}/post", s.postTransfer, authKey)
 	s.route("POST /v1/transfers/{id}/void", s.voidTransfer, authKey)
 	s.route("POST /v1/transfers/{id}/increase", s.increaseTransfer, authKey)
@@ -207,6 +219,10 @@ func (w *statusWriter) WriteHeader(code int) {
 	}
 	w.ResponseWriter.WriteHeader(code)
 }
+
+// Unwrap lets http.ResponseController reach the connection's writer, for
+// flushing and deadlines.
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (w *statusWriter) Write(b []byte) (int, error) {
 	if w.code == 0 {

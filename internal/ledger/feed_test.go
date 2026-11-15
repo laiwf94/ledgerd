@@ -453,3 +453,46 @@ func BenchmarkEntries(b *testing.B) {
 		})
 	}
 }
+
+// EntriesGrown wakes a waiter on the first commit after it was taken that
+// appends entries, and only then: an account, a rejected transfer or an
+// idle writer leave it open.
+func TestEntriesGrown(t *testing.T) {
+	e := newEnv(t, false)
+	closed := func(ch <-chan struct{}) bool {
+		select {
+		case <-ch:
+			return true
+		default:
+			return false
+		}
+	}
+	ch := e.l.EntriesGrown()
+	if again := e.l.EntriesGrown(); again != ch {
+		t.Fatal("two waiters before a commit got different channels")
+	}
+	e.standard()
+	if _, err := e.l.Do(context.Background(), move(dr("alice", 5), cr("bob", 5)), nil); err == nil {
+		t.Fatal("overdraft accepted")
+	}
+	if closed(ch) {
+		t.Fatal("woken by commits that appended no entries")
+	}
+	head := e.head()
+	e.do(move(dr("bank", 10), cr("alice", 10)))
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatal("not woken by a commit that appended an entry")
+	}
+	// The wake-up is published after the commit: the entry is readable.
+	if p, err := e.l.Entries(EntryFilter{}, head, 10); err != nil || len(p.Entries) != 1 {
+		t.Fatalf("page after the wake-up: %+v %v", p, err)
+	}
+	next := e.l.EntriesGrown()
+	if closed(next) || next == ch {
+		t.Fatal("the next waiter got a used channel")
+	}
+	e.do(move(dr("bank", 10), cr("alice", 10)))
+	<-next
+}

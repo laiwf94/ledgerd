@@ -41,7 +41,7 @@ func (c *clock) Advance(d time.Duration) {
 }
 
 type fixture struct {
-	t     *testing.T
+	t     testing.TB
 	srv   *httptest.Server
 	api   *Server
 	l     *ledger.Ledger
@@ -49,7 +49,7 @@ type fixture struct {
 	logs  *bytes.Buffer
 }
 
-func newFixture(t *testing.T, mutate func(*ledger.Options, *Config)) *fixture {
+func newFixture(t testing.TB, mutate func(*ledger.Options, *Config)) *fixture {
 	t.Helper()
 	f := &fixture{t: t, clock: &clock{t: time.Date(2030, 3, 1, 9, 0, 0, 0, time.UTC)}, logs: &bytes.Buffer{}}
 	log := slog.New(slog.NewJSONHandler(f.logs, nil))
@@ -81,7 +81,7 @@ type resp struct {
 	body   []byte
 }
 
-func (r resp) json(t *testing.T) map[string]any {
+func (r resp) json(t testing.TB) map[string]any {
 	t.Helper()
 	var m map[string]any
 	if err := json.Unmarshal(r.body, &m); err != nil {

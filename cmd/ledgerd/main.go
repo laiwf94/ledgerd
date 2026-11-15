@@ -171,6 +171,8 @@ func run(ctx context.Context, getenv func(string) string, logOut io.Writer, read
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 	}
+	// Shutdown waits for handlers; live entry streams end so it can finish.
+	hs.RegisterOnShutdown(srv.CloseStreams)
 	ln, err := net.Listen("tcp", cfg.addr)
 	if err != nil {
 		return err

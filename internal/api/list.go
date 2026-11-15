@@ -211,41 +211,11 @@ func (s *Server) listTransfers(w http.ResponseWriter, r *http.Request) error {
 // change its filters when it resumes; next_after_seq is always present, and
 // has_more says whether entries the page did not examine already exist.
 func (s *Server) listEntries(w http.ResponseWriter, r *http.Request) error {
-	q, err := parseListQuery(r, func(name string) bool {
-		return name == "after_seq" || name == "account" || name == "kind" || name == "currency"
-	})
+	f, after, limit, err := parseEntryQuery(r, true)
 	if err != nil {
 		return err
 	}
-	if q.cursor != "" {
-		return badRequest("the entry feed resumes from after_seq, not a cursor")
-	}
-	var f ledger.EntryFilter
-	var after uint64
-	for name, v := range q.filters {
-		if v == "" {
-			return badRequest("%s must not be empty", name)
-		}
-		switch name {
-		case "after_seq":
-			n, err := queryUint(r, "after_seq", 0, 1<<63)
-			if err != nil {
-				return err
-			}
-			after = n
-		case "account":
-			f.Account = v
-		case "kind":
-			kinds, err := ledger.ParseEntryKinds(v)
-			if err != nil {
-				return err
-			}
-			f.Kinds = kinds
-		case "currency":
-			f.Currency = v
-		}
-	}
-	page, err := s.l.Entries(f, after, q.limit)
+	page, err := s.l.Entries(f, after, limit)
 	if err != nil {
 		return err
 	}
@@ -260,4 +230,48 @@ func (s *Server) listEntries(w http.ResponseWriter, r *http.Request) error {
 	}
 	writeJSON(w, http.StatusOK, resp)
 	return nil
+}
+
+// parseEntryQuery reads the journal feed's query string: after_seq and the
+// account, kind and currency filters, plus limit when paged is set. The live
+// stream sends what it has, so it takes no limit.
+func parseEntryQuery(r *http.Request, paged bool) (ledger.EntryFilter, uint64, int, error) {
+	var f ledger.EntryFilter
+	q, err := parseListQuery(r, func(name string) bool {
+		return name == "after_seq" || name == "account" || name == "kind" || name == "currency"
+	})
+	if err != nil {
+		return f, 0, 0, err
+	}
+	if q.cursor != "" {
+		return f, 0, 0, badRequest("the entry feed resumes from after_seq, not a cursor")
+	}
+	if !paged && r.URL.Query().Has("limit") {
+		return f, 0, 0, badRequest("the entry stream takes no limit")
+	}
+	var after uint64
+	for name, v := range q.filters {
+		if v == "" {
+			return f, 0, 0, badRequest("%s must not be empty", name)
+		}
+		switch name {
+		case "after_seq":
+			n, err := queryUint(r, "after_seq", 0, 1<<63)
+			if err != nil {
+				return f, 0, 0, err
+			}
+			after = n
+		case "account":
+			f.Account = v
+		case "kind":
+			kinds, err := ledger.ParseEntryKinds(v)
+			if err != nil {
+				return f, 0, 0, err
+			}
+			f.Kinds = kinds
+		case "currency":
+			f.Currency = v
+		}
+	}
+	return f, after, q.limit, nil
 }

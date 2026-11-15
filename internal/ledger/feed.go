@@ -230,6 +230,30 @@ func (l *Ledger) Entries(f EntryFilter, after uint64, limit int) (EntryPage, err
 	return page, nil
 }
 
+// EntriesGrown returns a channel that is closed once a commit after this
+// call appends journal entries. A live consumer takes it before reading a
+// page and waits on it when the page reaches the head, so an entry
+// committed between the read and the wait still wakes it.
+func (l *Ledger) EntriesGrown() <-chan struct{} {
+	l.growMu.Lock()
+	defer l.growMu.Unlock()
+	if l.grown == nil {
+		l.grown = make(chan struct{})
+	}
+	return l.grown
+}
+
+// wakeEntryWaiters closes the channel EntriesGrown handed out. The writer
+// calls it after publishing a commit that appended entries.
+func (l *Ledger) wakeEntryWaiters() {
+	l.growMu.Lock()
+	if l.grown != nil {
+		close(l.grown)
+		l.grown = nil
+	}
+	l.growMu.Unlock()
+}
+
 func (l *Ledger) feedStep(seq uint64) {
 	if l.feedHook != nil {
 		l.feedHook(seq)

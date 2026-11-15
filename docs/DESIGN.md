@@ -1157,6 +1157,95 @@ every entry exactly once, in order. On the 4-vCPU 2.1 GHz Xeon VM with
 takes about 14 µs unfiltered, 12 µs for one account's entries and 90 µs
 for a kind that is one entry in a hundred.
 
+### The live entry stream
+
+`GET /v1/entries/stream` (`internal/api/stream.go`) serves the same feed as
+Server-Sent Events, with the same `account=`, `kind=`, `currency=` and
+`after_seq=` parameters (no `limit` or `cursor`). Each journal entry is one
+event:
+
+```text
+id: 42
+event: entry
+data: {"seq":42,"kind":"posted","transfer_id":"tr_...","lines":[...]}
+```
+
+The event's id is the entry's sequence, so an `EventSource` that loses its
+connection reconnects with `Last-Event-ID: 42` and the stream resumes right
+after it. A reconnect repeats the original URL, so `Last-Event-ID` wins over
+the `after_seq` in it. Nothing is skipped and nothing is sent twice by the
+server; a consumer that had received an event but not finished processing
+it when it dropped sees it again only if it resumes from an older id, which
+is the at-least-once a consumer gets from storing its position after
+processing. The stream opens with `retry: 2000`, asking clients to wait two
+seconds before reconnecting. A `Last-Event-ID` or `after_seq` past the head
+is refused with 400 before the stream starts, like the paged feed.
+
+A stream does not queue entries for its consumer and the writer never does
+any work per stream. The journal is append-only and in memory, so a stream
+keeps only its position and reads the next page of the feed itself, up to
+256 entries, with the state lock held only to note the journal's length.
+When a page reaches the head, the stream waits on `Ledger.EntriesGrown`: a
+channel the writer closes after publishing a commit that appended entries.
+The channel exists only while someone waits, so a commit with no stream
+open allocates nothing, and one close wakes every waiting stream. A stream
+takes the channel before reading a page, so an entry committed between the
+read and the wait still wakes it (`TestEntriesGrown`).
+
+An idle stream sends a heartbeat every 15 seconds
+(`api.Config.StreamHeartbeat`), which keeps proxies from closing the
+connection and tells the consumer how far the stream has looked:
+
+```text
+event: heartbeat
+id: 57
+data: {"head_seq":57}
+```
+
+Its id is the stream's position, not the last entry sent: entries in
+between did not match the filter and never will, so a consumer that
+resumes from it does not rescan them. An `EventSource` records the id
+without needing a listener for `heartbeat` events.
+
+Each connection has one buffer, which holds at most one page of events, and
+each write of it gets its own deadline, 10 seconds by default
+(`api.Config.StreamWriteTimeout`); the server's `WriteTimeout`, meant for
+one response, does not end a stream. A consumer that stops reading fills its
+TCP window, the write misses its deadline, and the server closes the
+connection, counts it in `ledgerd_entry_stream_slow_disconnects_total` and
+logs it; the consumer reconnects with `Last-Event-ID` once it is ready. The
+number of open streams is capped at 1,024 (`api.Config.MaxStreams`), and a
+stream past the cap is refused with 503 `unavailable` and counted in
+`ledgerd_entry_stream_refused_total`. `ledgerd_entry_streams` is the number
+open and `ledgerd_entry_stream_events_total` the entries sent. On shutdown,
+`http.Server.Shutdown` waits for handlers, so the server registers
+`Server.CloseStreams` with `RegisterOnShutdown`: every stream ends at once
+and new ones are refused with 503, and clients resume from the restarted
+server with their last id.
+
+`TestEntryStreamDeliversAndResumes` reads 300 entries of history across
+pages of the stream, then live entries as they commit, then reconnects with
+`Last-Event-ID` after commits made while disconnected and requires the
+sequences to continue with no gap or repeat, with and without filters.
+`TestEntryStreamFollowsConcurrentWrites` has three consumers follow 4
+concurrent writers, one of them dropping after 50 entries and resuming,
+and requires each to see every entry once and in order, and the filtered
+one to see exactly what the paged feed returns.
+`TestEntryStreamHeartbeatCarriesPosition` checks that a stream nothing
+matches hears only heartbeats whose ids follow the head, and that resuming
+from one returns the next match. `TestEntryStreamDisconnectsSlowConsumers`
+opens a stream on a socket that never reads, with 4 KiB socket buffers and
+4,000 entries to send, and requires the server to close it within the write
+timeout and free its slot for a consumer that keeps up; removing the
+per-write deadline makes it fail. `TestEntryStreamUnderServerTimeoutsAndShutdown`
+keeps a stream open for a second past a 200 ms read and write timeout and
+then requires `Shutdown` to end it and return. On the 4-vCPU 2.1 GHz Xeon
+VM (`BenchmarkEntryStream`), one consumer catches up on 49,140 entries over
+HTTP at about 290,000 entries a second, JSON decoding on the client
+included, and a transfer's round trip from its request to its event
+arriving on a stream waiting at the head, fsync included, takes about
+0.4 ms.
+
 ## Matching a bank statement
 
 `POST /v1/accounts/{id}/reconcile` takes a CSV statement

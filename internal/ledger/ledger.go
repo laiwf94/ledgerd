@@ -95,6 +95,11 @@ type Ledger struct {
 	auditStep func(step string) // tests: called while the checker holds no lock
 	feedHook  func(seq uint64)  // tests: called before the feed examines an entry, holding no lock
 
+	// grown is closed when a commit appends journal entries; nil while no
+	// one waits, so a commit with no waiting stream allocates nothing.
+	growMu sync.Mutex
+	grown  chan struct{}
+
 	queue   chan *request
 	quit    chan struct{}
 	done    chan struct{}
@@ -784,6 +789,9 @@ func (l *Ledger) process(batch []*request) {
 	l.mu.Lock()
 	t.commit()
 	l.mu.Unlock()
+	if len(t.entries) > 0 {
+		l.wakeEntryWaiters()
+	}
 	l.mCommitted.Add(uint64(committed))
 	l.mRejected.Add(uint64(rejected))
 	reply()
