@@ -212,6 +212,15 @@ func (w *worker) run() {
 	l := w.d.l
 	var version, scanned uint64
 	for w.ctx.Err() == nil {
+		if err := l.Err(); err != nil {
+			// The ledger stopped taking writes after a storage error and
+			// stays stopped until a restart, so no position can be logged.
+			// Delivering now would only send the same entries again and
+			// again; after the restart they are sent once more.
+			w.d.o.Logger.Warn("webhook: the ledger stopped taking writes; deliveries resume after a restart", "webhook", w.id, "error", err.Error())
+			<-w.ctx.Done()
+			return
+		}
 		changed := l.WebhooksChanged()
 		grown := l.EntriesGrown()
 		h, err := l.Webhook(w.id)
@@ -323,7 +332,7 @@ func (w *worker) progress(p *ledger.WebhookProgressSpec) {
 		w.d.o.Logger.Warn("webhook: dead letter list is full; retrying instead", "webhook", p.ID)
 		w.sleep(w.d.o.BackoffMax, p.Version)
 	default:
-		if w.ctx.Err() == nil {
+		if w.ctx.Err() == nil && w.d.l.Err() == nil {
 			w.d.o.Logger.Warn("webhook: logging delivery progress failed; the entries will be sent again", "webhook", p.ID, "error", err.Error())
 			w.sleep(w.d.o.BackoffBase, p.Version)
 		}

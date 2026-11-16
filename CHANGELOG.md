@@ -67,6 +67,13 @@ current formats.
   `ledgerd_exports_total`, `ledgerd_exports_failed_total`,
   `ledgerd_export_entries_total` and `ledgerd_export_bytes_total`.
 
+#### Fixed
+
+- Webhook workers no longer resend the same batch every backoff interval
+  while the ledger is stopped after a storage error. The position of such a
+  delivery cannot be logged until a restart, so workers now wait for the
+  restart and deliver the entries once more then (#82).
+
 ### Batches, balancing transfers, holds and multi-currency (#26)
 
 #### Added

@@ -682,8 +682,12 @@ func TestDeliveryIsRepeatedWhenProgressIsNotLogged(t *testing.T) {
 	h.pay("alice", 3) // before the endpoint exists, so no write can fail
 	h.hook(ledger.WebhookSpec{ID: "w", URL: r.srv.URL, AfterSeq: new(uint64)})
 	eventually(t, "the ledger to stop taking writes", func() bool { return h.l.Err() != nil })
-	if got := r.seqs("w"); len(got) == 0 {
-		t.Fatal("nothing delivered")
+	// However long the ledger stays stopped, the worker does not send the
+	// entries again: it could not log their position either. Many times
+	// the backoff passes.
+	time.Sleep(40 * h.do.BackoffBase)
+	if got := r.seqs("w"); !equal(got, []uint64{1, 2, 3}) {
+		t.Fatalf("received %v while the ledger was stopped", got)
 	}
 	r.setAnswer(nil)
 	failing.Store(false)
