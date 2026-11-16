@@ -172,6 +172,8 @@ JSON bodies and an optional `Idempotency-Key` header.
 | `GET /v1/transfers/{id}` | A transfer with its postings, state, links and entries. |
 | `GET /v1/entries` | The journal feed: entries in sequence order with their lines; `?after_seq=&account=&kind=posted,pending&currency=&limit=`. Every page has `next_after_seq` (pass it back as `after_seq` to resume exactly where you stopped), `has_more` and `head_seq`. Reads never hold up writes. |
 | `GET /v1/entries/stream` | The journal feed live, as Server-Sent Events: one `entry` event per entry with its sequence as the event id, the same filters and `after_seq`; resumes after `Last-Event-ID` on reconnect, sends `heartbeat` events carrying its position while idle, and disconnects consumers that stop reading. |
+| `GET /v1/export` | Stream the journal as a file: `?from=&to=` (dates or RFC 3339 times, `[from, to)` by entry time, either end open) and `format=ndjson` (default) or `csv`. The last line is a manifest (`{"manifest":...,"signature":...}`, in CSV a `#ledgerd-export` comment line) with the head the export was taken at, entry and row counts, the sequence range, the SHA-256 of everything before it with a checkpoint every 65,536 entries, and an Ed25519 signature. A file without one was cut short. Holds no lock and keeps no more than one entry in memory; at most 4 run at once. |
+| `GET /v1/export/key` | The Ed25519 public key (`public_key`, base64) and `key_id` that verify export manifests. |
 | `POST /v1/webhooks` | Register a webhook endpoint: `{"id","url"}`, optional `secret` (generated and returned when left out), the feed's `account`, `kinds` and `currency` filters, `max_batch` (1 to 1,000, default 100) and `after_seq` (default: the journal head, so only new entries). |
 | `GET /v1/webhooks` | Every endpoint with its `delivered_through_seq` and `dead_letter_count`, without secrets. |
 | `GET /v1/webhooks/{id}` | One endpoint with its secret, position and dead letters. |
@@ -241,6 +243,21 @@ $ curl -s localhost:8080/v1/webhooks -H "$AUTH" -H 'Content-Type: application/js
  "max_batch":100,"version":1,"delivered_through_seq":12,"dead_letters":[],"head_seq":12, ...}
 ```
 
+To hand a period to an accounting system or an auditor, export it. The
+file streams as NDJSON (one entry per line, as the feed returns them) or
+CSV (one row per entry line) and ends in a manifest of counts and running
+SHA-256 hashes, signed with the server's Ed25519 export key; check it with
+the key from `GET /v1/export/key`:
+
+```console
+$ curl -s "localhost:8080/v1/export?from=2026-11-01&to=2026-12-01&format=csv" -H "$AUTH" -o november.csv
+$ KEY=$(curl -s localhost:8080/v1/export/key -H "$AUTH" | jq -r .public_key)
+$ ledgerd verify-export -key "$KEY" november.csv
+ledgerd verify-export: verified
+manifest: csv, [2026-11-01T00:00:00Z, 2026-12-01T00:00:00Z), head 4211, entries 7 to 4198, key c32de43a3701c641, created 2026-12-01T00:00:03Z
+file: 3917 entries in 7834 rows, 1290412 bytes; signature valid
+```
+
 Errors look like `{"error":{"code":"limit_exceeded","message":"...","request_id":"..."}}`
 with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 `permission_denied` 403, `not_found` 404, `already_exists` / `invalid_state` /
@@ -271,8 +288,9 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 | Journal feed | The reference model walks the feed with every kind of filter from random positions with changing page sizes and must get exactly its own journal, entry for entry; consumers that follow the feed while clients write, in-process and over HTTP, see every entry once and in order; a commit is made at every entry the feed examines and must never wait for it; the feed is unchanged after a restart that dropped the segments holding its first entries. |
 | Live entry stream | Consumers read history and then live entries over Server-Sent Events, drop, and resume with `Last-Event-ID`, also while 4 clients write, and must see every entry once and in order; a filtered stream hears heartbeats whose ids follow the head; a consumer that never reads is disconnected within the write timeout and its slot freed, which fails without the per-write deadline; a stream outlives the server's read and write timeouts and ends on shutdown. |
 | Webhooks | Real HTTP receivers check every signature: entries from concurrent writers arrive exactly once and in order, filtered endpoints skip what they do not match, failures retry with growing delays under the same delivery ID, timeouts and unreachable endpoints become dead letters that survive restarts and replay, a replay made during a delivery wins over it, positions survive restarts and snapshots while the receiver is down, a delivery whose position the disk failed to log is sent again, and a full dead-letter list holds entries rather than dropping them. Snapshots with every kind of endpoint state are cut at every byte and bit-flipped. |
+| Export | Exports in both formats read back to exactly the entries written (no lines, several lines, two currencies, an FX source with a comma, quotes and a newline). Every cut and every flipped bit of a signed export is reported as damaged; a manifest rebuilt and signed with another key, or claiming the trusted key, is refused; out-of-order, repeated, out-of-period and past-the-head entries, wrong counts and a changed CSV header are each reported, and damage is narrowed to the span between two checkpoints. Live heap stays flat (under 10 KiB of growth) across a 110 MiB export. Over HTTP the export equals the journal feed line for line, a client that stops reading is cut off with no manifest while commits carry on, and `ledgerd verify-export` returns its exit codes against files from the real binary, whose key survives a restart. |
 | Reconciliation | The amount-and-date pass is compared with a maximum bipartite matching on random inputs; a worst case of 10,000 lines against 100,000 identical movements must stay fast. |
-| Parsers | Go fuzzing of the decimal amount parser, the log reader, the CSV parser, the transfer, freeze, close and limit endpoints, and the listing and feed query strings with every cursor and position they return followed: accepted input round-trips; nothing returns a 500, breaks an invariant or an index, and no walk repeats an item or fails to end. |
+| Parsers | Go fuzzing of the decimal amount parser, the log reader, the CSV parser, the export verifier, the transfer, freeze, close and limit endpoints, and the listing and feed query strings with every cursor and position they return followed: accepted input round-trips; nothing returns a 500, breaks an invariant or an index, and no walk repeats an item or fails to end. |
 | API | Every endpoint and error code over real HTTP, a full card-payment flow, auth and admin rules, body limits, timeouts and request IDs. `examples/demo.sh` runs in CI against the real binary, twice and across a restart, and every step's outcome is checked (each refusal with its error code), followed by `ledgerd verify` on the data directory. |
 | Concurrency | The whole suite runs under the race detector in CI. |
 

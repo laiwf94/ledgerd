@@ -496,3 +496,93 @@ func TestEntriesGrown(t *testing.T) {
 	e.do(move(dr("bank", 10), cr("alice", 10)))
 	<-next
 }
+
+// A Journal is the journal as of the head when it was taken. Walking it
+// holds no lock: at every entry it examines, the test commits a transfer,
+// which must not wait for it and must not appear in the walk. Each keeps
+// to its period by entry time, with either end open.
+func TestJournalEach(t *testing.T) {
+	e := newEnv(t, false)
+	e.standard()
+	start := e.clock.Now()
+	for i := 0; i < 12; i++ {
+		e.do(move(dr("bank", 10), cr("alice", 10)))
+		e.clock.Advance(time.Hour)
+	}
+	j := e.l.Journal()
+	head := e.head()
+	if j.Head() != head {
+		t.Fatalf("head %d, want %d", j.Head(), head)
+	}
+	committed := 0
+	e.l.feedHook = func(uint64) {
+		done := make(chan error, 1)
+		go func() {
+			_, err := e.l.Do(context.Background(), move(dr("bank", 1), cr("bob", 1)), nil)
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+			committed++
+		case <-time.After(10 * time.Second):
+			t.Fatal("a commit waited for the journal walk")
+		}
+	}
+	var all []Entry
+	if err := j.Each(time.Time{}, time.Time{}, func(en *Entry) error { all = append(all, *en); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	e.l.feedHook = nil
+	if committed != int(head) || len(all) != int(head) || e.head() != head+uint64(committed) {
+		t.Fatalf("%d commits during the walk; walked %d of %d", committed, len(all), head)
+	}
+	for i := range all {
+		if !reflect.DeepEqual(all[i], e.entry(uint64(i+1))) {
+			t.Fatalf("entry %d differs", i+1)
+		}
+	}
+
+	period := func(from, to time.Time) []uint64 {
+		var got []uint64
+		if err := j.Each(from, to, func(en *Entry) error { got = append(got, en.Seq); return nil }); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	var want, wantFrom, wantTo []uint64
+	lo, hi := start.Add(3*time.Hour), start.Add(7*time.Hour)
+	for _, en := range all {
+		if !en.Time.Before(lo) && en.Time.Before(hi) {
+			want = append(want, en.Seq)
+		}
+		if !en.Time.Before(lo) {
+			wantFrom = append(wantFrom, en.Seq)
+		}
+		if en.Time.Before(hi) {
+			wantTo = append(wantTo, en.Seq)
+		}
+	}
+	if len(want) != 4 {
+		t.Fatalf("the period holds %d entries, want 4", len(want))
+	}
+	if got := period(lo, hi); !slices.Equal(got, want) {
+		t.Fatalf("period: %v, want %v", got, want)
+	}
+	if got := period(lo, time.Time{}); !slices.Equal(got, wantFrom) {
+		t.Fatalf("from only: %v, want %v", got, wantFrom)
+	}
+	if got := period(time.Time{}, hi); !slices.Equal(got, wantTo) {
+		t.Fatalf("to only: %v, want %v", got, wantTo)
+	}
+	stop := errors.New("stop")
+	n := 0
+	if err := j.Each(time.Time{}, time.Time{}, func(*Entry) error { n++; return stop }); err != stop || n != 1 {
+		t.Fatalf("the walk did not stop at the first error: %v after %d", err, n)
+	}
+	if (Journal{}).Head() != 0 || (Journal{}).Each(time.Time{}, time.Time{}, func(*Entry) error { return stop }) != nil {
+		t.Fatal("an empty journal")
+	}
+}

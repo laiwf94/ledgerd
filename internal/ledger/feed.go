@@ -3,6 +3,7 @@ package ledger
 import (
 	"sort"
 	"strings"
+	"time"
 )
 
 // The journal feed lets a consumer follow every journal entry in sequence
@@ -281,4 +282,45 @@ func ParseEntryKinds(s string) ([]EntryKind, error) {
 		kinds = append(kinds, k)
 	}
 	return kinds, nil
+}
+
+// Journal is the journal as of one moment: every entry up to the head when
+// it was taken. Taking it costs O(1) under the read lock, and reading it
+// takes no lock at all, because the journal is append-only and an entry
+// never changes once committed. An export walks the whole journal through
+// one, so it never delays a commit, however long its client takes to read.
+type Journal struct {
+	entries []Entry
+	step    func(seq uint64)
+}
+
+// Journal returns the journal as of now.
+func (l *Ledger) Journal() Journal {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return Journal{entries: l.st.entries, step: l.feedStep}
+}
+
+// Head is the sequence of the newest entry in the journal, 0 when empty.
+func (j Journal) Head() uint64 { return uint64(len(j.entries)) }
+
+// Each calls fn for every entry whose time is in [from, to), oldest first,
+// and stops at the first error fn returns. A zero from or to leaves that
+// end open. Entries are in sequence order, not time order: the clock that
+// stamps them may step back, so every entry is examined. fn must not
+// modify the entry or keep it after it returns.
+func (j Journal) Each(from, to time.Time, fn func(e *Entry) error) error {
+	for i := range j.entries {
+		e := &j.entries[i]
+		if j.step != nil {
+			j.step(e.Seq)
+		}
+		if !from.IsZero() && e.Time.Before(from) || !to.IsZero() && !e.Time.Before(to) {
+			continue
+		}
+		if err := fn(e); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -2,6 +2,7 @@
 //
 //	ledgerd                  serve the HTTP API
 //	ledgerd verify [dir]     check a data directory offline (see ledgerd verify -h)
+//	ledgerd verify-export f  check an exported journal file (see ledgerd verify-export -h)
 //
 // Configuration comes from the environment:
 //
@@ -18,11 +19,14 @@
 //	LEDGERD_WEBHOOK_BACKOFF       delay after a delivery's first failed attempt, doubling after each (default 1s)
 //	LEDGERD_WEBHOOK_BACKOFF_MAX   longest delay between attempts (default 1h)
 //	LEDGERD_WEBHOOK_MAX_ATTEMPTS  attempts before a delivery becomes a dead letter (default 20, 1 to 1000)
+//	LEDGERD_EXPORT_KEY       Ed25519 seed signing export manifests, 32 bytes of base64; when unset the key is
+//	                         <data dir>/export.key, made on first start, or a key that lasts until exit without a data dir
 //	LEDGERD_LOG_LEVEL        debug, info, warn or error (default info)
 package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -31,12 +35,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/laiwf94/ledgerd/internal/api"
+	"github.com/laiwf94/ledgerd/internal/export"
 	"github.com/laiwf94/ledgerd/internal/ledger"
 	"github.com/laiwf94/ledgerd/internal/metrics"
 	"github.com/laiwf94/ledgerd/internal/webhook"
@@ -45,6 +51,9 @@ import (
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "verify" {
 		os.Exit(verify(os.Args[2:], os.Getenv, os.Stdout, os.Stderr))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "verify-export" {
+		os.Exit(verifyExport(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -60,6 +69,7 @@ type config struct {
 	apiKeys    []string
 	adminToken string
 	cursorKey  string
+	exportSeed []byte
 	idemTTL    time.Duration
 	maxBatch   int
 	snapEvery  int
@@ -93,6 +103,13 @@ func loadConfig(getenv func(string) string) (config, error) {
 	c.cursorKey = getenv("LEDGERD_CURSOR_SECRET")
 	if c.cursorKey != "" && len(c.cursorKey) < 16 {
 		return c, errors.New("LEDGERD_CURSOR_SECRET must be at least 16 characters")
+	}
+	if v := getenv("LEDGERD_EXPORT_KEY"); v != "" {
+		seed, err := export.ParseSeed(v)
+		if err != nil {
+			return c, errors.New("LEDGERD_EXPORT_KEY must be a 32-byte Ed25519 seed in base64")
+		}
+		c.exportSeed = seed
 	}
 	if v := getenv("LEDGERD_IDEMPOTENCY_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -160,6 +177,37 @@ func loadConfig(getenv func(string) string) (config, error) {
 	return c, nil
 }
 
+// exportSigner picks the key that signs export manifests: LEDGERD_EXPORT_KEY,
+// else the data directory's export.key (made on first start), else a key
+// that lasts until exit.
+func exportSigner(cfg config, log *slog.Logger) (*export.Signer, error) {
+	var s *export.Signer
+	var err error
+	source := "LEDGERD_EXPORT_KEY"
+	switch {
+	case cfg.exportSeed != nil:
+		s, err = export.NewSigner(cfg.exportSeed)
+	case cfg.dataDir != "":
+		var created bool
+		path := filepath.Join(cfg.dataDir, export.KeyFile)
+		s, created, err = export.LoadOrCreateKey(path)
+		source = path
+		if created {
+			source += " (new)"
+		}
+	default:
+		seed := make([]byte, export.SeedSize)
+		_, _ = rand.Read(seed)
+		s, err = export.NewSigner(seed)
+		source = "random until exit"
+	}
+	if err != nil {
+		return nil, fmt.Errorf("export signing key: %w", err)
+	}
+	log.Info("export signing key", "key_id", s.KeyID(), "public_key", export.EncodeKey(s.PublicKey()), "source", source)
+	return s, nil
+}
+
 // utcTime logs timestamps in UTC, like every time the ledger stores.
 func utcTime(groups []string, a slog.Attr) slog.Attr {
 	if a.Key == slog.TimeKey && len(groups) == 0 {
@@ -194,6 +242,11 @@ func run(ctx context.Context, getenv func(string) string, logOut io.Writer, read
 	log.Info("recovered", "head", stats.Head, "accounts", stats.Accounts, "transfers", stats.Transfers,
 		"open_pending", stats.OpenPending, "log_bytes", stats.LogBytes, "log_segments", stats.LogSegments, "duration_ms", time.Since(start).Milliseconds())
 
+	signer, err := exportSigner(cfg, log)
+	if err != nil {
+		return err
+	}
+
 	hooks, err := webhook.Start(webhook.Options{Ledger: l, Timeout: cfg.hookTimeout, BackoffBase: cfg.hookBackoff,
 		BackoffMax: cfg.hookBackoffMax, MaxAttempts: cfg.hookAttempts, Logger: log, Metrics: reg})
 	if err != nil {
@@ -202,7 +255,7 @@ func run(ctx context.Context, getenv func(string) string, logOut io.Writer, read
 	defer hooks.Close() // before the ledger closes: a delivery in flight is sent again on the next start
 
 	srv, err := api.New(api.Config{Ledger: l, APIKeys: cfg.apiKeys, AdminToken: cfg.adminToken, CursorSecret: cfg.cursorKey,
-		Logger: log, Metrics: reg})
+		ExportSigner: signer, Logger: log, Metrics: reg})
 	if err != nil {
 		return err
 	}

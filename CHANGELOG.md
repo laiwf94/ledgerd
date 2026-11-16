@@ -54,6 +54,18 @@ current formats.
   `ledgerd_webhook_entries_delivered_total`,
   `ledgerd_webhook_attempt_duration_seconds`, `ledgerd_webhook_endpoints`
   and `ledgerd_webhook_backlog_entries`.
+- Journal export: `GET /v1/export?from=&to=&format=ndjson|csv` streams
+  every entry of a period (dates or RFC 3339 times, either end open)
+  without holding a lock or loading the period into memory, and ends with a
+  manifest of the head, entry and row counts, the sequence range and the
+  SHA-256 of the file with a checkpoint every 65,536 entries, signed with
+  Ed25519. The key is `LEDGERD_EXPORT_KEY`, else `<data>/export.key` (made
+  on first start), and `GET /v1/export/key` publishes the public half.
+  `ledgerd verify-export` checks a file: exit 0 verified, 1 damaged, 2
+  intact but no key given, 3 could not run. At most 4 exports run at once;
+  a client that stops reading is cut off. Metrics:
+  `ledgerd_exports_total`, `ledgerd_exports_failed_total`,
+  `ledgerd_export_entries_total` and `ledgerd_export_bytes_total`.
 
 ### Batches, balancing transfers, holds and multi-currency (#26)
 

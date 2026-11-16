@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/laiwf94/ledgerd/internal/export"
 	"github.com/laiwf94/ledgerd/internal/ledger"
 	"github.com/laiwf94/ledgerd/internal/metrics"
 	"github.com/laiwf94/ledgerd/internal/recon"
@@ -69,6 +70,11 @@ type Config struct {
 	StreamWriteTimeout time.Duration
 	// MaxStreams caps the open entry streams; DefaultMaxStreams when zero.
 	MaxStreams int
+	// ExportSigner signs export manifests. When nil the server makes a
+	// random key that lasts until it stops, which only suits tests and
+	// in-memory ledgers: files exported before a restart can no longer be
+	// checked against GET /v1/export/key.
+	ExportSigner *export.Signer
 }
 
 // Server is the HTTP API.
@@ -83,6 +89,10 @@ type Server struct {
 	recon   chan struct{}
 	cursors cursorCodec
 	streams *streams
+	exports chan struct{}
+	signer  *export.Signer
+
+	mExports, mExportFailed, mExportEntries, mExportBytes *metrics.Counter
 }
 
 // New builds a server. It returns an error for unsafe configuration.
@@ -143,6 +153,17 @@ func New(cfg Config) (*Server, error) {
 		s.timeout = DefaultTimeout
 	}
 	s.streams = newStreams(cfg, s.m)
+	s.exports = make(chan struct{}, MaxConcurrentExports)
+	s.signer = cfg.ExportSigner
+	if s.signer == nil {
+		seed := make([]byte, export.SeedSize)
+		_, _ = rand.Read(seed)
+		s.signer, _ = export.NewSigner(seed)
+	}
+	s.mExports = s.m.Counter("ledgerd_exports_total", "", "Journal exports completed with a manifest.")
+	s.mExportFailed = s.m.Counter("ledgerd_exports_failed_total", "", "Journal exports that ended before their manifest.")
+	s.mExportEntries = s.m.Counter("ledgerd_export_entries_total", "", "Entries written by completed journal exports.")
+	s.mExportBytes = s.m.Counter("ledgerd_export_bytes_total", "", "Bytes written by completed journal exports, manifests excluded.")
 
 	s.mux = http.NewServeMux()
 	s.route("GET /healthz", s.healthz, authNone)
@@ -169,6 +190,8 @@ func New(cfg Config) (*Server, error) {
 	s.route("POST /v1/transfers/{id}/increase", s.increaseTransfer, authKey)
 	s.route("POST /v1/transfers/{id}/extend", s.extendTransfer, authKey)
 	s.route("POST /v1/transfers/{id}/reverse", s.reverseTransfer, authKey)
+	s.route("GET /v1/export", s.exportJournal, authKey)
+	s.route("GET /v1/export/key", s.exportKey, authKey)
 	s.route("POST /v1/webhooks", s.createWebhook, authKey)
 	s.route("GET /v1/webhooks", s.listWebhooks, authKey)
 	s.route("GET /v1/webhooks/{id}", s.getWebhook, authKey)

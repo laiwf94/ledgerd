@@ -31,5 +31,6 @@ jobs:
           go test ./internal/recon -run=^$ -fuzz=FuzzParse -fuzztime=20s
           go test ./internal/api -run=^$ -fuzz=FuzzCreateTransfer -fuzztime=20s
           go test ./internal/api -run=^$ -fuzz=FuzzListQuery -fuzztime=20s
+          go test ./internal/export -run=^$ -fuzz=FuzzVerify -fuzztime=20s
       - name: Vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...

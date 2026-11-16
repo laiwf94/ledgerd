@@ -522,6 +522,7 @@ A data directory holds:
   snapshot-00000000000000000041.snap       newest two snapshots, named by snapshot number
   snapshot-00000000000000000042.snap
   snapshot-00000000000000000043.snap.tmp   only while a snapshot is being written
+  export.key                               Ed25519 seed signing export manifests, base64, mode 0600
   wal/
     LOCK                                   flock target; holds no data
     MANIFEST                               which segments make up the log
@@ -1373,6 +1374,90 @@ recovers. In `internal/ledger` the snapshot round trip, every-byte cut and
 bit-flip tests include endpoints with filters, dead letters in each state
 and keyed results, and `ledgerd verify` reports a snapshot whose endpoints
 differ from the log.
+
+### Exporting a period
+
+`GET /v1/export?from=&to=&format=` writes every journal entry whose time is
+in `[from, to)` (either end open) as one file, NDJSON or CSV, for loading
+into a warehouse or handing to an auditor. Three properties matter: the
+file never sits in memory, it never holds up a commit, and the receiver
+can tell that it is whole and came from this ledger.
+
+**Streaming.** The handler takes a `ledger.Journal`, the journal slice as
+of the head, under the read lock: O(1), the same trick as the feed. Every
+entry up to that head is immutable, so the walk holds no lock at all. Each
+matching entry is encoded into one small buffer, hashed and passed to a
+64 KiB `bufio.Writer` over the connection; nothing is kept per entry. In
+`internal/export`, `TestExportMemoryIsFlat` exports 400,000 entries (110
+MiB of NDJSON, 85 MiB of CSV) while forcing a GC every 16 MiB and the live
+heap grows by at most 9 KiB. The server's write timeout covers a whole
+response, so like the live stream every buffer write gets its own deadline
+(`StreamWriteTimeout`); a client that stops reading is disconnected,
+counted in `ledgerd_exports_failed_total`, and its file has no manifest.
+Entry times come from the wall clock, which may step back, so the period is
+a filter over the journal in sequence order, not a binary search. At most 4
+exports run at once (429 `resource_exhausted` beyond that), since each
+scans the journal.
+
+One cost to know: an export pins the journal's backing array as of its
+start. When the journal grows past its capacity during a long export, the
+old array stays alive until the export ends, as it does for a feed page.
+That goes away when state moves to disk (#37).
+
+**Formats.** NDJSON lines are the feed's entry JSON byte for byte. CSV has a
+header and one row per entry line, `seq,time,kind,transfer_id,
+entry_currency,line,account,direction,currency,posted,pending,expires_at,
+fx_base,fx_quote,fx_rate,fx_source,fx_quoted_at`; an entry with two lines
+is two rows with the same `seq` and `line` 0 and 1, and an
+`extend_pending` entry, which has no lines, is one row with the line
+columns empty. Times are RFC 3339 in UTC with nanoseconds.
+
+**Manifest.** The last line describes the file:
+
+```text
+{"manifest":{"version":1,"format":"csv","from":"...","to":"...","head_seq":4211,
+  "entries":3917,"rows":7834,"first_seq":7,"last_seq":4198,"bytes":1290412,
+  "sha256":"...","checkpoints":[{"entries":65536,"seq":...,"bytes":...,"sha256":"..."}],
+  "created_at":"...","key_id":"c32de43a3701c641"},"signature":"<base64>"}
+```
+
+In CSV the line starts with `#ledgerd-export `, so CSV readers that skip `#`
+comments (Go's `csv.Reader.Comment`, pandas' `comment=`) read only the
+rows. `sha256` is the SHA-256 of every byte before the manifest line, and
+each checkpoint is the SHA-256 of the prefix up to the end of its entry,
+every 65,536 entries; `hash.Hash.Sum` does not disturb the running state,
+so checkpoints cost one finalisation each. `head_seq` pins what the file
+claims: every entry up to that head whose time is in the period, so two
+exports of a closed period agree unless the clock stepped back.
+
+**Signature.** The manifest is signed with Ed25519 over the bytes
+`ledgerd export manifest v1\0` followed by the manifest object exactly as
+written; the verifier keeps those bytes rather than re-encoding them. A
+public key, not an HMAC, because the people who check an export (an
+auditor, a warehouse loader) should not be able to make one. The key is
+`LEDGERD_EXPORT_KEY` (a 32-byte seed in base64) when set, else
+`<data>/export.key`, made with mode 0600 on first start (temporary file,
+fsync, rename, directory fsync) so it survives restarts and travels with a
+copied data directory, else a random key that lasts until exit for an
+in-memory ledger. The server logs the public key at startup and serves it
+at `GET /v1/export/key`; `key_id` is the first 8 bytes of its SHA-256.
+
+**Checking a file.** `ledgerd verify-export [-key K | -key-file F] [-json]
+file` (or `export.Verify`) reads the file once with bounded memory and
+checks the hashes and checkpoints, the counts and sequence range, that
+entries rise in sequence order to at most `head_seq`, that CSV rows of one
+entry carry consecutive line numbers, that every entry time is in the
+period, that nothing follows the manifest, and the signature against the
+trusted key. Exit 0 is verified; 1 is damaged (cut short, edited, not an
+export, or a bad signature), with the first checkpoint that disagrees
+narrowing where; 2 is intact but unchecked, because without a trusted key
+anyone could have written a matching manifest; 3 is could not run.
+
+Measured on a 4 vCPU 2.1 GHz Xeon VM (`BenchmarkExport`,
+`BenchmarkVerify`, 100,000 entries in the mix above): writing runs at
+about 640,000 entries/s (185 MB/s) as NDJSON and 690,000 entries/s (154
+MB/s) as CSV, and verifying at about 370,000 entries/s (106 MB/s) for
+NDJSON and 147,000 entries/s (32 MB/s) for CSV.
 
 ## Matching a bank statement
 
