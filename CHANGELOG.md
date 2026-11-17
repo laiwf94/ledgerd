@@ -67,6 +67,20 @@ current formats.
   `ledgerd_exports_total`, `ledgerd_exports_failed_total`,
   `ledgerd_export_entries_total` and `ledgerd_export_bytes_total`.
 
+#### Tests
+
+- `TestWebhookDeliveryUnderKillNineAndNetworkFaults` runs the real binary
+  with four endpoints (everything, one account, hold entries only, and
+  everything one entry per delivery) behind receivers that answer 503,
+  reset the connection before or during the body, accept a delivery and
+  never answer, answer after the sender's timeout, or stop listening for a
+  while. Concurrent clients write while the server is killed with `SIGKILL`
+  three times, once with a receiver down. Once the faults stop, every
+  journal entry must have reached every endpoint it matches at least once,
+  in order per endpoint and identical to the journal, with valid signatures
+  and stable delivery IDs, no dead letters and every acknowledged request
+  still held.
+
 #### Fixed
 
 - Webhook workers no longer resend the same batch every backoff interval

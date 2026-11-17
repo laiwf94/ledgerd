@@ -43,12 +43,14 @@ type proc struct {
 	done      chan error
 }
 
-// spawn starts ledgerd on dir and waits until it listens.
-func spawn(t *testing.T, dir string) *proc {
+// spawn starts ledgerd on dir and waits until it listens. env adds or
+// overrides environment variables.
+func spawn(t *testing.T, dir string, env ...string) *proc {
 	t.Helper()
 	cmd := exec.Command(os.Args[0])
 	cmd.Env = append(os.Environ(), childEnv+"=1", "LEDGERD_ADDR=127.0.0.1:0", "LEDGERD_API_KEYS="+key,
 		"LEDGERD_DATA_DIR="+dir, "LEDGERD_SNAPSHOT_EVERY=500", "LEDGERD_SEGMENT_BYTES=4096", "LEDGERD_ADMIN_TOKEN=")
+	cmd.Env = append(cmd.Env, env...)
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)

@@ -1375,6 +1375,45 @@ bit-flip tests include endpoints with filters, dead letters in each state
 and keyed results, and `ledgerd verify` reports a snapshot whose endpoints
 differ from the log.
 
+**Delivery under crashes and network faults.**
+`TestWebhookDeliveryUnderKillNineAndNetworkFaults` (`cmd/ledgerd`) runs
+the real binary with four endpoints: everything in batches of 40, one
+account's entries, hold entries only, and everything one entry per
+delivery. Each receiver sits behind a faulty network: while faults are on,
+each request meets one with probability 0.35: a 503 before the body is
+read, a TCP reset before or partway through the body, a delivery read in
+full and then cut off without an answer, or an answer that comes after the
+1 s `LEDGERD_WEBHOOK_TIMEOUT`. Receivers also stop listening for 50 to 250
+ms at a time, so the sender meets connection refused. Four clients write
+transfers, holds, posts, voids and reversals while the server is killed
+with `SIGKILL` three times, each time once every receiver has had new
+deliveries in that round, and once while one receiver is down so the
+restarted server must keep retrying until it returns. After the last
+restart the faults stop and every endpoint's position must reach the last
+entry its filter matches. Every delivery a receiver read is then held
+against the journal feed with the same filter:
+
+- every signature verifies, and a delivery ID always carries the same
+  entries;
+- every matching entry arrived at least once, nothing else arrived, and
+  each arrived entry is identical to the journal's, so no delivered entry
+  was lost by a kill;
+- each delivery is a run of consecutive matching entries that starts no
+  later than just after the furthest entry already received, so no entry
+  ever arrives before one that precedes it;
+- no endpoint has dead letters, every acknowledged request replays after
+  each restart, and the stopped directory verifies as sound.
+
+A run makes about 6,000 requests, about 320 of them faulty (most requests
+are the one-entry endpoint catching up after the faults stop), and
+receivers see a few hundred entries more than once; a few of those had
+been answered 200 before a kill landed ahead of the logged position. Three
+deliberately broken dispatchers each fail with the skipped entries named:
+one that treats a 503 as delivered, one that logs one entry past what it
+delivered, and one that resumes from the head instead of its logged
+position after a restart. The test takes about 6 s, or 12 to 14 s under
+`-race`.
+
 ### Exporting a period
 
 `GET /v1/export?from=&to=&format=` writes every journal entry whose time is
