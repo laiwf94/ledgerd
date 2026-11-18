@@ -25,9 +25,10 @@ package ledger
 // frames. The first item is the header (format version, snapshot number,
 // journal head, time, and the number of accounts, transfers, entries and keys
 // that follow, then the number of webhook endpoints and the newest webhook
-// version); then come the accounts, transfers, entries, keys and webhook
-// endpoints, and last a footer with the number of frames before it. Anything else, including
-// bytes after the footer, makes the file invalid.
+// version, then the number of balance monitors and balance alerts); then
+// come the accounts, transfers, entries, keys, webhook endpoints, monitors
+// and alerts, and last a footer with the number of frames before it.
+// Anything else, including bytes after the footer, makes the file invalid.
 
 import (
 	"bufio"
@@ -64,7 +65,9 @@ const (
 	// Older versions hold single-currency transfers only. Version 8 adds
 	// webhook endpoints, with their positions and dead letters, and the
 	// endpoint a keyed webhook command returned. Older versions hold none.
-	snapVersion    = 8
+	// Version 9 adds balance monitors and the balance alerts raised so far,
+	// and the monitor a keyed monitor command returned.
+	snapVersion    = 9
 	snapPrefix     = "snapshot-"
 	snapSuffix     = ".snap"
 	snapTmpSuffix  = ".tmp"
@@ -78,6 +81,9 @@ const (
 	snapItemIdem   = 'I'
 	snapItemBatch  = 'B' // one transfer of a batch result; follows its key
 	snapItemHook   = 'W'
+	snapItemMonDef = 'D'
+	snapItemMon    = 'M'
+	snapItemAlert  = 'L'
 	snapItemFooter = 'Z'
 )
 
@@ -116,6 +122,8 @@ type snapshot struct {
 	idem      []snapIdem  // in the order they were stored
 	hooks     []*Webhook  // committed endpoints are immutable, so these are shared
 	hookGen   uint64
+	monitors  []monState // copies: commit changes monitors in place
+	alerts    []alertRec // a prefix of the alert list, which is append-only
 }
 
 func snapName(num uint64) string { return fmt.Sprintf("%s%020d%s", snapPrefix, num, snapSuffix) }
@@ -140,6 +148,11 @@ func (l *Ledger) capture(num uint64, now time.Time) *snapshot {
 	for _, h := range st.hooks {
 		s.hooks = append(s.hooks, h)
 	}
+	s.monitors = make([]monState, 0, len(st.monitors))
+	for _, m := range st.monitors {
+		s.monitors = append(s.monitors, *m)
+	}
+	s.alerts = st.alerts[:len(st.alerts):len(st.alerts)]
 	// Keys past their retention are left out: once the segments before the
 	// snapshot are dropped, nothing on disk holds them any more.
 	cutoff := now.Add(-l.opts.IdempotencyTTL)
@@ -163,6 +176,7 @@ func writeSnapshot(fsys wal.FS, dir string, s *snapshot) (int64, error) {
 	sort.Slice(s.accounts, func(i, j int) bool { return s.accounts[i].ID < s.accounts[j].ID })
 	sort.Slice(s.transfers, func(i, j int) bool { return s.transfers[i].ID < s.transfers[j].ID })
 	sort.Slice(s.hooks, func(i, j int) bool { return s.hooks[i].ID < s.hooks[j].ID })
+	sort.Slice(s.monitors, func(i, j int) bool { return s.monitors[i].def.id < s.monitors[j].def.id })
 	final := filepath.Join(dir, snapName(s.num))
 	tmp := final + snapTmpSuffix
 	f, err := fsys.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -430,6 +444,49 @@ func (w *snapWriter) hook(h *Webhook) {
 	}
 }
 
+// monitorDefs numbers the monitor definitions the snapshot refers to:
+// the live monitors' in ID order, then those of deleted monitors in the
+// order their first alert appears.
+func monitorDefs(s *snapshot) ([]*monitorDef, map[*monitorDef]uint64) {
+	var defs []*monitorDef
+	index := map[*monitorDef]uint64{}
+	add := func(d *monitorDef) {
+		if _, ok := index[d]; !ok {
+			index[d] = uint64(len(defs))
+			defs = append(defs, d)
+		}
+	}
+	for i := range s.monitors {
+		add(s.monitors[i].def)
+	}
+	for i := range s.alerts {
+		add(s.alerts[i].def)
+	}
+	return defs, index
+}
+
+func (w *snapWriter) monitorDef(d *monitorDef) {
+	w.str(d.id)
+	w.str(d.account)
+	w.condition(d.cond)
+	w.str(d.desc)
+	w.when(d.created)
+	w.u(d.from)
+}
+
+// monitorState writes what changes about a monitor.
+func (w *snapWriter) monitorState(met bool, last, count uint64) {
+	w.flag(met)
+	w.u(last)
+	w.u(count)
+}
+
+func (w *snapWriter) condition(c Condition) {
+	w.str(string(c.Field))
+	w.str(string(c.Operator))
+	w.i(c.Value)
+}
+
 // fx writes a rate: a flag, then base, quote, rate, source and quote time.
 func (w *snapWriter) fx(f *FX) {
 	w.flag(f != nil)
@@ -476,6 +533,14 @@ func (w *snapWriter) encode(s *snapshot) error {
 	if w.ver >= 8 {
 		w.u(uint64(len(s.hooks)))
 		w.u(s.hookGen)
+	}
+	var defs []*monitorDef
+	var defIndex map[*monitorDef]uint64
+	if w.ver >= 9 {
+		defs, defIndex = monitorDefs(s)
+		w.u(uint64(len(defs)))
+		w.u(uint64(len(s.monitors)))
+		w.u(uint64(len(s.alerts)))
 	}
 	w.item()
 	for i := range s.accounts {
@@ -560,6 +625,9 @@ func (w *snapWriter) encode(s *snapshot) error {
 		if w.ver >= 8 && q.e.out.Webhook != nil {
 			flags |= 32
 		}
+		if w.ver >= 9 && q.e.out.Monitor != nil {
+			flags |= 64
+		}
 		w.buf = append(w.buf, flags)
 		if q.e.err != nil {
 			w.str(string(q.e.err.Code))
@@ -594,6 +662,10 @@ func (w *snapWriter) encode(s *snapshot) error {
 		if flags&32 != 0 {
 			w.hook(q.e.out.Webhook)
 		}
+		if m := q.e.out.Monitor; flags&64 != 0 {
+			w.monitorDef(&monitorDef{id: m.ID, account: m.Account, cond: m.Condition, desc: m.Description, created: m.CreatedAt, from: m.FromSeq})
+			w.monitorState(m.Met, m.LastAlert, m.Alerts)
+		}
 		w.item()
 		// A batch result can hold thousands of transfers, more than one
 		// frame takes, so each is an item of its own.
@@ -609,6 +681,28 @@ func (w *snapWriter) encode(s *snapshot) error {
 		for _, h := range s.hooks {
 			w.tag(snapItemHook)
 			w.hook(h)
+			w.item()
+		}
+	}
+	if w.ver >= 9 {
+		for _, d := range defs {
+			w.tag(snapItemMonDef)
+			w.monitorDef(d)
+			w.item()
+		}
+		for _, m := range s.monitors {
+			w.tag(snapItemMon)
+			w.u(defIndex[m.def])
+			w.monitorState(m.met, m.last, m.count)
+			w.item()
+		}
+		for i := range s.alerts {
+			a := &s.alerts[i]
+			w.tag(snapItemAlert)
+			w.u(defIndex[a.def])
+			w.u(a.entry)
+			w.u(uint64(a.line))
+			w.flag(a.up)
 			w.item()
 		}
 	}
@@ -1119,6 +1213,45 @@ func (r *snapReader) hook(gen, head uint64) *Webhook {
 	return h
 }
 
+// condition reads a monitor's condition and checks it.
+func (r *snapReader) condition() Condition {
+	c := Condition{Field: BalanceField(r.sym()), Operator: MonitorOperator(r.sym()), Value: r.i()}
+	if r.err == nil && c.validate() != nil {
+		r.fail("bad monitor condition %s %s", c.Field, c.Operator)
+	}
+	return c
+}
+
+// monitorDef reads a monitor definition and checks it as create_monitor
+// would have: a valid ID and condition on a known account, watching from no
+// later than head+1. A definition in an idempotency record passes ^0 as
+// head, since it may be older than the state.
+func (r *snapReader) monitorDef(head uint64) *monitorDef {
+	d := &monitorDef{id: r.str(), account: r.acct(), cond: r.condition(), desc: r.str(), created: r.when(), from: r.u()}
+	if r.err == nil && (!ValidID(d.id) || !validText(d.desc, MaxMonitorDescription) || d.from == 0 || d.from-1 > head) {
+		r.fail("monitor %q is not valid or watches from entry %d, past the head %d", d.id, d.from, head)
+	}
+	return d
+}
+
+// monitorState reads what changes about a monitor and checks it names no
+// more alerts than the snapshot holds (^0 in an idempotency record).
+func (r *snapReader) monitorState(d *monitorDef, alerts uint64) *monState {
+	m := &monState{def: d, met: r.flag(), last: r.u(), count: r.u()}
+	if r.err == nil && (m.last > alerts || m.count > alerts || (m.last == 0) != (m.count == 0)) {
+		r.fail("monitor %s names alerts the snapshot does not hold", d.id)
+	}
+	return m
+}
+
+func (r *snapReader) defIndex(n int) int {
+	k := r.u()
+	if k >= uint64(n) && r.err == nil {
+		r.fail("monitor definition %d of %d", k, n)
+	}
+	return int(k)
+}
+
 func entryIndex(t *Transfer, seq uint64) int {
 	for i, ref := range t.Entries {
 		if ref.Seq == seq {
@@ -1163,12 +1296,19 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 			r.fail("%d webhook endpoints", nHooks)
 		}
 	}
+	var nDefs, nMonitors, nAlerts uint64
+	if r.ver >= 9 {
+		nDefs, nMonitors, nAlerts = r.u(), r.u(), r.u()
+		if (nMonitors > MaxMonitors || nDefs > nMonitors+nAlerts) && r.err == nil {
+			r.fail("%d balance monitors and %d definitions", nMonitors, nDefs)
+		}
+	}
 	if r.err == nil && nEntries != s.head {
 		r.fail("head %d but %d entries", s.head, nEntries)
 	}
 	// Every item takes several bytes, so the file's size bounds the counts
 	// and a damaged count cannot make the reader allocate without limit.
-	if fi, err := f.Stat(); err == nil && r.err == nil && max(nAccounts, nTransfers, nEntries, nIdem) > uint64(fi.Size()) {
+	if fi, err := f.Stat(); err == nil && r.err == nil && max(nAccounts, nTransfers, nEntries, nIdem, nDefs, nAlerts) > uint64(fi.Size()) {
 		r.fail("counts exceed the file size")
 	}
 	if r.err != nil {
@@ -1334,6 +1474,9 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 		if r.ver >= 8 {
 			known = 63
 		}
+		if r.ver >= 9 {
+			known = 127
+		}
 		if flags&^known != 0 || flags&16 != 0 && flags&1 == 0 {
 			r.fail("bad idempotency flags")
 			break
@@ -1384,6 +1527,11 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 		if flags&32 != 0 {
 			q.e.out.Webhook = r.hook(hookGen, ^uint64(0))
 		}
+		if flags&64 != 0 {
+			if m := r.monitorState(r.monitorDef(^uint64(0)), ^uint64(0)); r.err == nil {
+				q.e.out.Monitor = m.view()
+			}
+		}
 		s.idem = append(s.idem, q)
 	}
 
@@ -1399,6 +1547,57 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 			break
 		}
 		st.hooks[h.ID] = h
+	}
+
+	defs := make([]*monitorDef, 0, nDefs)
+	for k := uint64(0); k < nDefs && r.err == nil; k++ {
+		r.expect(snapItemMonDef)
+		defs = append(defs, r.monitorDef(s.head))
+	}
+	used := make([]bool, len(defs))
+	for k := uint64(0); k < nMonitors && r.err == nil; k++ {
+		r.expect(snapItemMon)
+		i := r.defIndex(len(defs))
+		if r.err != nil {
+			break
+		}
+		m := r.monitorState(defs[i], nAlerts)
+		switch {
+		case r.err != nil:
+		case used[i]:
+			r.fail("two monitors share definition %d", i)
+		case st.monitors[m.def.id] != nil:
+			r.fail("monitor %s appears twice", m.def.id)
+		case len(st.byAccount[m.def.account]) >= MaxMonitorsPerAccount:
+			r.fail("account %s has more than %d monitors", m.def.account, MaxMonitorsPerAccount)
+		}
+		if r.err != nil {
+			break
+		}
+		used[i] = true
+		st.addMonitor(m)
+	}
+	if nAlerts > 0 && r.err == nil {
+		st.alerts = make([]alertRec, 0, nAlerts)
+	}
+	var prevEntry uint64
+	for k := uint64(0); k < nAlerts && r.err == nil; k++ {
+		r.expect(snapItemAlert)
+		i := r.defIndex(len(defs))
+		a := alertRec{entry: r.u()}
+		line := r.u()
+		a.up = r.flag()
+		if r.err != nil {
+			break
+		}
+		a.def, a.line = defs[i], uint32(min(line, 1<<31))
+		if a.entry == 0 || a.entry > s.head || a.entry < prevEntry || a.entry < a.def.from ||
+			line >= uint64(len(st.entries[a.entry-1].Lines)) || st.entries[a.entry-1].Lines[line].Account != a.def.account {
+			r.fail("balance alert %d is out of journal order or not on its monitor's account", k+1)
+			break
+		}
+		prevEntry = a.entry
+		st.alerts = append(st.alerts, a)
 	}
 
 	r.expect(snapItemFooter)

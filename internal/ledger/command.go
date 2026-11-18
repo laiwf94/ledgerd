@@ -202,6 +202,9 @@ type Command struct {
 	DeleteWebhook   *WebhookRef          `json:"delete_webhook,omitempty"`
 	WebhookProgress *WebhookProgressSpec `json:"webhook_progress,omitempty"`
 	ReplayWebhook   *WebhookReplaySpec   `json:"replay_webhook,omitempty"`
+
+	CreateMonitor *MonitorSpec `json:"create_monitor,omitempty"`
+	DeleteMonitor *MonitorRef  `json:"delete_monitor,omitempty"`
 }
 
 // Idem identifies a request for idempotency. Scope separates callers (the API
@@ -291,7 +294,8 @@ func (c *Command) Validate() *Error {
 	n := 0
 	for _, set := range []bool{c.CreateAccount != nil, c.CreateTransfer != nil, c.Post != nil, c.Void != nil, c.Reverse != nil,
 		c.IncreasePending != nil, c.ExtendPending != nil, c.FreezeAccount != nil, c.UnfreezeAccount != nil, c.CloseAccount != nil, c.SetLimit != nil, c.CreateBatch != nil,
-		c.CreateWebhook != nil, c.DeleteWebhook != nil, c.WebhookProgress != nil, c.ReplayWebhook != nil} {
+		c.CreateWebhook != nil, c.DeleteWebhook != nil, c.WebhookProgress != nil, c.ReplayWebhook != nil,
+		c.CreateMonitor != nil, c.DeleteMonitor != nil} {
 		if set {
 			n++
 		}
@@ -336,6 +340,10 @@ func (c *Command) Validate() *Error {
 		return c.WebhookProgress.validate()
 	case c.ReplayWebhook != nil:
 		return c.ReplayWebhook.validate()
+	case c.CreateMonitor != nil:
+		return c.CreateMonitor.validate()
+	case c.DeleteMonitor != nil:
+		return c.DeleteMonitor.validate()
 	default:
 		r := c.Reverse
 		if !ValidID(r.TransferID) {

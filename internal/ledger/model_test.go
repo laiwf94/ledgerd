@@ -1667,6 +1667,15 @@ func runModel(t *testing.T, cfg modelRun) error {
 		m.exec(&c, "")
 		results[o.key], hashes[o.key] = mResult{}, o.hash
 	}
+	// Balance monitors the model does not track: the invariant checker
+	// re-derives every alert they raise from the journal.
+	for i, c := range modelMonitors() {
+		o := newOp(fmt.Sprintf("monitor-%d", i), c)
+		if _, err := l.Do(context.Background(), o.command(), &Idem{Key: o.key, Hash: o.hash}); err != nil {
+			t.Fatal(err)
+		}
+		results[o.key], hashes[o.key] = mResult{}, o.hash
+	}
 	hold()
 	_, offset := readRecords(t, path, 0)
 	release()

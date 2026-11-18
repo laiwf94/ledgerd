@@ -389,6 +389,9 @@ type Outcome struct {
 	// Webhook is the endpoint a webhook command created or changed, or the
 	// one it deleted.
 	Webhook *Webhook
+	// Monitor is the balance monitor a monitor command created, or the one
+	// it deleted.
+	Monitor *Monitor
 	// Replayed is true when the result was returned from the idempotency
 	// store instead of executing the command again.
 	Replayed bool

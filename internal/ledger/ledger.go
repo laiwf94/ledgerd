@@ -478,6 +478,12 @@ func (l *Ledger) registerMetrics() {
 	l.mCommit = m.Histogram("ledgerd_commit_duration_seconds", "", "Time to write and fsync one batch.")
 	m.Gauge("ledgerd_journal_head", "Sequence number of the newest journal entry.", func() float64 { return float64(l.Head()) })
 	m.Gauge("ledgerd_pending_transfers", "Open pending transfers.", func() float64 { return float64(l.Stats().OpenPending) })
+	m.Gauge("ledgerd_balance_monitors", "Balance monitors.", func() float64 {
+		l.mu.RLock()
+		defer l.mu.RUnlock()
+		return float64(len(l.st.monitors))
+	})
+	m.Gauge("ledgerd_balance_alerts", "Sequence number of the newest balance alert.", func() float64 { return float64(l.AlertHead()) })
 }
 
 // Do validates and executes one command. With idem set, it follows Stripe's

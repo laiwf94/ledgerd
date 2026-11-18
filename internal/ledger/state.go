@@ -36,7 +36,10 @@ type state struct {
 	order     []string // account IDs in the order they were added; append-only
 	ix        *indexes // secondary indexes; see index.go
 	hooks     map[string]*Webhook
-	hookGen   uint64 // the newest webhook version handed out; see webhook.go
+	hookGen   uint64                 // the newest webhook version handed out; see webhook.go
+	monitors  map[string]*monState   // balance monitors; see monitor.go
+	byAccount map[string][]*monState // each account's monitors in ID order; changed in place under the write lock
+	alerts    []alertRec             // balance alert i+1 is alerts[i]; append-only
 
 	// view is set while the invariant checker scans a frozen copy of the
 	// state. commit saves into it whatever it is about to overwrite.
@@ -44,7 +47,8 @@ type state struct {
 }
 
 func newState() *state {
-	return &state{accounts: map[string]*account{}, transfers: map[string]*Transfer{}, ix: newIndexes(), hooks: map[string]*Webhook{}}
+	return &state{accounts: map[string]*account{}, transfers: map[string]*Transfer{}, ix: newIndexes(), hooks: map[string]*Webhook{},
+		monitors: map[string]*monState{}, byAccount: map[string][]*monState{}}
 }
 
 func (s *state) head() uint64 { return uint64(len(s.entries)) }
@@ -101,6 +105,7 @@ type txn struct {
 	sp        *savepoint          // set while a batch runs; see begin
 	hooks     map[string]*Webhook // changed webhook endpoints, nil for deleted ones
 	hookGen   uint64              // webhook versions handed out by this txn
+	monOps    []monitorOp         // monitors created and deleted, in order
 }
 
 // savepoint is what a txn looked like when a batch began, so a failed batch
@@ -245,6 +250,7 @@ func (t *txn) commit() {
 		}
 		t.st.transfers[id] = tr
 	}
+	t.commitMonitors()
 	t.st.entries = append(t.st.entries, t.entries...)
 	for _, e := range t.expiries {
 		heap.Push(&t.st.expiries, e)
@@ -322,6 +328,10 @@ func (t *txn) apply(c *Command, id string) (Outcome, *Error) {
 		return t.webhookProgress(c.WebhookProgress)
 	case c.ReplayWebhook != nil:
 		return t.replayWebhook(c.ReplayWebhook)
+	case c.CreateMonitor != nil:
+		return t.createMonitor(c.CreateMonitor)
+	case c.DeleteMonitor != nil:
+		return t.deleteMonitor(c.DeleteMonitor)
 	}
 	return Outcome{}, errf(CodeInvalid, "empty command")
 }

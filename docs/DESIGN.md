@@ -580,13 +580,16 @@ order. Items, in file order:
 
 | Tag | Item | Fields |
 |---|---|---|
-| `H` | header, first | `u` format version (8), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys; from format 8 `u` count of webhook endpoints and `u` newest webhook version |
+| `H` | header, first | `u` format version (9), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys; from format 8 `u` count of webhook endpoints and `u` newest webhook version; from format 9 `u` counts of monitor definitions, balance monitors and balance alerts |
 | `A` | account, by ID | `str` ID, `str` currency, `i` exponent, `str` normal balance, `bool` non-negative, `bool` non-positive, from format 7 `bool` exchange, `meta`, `time` created; `i` debits posted, credits posted, debits pending, credits pending; `u` version; `u` count then per status change `u` journal head, `time`, `str` status, `str` reason; `u` count then per limit change `u` journal head, `time`, `str` kind, `i` amount (-1 for none), `str` reason |
 | `T` | transfer, by ID | `str` ID, state, currency; `u` posting count then per posting `str` account, `str` direction, `i` amount, posted, reversed, and from format 7 `str` currency (empty for the transfer's own); `str` reference, `meta`, `time` created, `time` expires, `str` reverses; `u` count then `str` reversal IDs; `u` count then per entry `u` sequence, `str` kind; from format 5 a balancing byte (0 none, else bit 0 `balance_debit`, bit 1 `balance_credit`) followed, when not 0, by `i` requested amount and `i` amount; from format 7 a rate: `bool` set, then if set `str` base, quote, rate and source and `time` quoted, present exactly when a posting names another currency |
 | `E` | journal entry, by sequence from 1 | `u` sequence, `time`, `str` kind, transfer ID, currency; `u` line count then per line `str` account, `str` direction, `i` posted, `i` pending, and from format 7 `str` currency (empty for the entry's own); from format 6 `time` expires, set only on an `extend_pending` entry, which alone has no lines; from format 7 a rate as in `T`, only on the entry that creates a multi-currency transfer and equal to that transfer's |
-| `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result, 8 batch result, 16 error names a batch item, 32 webhook result); then if flagged: `str` code and message, and `u` item index if flag 16; an account as in `A` with `u` version, the four totals, `u` as-of sequence, then `str` status, `str` status reason and `time` changed, then `i` overdraft and credit limits (-1 for none) and `u` effective sequence; a transfer as in `T`; `i` count of reservations expired; `u` number of batch transfers if flag 8; finally an endpoint as in `W` if flag 32 |
+| `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result, 8 batch result, 16 error names a batch item, 32 webhook result, 64 monitor result); then if flagged: `str` code and message, and `u` item index if flag 16; an account as in `A` with `u` version, the four totals, `u` as-of sequence, then `str` status, `str` status reason and `time` changed, then `i` overdraft and credit limits (-1 for none) and `u` effective sequence; a transfer as in `T`; `i` count of reservations expired; `u` number of batch transfers if flag 8; then an endpoint as in `W` if flag 32; finally, if flag 64, a monitor: a definition as in `D` followed by the fields of `M` after its definition |
 | `B` | one transfer of a batch result, right after its `I` item, in batch order | a transfer as in `T` |
 | `W` | webhook endpoint, by ID, from format 8 | `str` ID, URL, secret, account filter; `u` count then `str` kinds; `str` currency filter; `u` max batch, `time` created, `u` version, `u` position, `u` next dead letter ID; `u` count then per dead letter `u` ID, after sequence, through sequence, entries, attempts, `str` error, `time` failed, `bool` replaying |
+| `D` | monitor definition, numbered from 0, from format 9: the live monitors' in ID order, then deleted monitors' in the order of their first alert | `str` ID, account; condition: `str` field, `str` operator, `i` value; `str` description, `time` created, `u` first entry watched |
+| `M` | balance monitor, by ID, from format 9 | `u` its definition; `bool` condition met, `u` last alert, `u` alert count |
+| `L` | balance alert, by sequence from 1, from format 9 | `u` its monitor's definition, `u` entry sequence, `u` index of the entry's line on the monitor's account, `bool` triggered (else cleared) |
 | `Z` | footer, alone in the last frame | `u` number of frames before it |
 
 Each format carries a version: the log's `header` record, the manifest's
@@ -596,12 +599,12 @@ format 2 added account status, format 3 limit changes, format 4 batch
 results, format 5 balancing records, format 6 hold increases and
 extensions (`increase_pending` and `extend_pending` entries, and the
 timeout an extension sets), format 7 multi-currency transfers (the
-exchange flag, posting and line currencies, and rates) and format 8 webhook
-endpoints; format 1 and 2
+exchange flag, posting and line currencies, and rates), format 8 webhook
+endpoints and format 9 balance monitors and alerts; format 1 and 2
 files, which lack those fields, still load with every account open and at
-the limits its flags give, and format 3 to 7 files, written before
-batches, balancing transfers, hold changes, multi-currency transfers or
-webhooks existed, load as they are; a file older than 6 holding either new entry
+the limits its flags give, and format 3 to 8 files, written before
+batches, balancing transfers, hold changes, multi-currency transfers,
+webhooks or monitors existed, load as they are; a file older than 6 holding either new entry
 kind is refused. A batch result is spread
 over `B` items because thousands of transfers can be more than one frame
 holds. New command kinds in `cmd` records keep
@@ -1498,6 +1501,99 @@ about 640,000 entries/s (185 MB/s) as NDJSON and 690,000 entries/s (154
 MB/s) as CSV, and verifying at about 370,000 entries/s (106 MB/s) for
 NDJSON and 147,000 entries/s (32 MB/s) for CSV.
 
+### Balance monitors
+
+A balance monitor watches one account's `posted`, `pending` or `available`
+balance (signed in the account's normal-balance sense, as the account shows
+it) against a value with `less_than`, `less_than_or_equals`, `equals`,
+`not_equals`, `greater_than_or_equals` or `greater_than`, the conditions
+Modern Treasury's ledger balance monitors offer. Each time a journal entry
+makes the condition true it raises a `triggered` balance alert, and each
+time an entry makes it false again a `cleared` one. Alerts mark crossings,
+not states: creating a monitor whose condition already holds records
+`condition_met: true` and raises nothing, and a balance that stays below a
+threshold raises one alert, not one per entry.
+
+| Command | Issued by | Effect |
+|---|---|---|
+| `create_monitor` | `POST /v1/balance-monitors` | starts watching from the next journal entry, with the condition's current state |
+| `delete_monitor` | `DELETE /v1/balance-monitors/{id}` | stops watching; its alerts stay in the feed |
+
+**Derived as commits apply.** Monitors are ledger state and change only
+through those logged commands. Alerts are not logged at all: `txn.commit`
+derives them under the write lock from the entries it is publishing. It
+walks the batch's history rows (one per journal line, in sequence order,
+each with the account's balance right after its entry) and evaluates the
+monitors on the row's account, in ID order, against that balance. A
+monitor whose state flips is changed in place under the write lock
+(readers copy it under the read lock) and an alert is appended to an
+append-only list. A group commit can hold several commands,
+so each monitor change carries the sequence the next entry would have had
+when its command ran, and commit applies it between exactly those entries:
+a monitor created halfway through a group commit does not see the entries
+before it, and one deleted halfway does not see those after. Replay runs
+one record per transaction and so produces the same alerts in the same
+order; `TestMonitorChangesApplyBetweenTheEntriesOfACommit` runs the same
+commands both ways and compares. Evaluating per row means a batch that
+takes an account below a threshold and back raises both alerts, one per
+entry. Each account's monitors are kept in a slice in ID order next to
+the account map, so an account without monitors costs one map lookup per
+line and one with 1,000 costs 1,000 comparisons.
+
+**What an alert costs.** A stored alert is 24 bytes: a pointer to its
+monitor's definition (one per `create_monitor`, shared by the monitor and
+all its alerts), the entry's sequence, the index of the line, and the
+direction. Everything else the feed shows, the time, transfer, currency
+and balance, is read back from the journal entry and the account's history
+row for that line, which the ledger keeps anyway. A crossing allocates
+nothing beyond its share of the list's growth. `BenchmarkMonitorFanout`
+(4 vCPU 2.1 GHz Xeon VM, in memory) commits one transfer at a time on an
+account with no monitors, with 1,000 monitors none of which cross, and with
+1,000 that all cross on every transfer:
+
+| Monitors on the account | Alerts per transfer | Time per transfer | Allocations | Bytes |
+|---|---|---|---|---|
+| 0 | 0 | 17 to 22 µs | 27 | 4.0 KB |
+| 1,000, none crossing | 0 | 24 to 26 µs | 27 | 4.0 KB |
+| 1,000, all crossing | 1,000 | 83 to 263 µs (83 to 263 ns per alert) | 27 | 127 KB |
+
+The spread in the last row is the garbage collector scanning the growing
+alert list. `BenchmarkAlertFeedPage` reads one page of 1,000 alerts in
+about 150 µs (150 ns per alert, 3 allocations). A first version stored each
+alert fully expanded (about 240 bytes) and made a new monitor version per
+crossing; the all-crossing case then ran out of memory at 20,000 transfers
+(20 million alerts) and made 1,027 allocations per transfer.
+
+**The alert feed.** `GET /v1/balance-alerts?after_seq=&monitor=&account=&limit=`
+pages through alerts by their own sequence number exactly as the journal
+feed pages through entries: `next_after_seq` is the last alert the page
+examined, `has_more` and `head_seq` say whether more were already raised.
+The list is append-only and alerts never change, so a request takes the read
+lock only to note its length and scans with no lock held. Each alert carries
+the monitor, its condition, the account and currency, `event`, the
+`entry_seq` and `transfer_id` that crossed it and the account's full balance
+after that entry, so it can be acted on without another read and lined up
+with the journal feed. `monitor_from_seq` is the monitor's first watched
+entry: a monitor deleted and created again under the same ID starts over,
+and this tells the two apart.
+
+**Recovery and checks.** Snapshots (format 9) carry monitors and alerts, and
+`ledgerd verify` compares both with what replaying the log produces. The
+invariant checker checks that every alert sits on a line of its monitor's
+account, that its direction agrees with the balance the account's history
+holds after that line, the alternation and each monitor's state (item 10
+[below](#what-the-invariant-checker-proves)). Commits that create, delete
+or cross monitors during a check save a copy of what they change into the
+frozen view, as they do for accounts, so freezing stays O(1); the checker
+copies the monitor map once under the read lock. `TestAlertsMatchTheJournal`
+derives the expected alerts from nothing but the journal (folding each
+account's lines and evaluating every monitor after each entry) for the
+reference model's random workloads, with 27 monitors over every field and
+operator, and requires exactly the ledger's list, field for field, after a
+restart from the log and from a snapshot. Those monitors also run through
+the reference-model, power-cut and snapshot-plus-tail tests, where the
+checker and the snapshot-versus-replay comparison cover them.
+
 ## Matching a bank statement
 
 `POST /v1/accounts/{id}/reconcile` takes a CSV statement
@@ -1560,7 +1656,16 @@ a reversal. Dates are UTC.
    expiry, while it was frozen, and a closed account holds nothing;
 9. every webhook endpoint's position and dead letters lie within the
    journal, its version within the versions handed out, and its dead letter
-   IDs increase (see [signed webhooks](#signed-webhooks)).
+   IDs increase (see [signed webhooks](#signed-webhooks));
+10. every balance monitor watches an existing account and says truly
+    whether its condition holds of the balance now, and its alert count and
+    last alert match the alert list; every balance alert names an entry in
+    journal order no earlier than its monitor's first, and a line of that
+    entry on the monitor's account, says triggered exactly when its
+    condition holds of the balance the account's history has after that
+    line, and follows the previous alert of the same monitor with the
+    opposite event (see
+    [balance monitors](#balance-monitors)).
 
 The checker is linear in the journal size, but commits do not wait for it.
 It checks a frozen, copy-on-write view of the committed state as of the
@@ -1711,6 +1816,7 @@ accounts, so all of these also cross power cuts and snapshots.
 | Listing page | 1,000 accounts or transfers, 8 metadata filters, max(16 × limit, 4,096) candidates scanned | Bounds the time a listing holds the read lock. |
 | Log record | 16 MiB | Sized for the largest batch; validation guarantees every accepted command fits (tested). Other commands encode to under 256 KiB. |
 | Group commit | 1,024 commands per fsync | |
+| Balance monitors | 100,000, at most 1,000 per account; description 256 chars | Every line on an account is evaluated against each of its monitors on the writer. |
 | Request deadline | 5 s | A timed-out write may still commit; retry with the key to find out. |
 
 ## Hardening

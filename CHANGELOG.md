@@ -66,6 +66,20 @@ current formats.
   a client that stops reading is cut off. Metrics:
   `ledgerd_exports_total`, `ledgerd_exports_failed_total`,
   `ledgerd_export_entries_total` and `ledgerd_export_bytes_total`.
+- Balance monitors: `POST /v1/balance-monitors` watches an account's
+  `posted`, `pending` or `available` balance with `less_than`,
+  `less_than_or_equals`, `equals`, `not_equals`, `greater_than_or_equals`
+  or `greater_than` a value; `GET` lists or reads them and `DELETE` stops
+  one. Each entry that makes a condition true raises a `triggered` balance
+  alert and each that makes it false a `cleared` one, carrying the entry,
+  transfer and balance after it; `GET /v1/balance-alerts?after_seq=` pages
+  through them like the journal feed, filtered by `monitor=` and
+  `account=`, without holding the state lock. Alerts are derived from each
+  commit's entries in journal order, so replay rebuilds them exactly;
+  monitors and alerts are in snapshots (format 9), compared by
+  `ledgerd verify` and checked by the invariant checker (item 10). Up to
+  100,000 monitors, 1,000 per account. Metrics: `ledgerd_balance_monitors`
+  and `ledgerd_balance_alerts`.
 
 #### Tests
 

@@ -197,6 +197,11 @@ func New(cfg Config) (*Server, error) {
 	s.route("GET /v1/webhooks/{id}", s.getWebhook, authKey)
 	s.route("DELETE /v1/webhooks/{id}", s.deleteWebhook, authKey)
 	s.route("POST /v1/webhooks/{id}/replay", s.replayWebhook, authKey)
+	s.route("POST /v1/balance-monitors", s.createMonitor, authKey)
+	s.route("GET /v1/balance-monitors", s.listMonitors, authKey)
+	s.route("GET /v1/balance-monitors/{id}", s.getMonitor, authKey)
+	s.route("DELETE /v1/balance-monitors/{id}", s.deleteMonitor, authKey)
+	s.route("GET /v1/balance-alerts", s.listAlerts, authKey)
 	s.route("GET /v1/admin/invariants", s.invariants, authAdmin)
 	s.route("/", func(http.ResponseWriter, *http.Request) error {
 		return &apiError{http.StatusNotFound, "not_found", "no such endpoint"}

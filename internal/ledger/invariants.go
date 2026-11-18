@@ -49,6 +49,11 @@ type frozen struct {
 	replaced  map[string]*Transfer
 	hooks     map[string]*Webhook // the endpoints as of head; committed ones never change
 	hookGen   uint64
+	// monSaved holds, for each monitor commit has changed since the view
+	// was taken, a copy as of head (nil when it did not exist). The others
+	// are read live.
+	monSaved map[string]*monState
+	alerts   []alertRec // st.alerts as of head
 }
 
 // accountImage is what commit changes in place on an account.
@@ -78,6 +83,39 @@ func (v *frozen) keepTransfer(tr *Transfer) {
 	if _, ok := v.replaced[tr.ID]; !ok {
 		v.replaced[tr.ID] = tr
 	}
+}
+
+// keepMonitor saves a copy of the monitor filed under id before commit
+// changes, replaces or removes it for the first time since the view was
+// taken. The caller holds the write lock.
+func (v *frozen) keepMonitor(id string, m *monState) {
+	if _, ok := v.monSaved[id]; !ok {
+		var c *monState
+		if m != nil {
+			cp := *m
+			c = &cp
+		}
+		v.monSaved[id] = c
+	}
+}
+
+// frozenMonitors returns copies of the monitors as of head. It reads them
+// under the read lock in one pass, which costs O(monitors).
+func (l *Ledger) frozenMonitors(v *frozen) map[string]monState {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	out := make(map[string]monState, len(v.st.monitors))
+	for id, m := range v.st.monitors {
+		out[id] = *m
+	}
+	for id, m := range v.monSaved {
+		if m == nil {
+			delete(out, id)
+		} else {
+			out[id] = *m
+		}
+	}
+	return out
 }
 
 // account returns an account's definition and its values as of head. The
@@ -118,6 +156,8 @@ func (l *Ledger) freeze() *frozen {
 	for id, h := range st.hooks {
 		v.hooks[id] = h
 	}
+	v.monSaved = map[string]*monState{}
+	v.alerts = st.alerts[:len(st.alerts):len(st.alerts)]
 	st.view = v
 	return v
 }
@@ -161,6 +201,11 @@ func (l *Ledger) step(name string) {
 //  9. every webhook endpoint's position and dead letters lie within the
 //     journal, its version within the versions handed out, and its dead
 //     letter IDs increase.
+//  10. every balance monitor watches an existing account and says truly
+//     whether its condition holds; every balance alert names a line of its
+//     monitor's account, its event agrees with the balance after that
+//     line, and each monitor's alerts alternate between triggered and
+//     cleared.
 //
 // It checks a frozen view of the committed state (see frozen), so commits
 // continue while it runs: they wait for at most one chunk of auditChunk
@@ -520,6 +565,12 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 		bad("open pending count is %d but %d transfers are pending", v.open, open)
 	}
 	hookProblems(v.hooks, v.hookGen, v.head, bad)
+	monitorProblems(l.frozenMonitors(v), v.alerts, v.entries, func(id string) *acctCheck {
+		if k, ok := index[id]; ok {
+			return &accts[k]
+		}
+		return nil
+	}, bad)
 	for i := range accts {
 		a := &accts[i]
 		var r Balance

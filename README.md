@@ -179,6 +179,11 @@ JSON bodies and an optional `Idempotency-Key` header.
 | `GET /v1/webhooks/{id}` | One endpoint with its secret, position and dead letters. |
 | `DELETE /v1/webhooks/{id}` | Remove an endpoint; delivery to it stops. |
 | `POST /v1/webhooks/{id}/replay` | Deliver again: `{"after_seq":N}` moves the position back, `{"dead_letters":[1,2]}` or `{"all_dead_letters":true}` redelivers dead letters. |
+| `POST /v1/balance-monitors` | Watch an account's balance: `{"id","account","condition":{"field","operator","value"}}` with `field` `posted`, `pending` or `available` and `operator` `less_than`, `less_than_or_equals`, `equals`, `not_equals`, `greater_than_or_equals` or `greater_than`; optional `description`. Returns `condition_met` as of now. |
+| `GET /v1/balance-monitors` | Every monitor, `?account=` for one account's, with `alert_head_seq`. |
+| `GET /v1/balance-monitors/{id}` | One monitor: `condition_met`, `alerts` and `last_alert_seq`. |
+| `DELETE /v1/balance-monitors/{id}` | Stop watching; the monitor's alerts stay in the feed. |
+| `GET /v1/balance-alerts` | The balance alert feed: one `triggered` or `cleared` alert each time an entry crosses a monitor's condition, with the entry, transfer and balance after it; `?after_seq=&monitor=&account=&limit=`, paged like the journal feed. |
 | `POST /v1/transfers/{id}/post` | Post a pending transfer: all, `{"amount":n}`, or per-posting amounts. |
 | `POST /v1/transfers/{id}/void` | Release a pending transfer. |
 | `POST /v1/transfers/{id}/increase` | Reserve more on a pending transfer: `{"amount":n}` for two postings, or balanced per-posting `postings`. Checked against limits; balancing holds can't grow. |
@@ -243,6 +248,23 @@ $ curl -s localhost:8080/v1/webhooks -H "$AUTH" -H 'Content-Type: application/js
  "max_batch":100,"version":1,"delivered_through_seq":12,"dead_letters":[],"head_seq":12, ...}
 ```
 
+To hear when a balance crosses a line, put a monitor on it. Every journal
+entry that makes the condition true raises a `triggered` alert and every
+entry that makes it false again a `cleared` one, in a feed of their own
+that pages like the journal feed:
+
+```console
+$ curl -s localhost:8080/v1/balance-monitors -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"id":"float-low","account":"shop","condition":{"field":"available","operator":"less_than","value":10000}}'
+{"id":"float-low","account":"shop","condition":{"field":"available","operator":"less_than","value":10000},
+ "from_seq":13,"condition_met":false,"last_alert_seq":0,"alerts":0, ...}
+$ curl -s "localhost:8080/v1/balance-alerts?after_seq=0" -H "$AUTH"
+{"alerts":[{"seq":1,"time":"...","event":"triggered","monitor":"float-low","monitor_from_seq":13,"account":"shop","currency":"USD",
+  "condition":{...},
+  "entry_seq":14,"transfer_id":"tr_...","balance":{...,"posted":8500,"pending":0,"available":8500}}],
+ "has_more":false,"next_after_seq":1,"head_seq":1}
+```
+
 To hand a period to an accounting system or an auditor, export it. The
 file streams as NDJSON (one entry per line, as the feed returns them) or
 CSV (one row per entry line) and ends in a manifest of counts and running
@@ -289,6 +311,7 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 | Live entry stream | Consumers read history and then live entries over Server-Sent Events, drop, and resume with `Last-Event-ID`, also while 4 clients write, and must see every entry once and in order; a filtered stream hears heartbeats whose ids follow the head; a consumer that never reads is disconnected within the write timeout and its slot freed, which fails without the per-write deadline; a stream outlives the server's read and write timeouts and ends on shutdown. |
 | Webhooks | Real HTTP receivers check every signature: entries from concurrent writers arrive exactly once and in order, filtered endpoints skip what they do not match, failures retry with growing delays under the same delivery ID, timeouts and unreachable endpoints become dead letters that survive restarts and replay, a replay made during a delivery wins over it, positions survive restarts and snapshots while the receiver is down, a delivery whose position the disk failed to log is sent again, and a full dead-letter list holds entries rather than dropping them. Snapshots with every kind of endpoint state are cut at every byte and bit-flipped. |
 | Webhook delivery under faults | The real binary delivers to four endpoints (unfiltered, by account, by kind, one entry per request) behind receivers that answer 503, reset connections before or during the body, accept and never answer, answer after the timeout or stop listening, while it is killed with `SIGKILL` three times under load. Every matching entry must reach every endpoint at least once, in order, identical to the journal and with a valid signature, with no dead letters. |
+| Balance monitors | Alerts derived from the journal alone (folding each account's lines and evaluating every monitor after each entry) must equal the ledger's, field for field, for random reference-model workloads with 27 monitors over every field and operator, and again after a restart from the log and from a snapshot. A batch that dips and recovers raises both alerts; a refused one raises none; monitors created and deleted inside one group commit see exactly the entries between them, as replay does; a monitor recreated under its ID starts over. The checker refuses nine kinds of damage to monitors and alerts, and monitors changed while it runs are checked as of its frozen head. A stored alert is 24 bytes; one transfer crossing 1,000 monitors commits in about 0.1 to 0.26 ms with no extra allocations (`BenchmarkMonitorFanout`). Snapshots with monitors and alerts are cut at every byte and bit-flipped. |
 | Export | Exports in both formats read back to exactly the entries written (no lines, several lines, two currencies, an FX source with a comma, quotes and a newline). Every cut and every flipped bit of a signed export is reported as damaged; a manifest rebuilt and signed with another key, or claiming the trusted key, is refused; out-of-order, repeated, out-of-period and past-the-head entries, wrong counts and a changed CSV header are each reported, and damage is narrowed to the span between two checkpoints. Live heap stays flat (under 10 KiB of growth) across a 110 MiB export. Over HTTP the export equals the journal feed line for line, a client that stops reading is cut off with no manifest while commits carry on, and `ledgerd verify-export` returns its exit codes against files from the real binary, whose key survives a restart. |
 | Reconciliation | The amount-and-date pass is compared with a maximum bipartite matching on random inputs; a worst case of 10,000 lines against 100,000 identical movements must stay fast. |
 | Parsers | Go fuzzing of the decimal amount parser, the log reader, the CSV parser, the export verifier, the transfer, freeze, close and limit endpoints, and the listing and feed query strings with every cursor and position they return followed: accepted input round-trips; nothing returns a 500, breaks an invariant or an index, and no walk repeats an item or fails to end. |

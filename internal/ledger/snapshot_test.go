@@ -141,6 +141,12 @@ func sameState(t testing.TB, what string, a, b *Ledger) {
 	if a.st.hookGen != b.st.hookGen || !reflect.DeepEqual(a.st.hooks, b.st.hooks) {
 		t.Fatalf("%s: webhook endpoints differ: %d and %d", what, len(a.st.hooks), len(b.st.hooks))
 	}
+	if !reflect.DeepEqual(a.st.monitors, b.st.monitors) || !reflect.DeepEqual(a.st.byAccount, b.st.byAccount) {
+		t.Fatalf("%s: balance monitors differ: %d and %d", what, len(a.st.monitors), len(b.st.monitors))
+	}
+	if !reflect.DeepEqual(a.st.alerts, b.st.alerts) {
+		t.Fatalf("%s: balance alerts differ: %d and %d", what, len(a.st.alerts), len(b.st.alerts))
+	}
 	if d := indexDiff(a.st.ix, b.st.ix); d != "" {
 		t.Fatalf("%s: secondary indexes differ: %s", what, d)
 	}
@@ -185,6 +191,9 @@ func randomWorkload(t testing.TB, l *Ledger, clock *fakeClock, r *rand.Rand, ops
 	for _, c := range modelSetup() {
 		l.Do(ctx, c, nil)
 		m.exec(&c, "")
+	}
+	for _, c := range modelMonitors() {
+		l.Do(ctx, c, nil)
 	}
 	for i := 0; i < ops; i++ {
 		if r.Intn(10) == 0 {
@@ -420,6 +429,9 @@ func writeSmallSnapshot(t *testing.T, ver int) (dir string, clock *fakeClock) {
 	}
 	if ver >= 8 {
 		writeSmallWebhooks(t, e)
+	}
+	if ver >= 9 {
+		writeSmallMonitors(t, e)
 	}
 	e.l.Close()
 	if nums := snapshotFiles(t, e.dir); len(nums) != 1 {

@@ -298,7 +298,7 @@ func TestVerifyNewestSnapshotWithoutRecord(t *testing.T) {
 // Damage stops the replay but not the checksums: later segments are still
 // read and reported.
 func TestVerifyKeepsCheckingAfterDamage(t *testing.T) {
-	dir, _ := verifyFixture(t, 512)
+	dir, _ := verifyFixture(t, 256)
 	paths, _ := wal.SegmentPaths(filepath.Join(dir, walDir))
 	if len(paths) < 4 {
 		t.Fatalf("the fixture kept %d segments; the test damages the first and third and needs a sound one after them", len(paths))
@@ -387,18 +387,22 @@ func TestStateDiff(t *testing.T) {
 		return ""
 	}
 	cases := map[string]func(l *Ledger){
-		"journal head":       func(l *Ledger) { l.st.entries = l.st.entries[:len(l.st.entries)-1] },
-		"account a differs":  func(l *Ledger) { l.st.accounts["a"].Metadata = map[string]string{"forged": "yes"} },
-		"accounts, the log":  func(l *Ledger) { delete(l.st.accounts, "a"); delete(l.st.accounts, "b") },
-		"transfer":           func(l *Ledger) { l.st.transfers[anyID(l.st.transfers, "")].Reference = "forged" },
-		"transfers, the log": func(l *Ledger) { delete(l.st.transfers, anyID(l.st.transfers, "")) },
-		"journal entry 1":    func(l *Ledger) { l.st.entries[0].Kind = "forged" },
-		"open pending":       func(l *Ledger) { l.st.open++ },
-		"timeouts differ":    func(l *Ledger) { l.st.expiries = nil },
-		"idempotency key":    func(l *Ledger) { clear(l.idem) },
-		"webhook w differs":  func(l *Ledger) { c := *l.st.hooks["w"]; c.Cursor++; l.st.hooks["w"] = &c },
-		"webhook endpoints":  func(l *Ledger) { delete(l.st.hooks, "w") },
-		"webhook versions":   func(l *Ledger) { l.st.hookGen++ },
+		"journal head":                func(l *Ledger) { l.st.entries = l.st.entries[:len(l.st.entries)-1] },
+		"account a differs":           func(l *Ledger) { l.st.accounts["a"].Metadata = map[string]string{"forged": "yes"} },
+		"accounts, the log":           func(l *Ledger) { delete(l.st.accounts, "a"); delete(l.st.accounts, "b") },
+		"transfer":                    func(l *Ledger) { l.st.transfers[anyID(l.st.transfers, "")].Reference = "forged" },
+		"transfers, the log":          func(l *Ledger) { delete(l.st.transfers, anyID(l.st.transfers, "")) },
+		"journal entry 1":             func(l *Ledger) { l.st.entries[0].Kind = "forged" },
+		"open pending":                func(l *Ledger) { l.st.open++ },
+		"timeouts differ":             func(l *Ledger) { l.st.expiries = nil },
+		"idempotency key":             func(l *Ledger) { clear(l.idem) },
+		"webhook w differs":           func(l *Ledger) { c := *l.st.hooks["w"]; c.Cursor++; l.st.hooks["w"] = &c },
+		"webhook endpoints":           func(l *Ledger) { delete(l.st.hooks, "w") },
+		"webhook versions":            func(l *Ledger) { l.st.hookGen++ },
+		"balance monitor m00 differs": func(l *Ledger) { l.st.monitors["m00"].met = !l.st.monitors["m00"].met },
+		"balance monitors, the log":   func(l *Ledger) { delete(l.st.monitors, "m00") },
+		"balance alert 1 differs":     func(l *Ledger) { l.st.alerts[0].up = !l.st.alerts[0].up },
+		"balance alerts, the log":     func(l *Ledger) { l.st.alerts = l.st.alerts[:len(l.st.alerts)-1] },
 	}
 	l, s, st := load()
 	if d := stateDiff(l, s, st); d != "" {

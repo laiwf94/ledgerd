@@ -361,6 +361,20 @@ func stateDiff(l *Ledger, s *snapshot, st *state) string {
 			}
 		}
 		return fmt.Sprintf("the snapshot holds %d webhook endpoints, the log %d", len(st.hooks), len(l.st.hooks))
+	case !reflect.DeepEqual(l.st.monitors, st.monitors):
+		for id, m := range l.st.monitors {
+			if g, ok := st.monitors[id]; !ok || !reflect.DeepEqual(m, g) {
+				return fmt.Sprintf("balance monitor %s differs", id)
+			}
+		}
+		return fmt.Sprintf("the snapshot holds %d balance monitors, the log %d", len(st.monitors), len(l.st.monitors))
+	case !reflect.DeepEqual(l.st.alerts, st.alerts):
+		for i := range l.st.alerts {
+			if i >= len(st.alerts) || !reflect.DeepEqual(l.st.alerts[i], st.alerts[i]) {
+				return fmt.Sprintf("balance alert %d differs", i+1)
+			}
+		}
+		return fmt.Sprintf("the snapshot holds %d balance alerts, the log %d", len(st.alerts), len(l.st.alerts))
 	}
 	if d := indexDiff(l.st.ix, st.ix); d != "" {
 		return "secondary indexes differ: " + d
