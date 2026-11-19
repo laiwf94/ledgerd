@@ -1856,9 +1856,13 @@ func runModel(t *testing.T, cfg modelRun) error {
 		}
 		release()
 	}
-	segs, _ := wal.SegmentPaths(filepath.Join(path, walDir))
-	if l.log.FirstIndex() == 1 || len(segs) < 2 {
-		t.Errorf("the workload never rolled and dropped segments: first record %d, %d segments", l.log.FirstIndex(), len(segs))
+	// Only sealed segments are dropped, so a first record past 1 means the
+	// log both rolled and dropped. How many segments are left depends on
+	// where the last drop fell: right after one only the active segment
+	// may remain (#83).
+	if first := l.log.FirstIndex(); first == 1 {
+		segs, _ := wal.SegmentPaths(filepath.Join(path, walDir))
+		t.Errorf("the workload never rolled and dropped segments: first record %d, %d segments", first, len(segs))
 	}
 	return nil
 }
