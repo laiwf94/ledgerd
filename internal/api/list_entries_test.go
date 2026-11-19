@@ -210,5 +210,5 @@ func TestEntriesFollowOverHTTP(t *testing.T) {
 
 func fuzzEntrySeeds() []string {
 	return []string{"after_seq=3", "account=a&kind=posted,pending", "kind=extend_pending", "currency=EUR&after_seq=" + strings.Repeat("9", 25),
-		"kind=" + url.QueryEscape("posted,void_pending")}
+		"kind=" + url.QueryEscape("posted,void_pending"), "alerts=only&alert_account=a", "alerts=include&account=b&alert_monitor=m"}
 }

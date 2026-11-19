@@ -28,6 +28,10 @@ import (
 // reconnects sends it back as Last-Event-ID and the stream resumes right
 // after it: no gaps, and no duplicates beyond the at-least-once of a
 // consumer that had not finished processing an event when it dropped.
+// A stream opened with alerts=include or alerts=only carries, in each
+// entry's event, the balance alerts that entry raised, so Last-Event-ID
+// resumes the alerts exactly as it resumes the entries.
+//
 // Heartbeats carry the stream's position as their id too, so a consumer
 // whose filter matched nothing for a while resumes from there instead of
 // rescanning.
@@ -59,7 +63,7 @@ type streams struct {
 	stopOnce  sync.Once
 	open      atomic.Int64
 
-	mEvents, mSlow, mRefused *metrics.Counter
+	mEvents, mAlerts, mSlow, mRefused *metrics.Counter
 }
 
 func newStreams(cfg Config, m *metrics.Registry) *streams {
@@ -77,6 +81,7 @@ func newStreams(cfg Config, m *metrics.Registry) *streams {
 	st.slots = make(chan struct{}, n)
 	m.Gauge("ledgerd_entry_streams", "Open live entry streams.", func() float64 { return float64(st.open.Load()) })
 	st.mEvents = m.Counter("ledgerd_entry_stream_events_total", "", "Entries sent on live entry streams.")
+	st.mAlerts = m.Counter("ledgerd_entry_stream_alerts_total", "", "Balance alerts sent with entries on live entry streams.")
 	st.mSlow = m.Counter("ledgerd_entry_stream_slow_disconnects_total", "", "Entry streams closed because the consumer did not read in time.")
 	st.mRefused = m.Counter("ledgerd_entry_stream_refused_total", "", "Entry streams refused because the stream limit was reached.")
 	return st
@@ -170,12 +175,17 @@ func (s *Server) streamEntries(w http.ResponseWriter, r *http.Request) error {
 			buf.WriteString("id: ")
 			buf.WriteString(strconv.FormatUint(e.Seq, 10))
 			buf.WriteString("\nevent: entry\ndata: ")
-			if err := enc.Encode(e); err != nil { // ends in the newline closing the data line
+			var v any = e
+			if page.Alerts != nil {
+				v = page.Item(i)
+			}
+			if err := enc.Encode(v); err != nil { // ends in the newline closing the data line
 				return nil
 			}
 			buf.WriteByte('\n')
 		}
 		st.mEvents.Add(uint64(len(page.Entries)))
+		st.mAlerts.Add(uint64(page.AlertCount()))
 		after = page.Next
 		if buf.Len() > 0 {
 			if !send() {

@@ -51,6 +51,34 @@ type EntryFilter struct {
 	// Currency matches entries with a line in that currency: an entry in
 	// that currency, or a conversion with that as its other currency.
 	Currency string
+	// Alerts opts in to balance alerts, and AlertMonitor and AlertAccount
+	// narrow the alerts wanted to one monitor or the monitors on one
+	// account. With AlertsInclude the feed selects the entries the fields
+	// above match and, as well, every entry that raised a wanted alert;
+	// with AlertsOnly it selects only entries that raised a wanted alert
+	// and that the fields above match. Either way each selected entry
+	// carries the wanted alerts it raised, so a consumer's position in the
+	// journal is its position in the alerts too.
+	Alerts       AlertMode
+	AlertMonitor string
+	AlertAccount string
+}
+
+// AlertMode says whether a feed carries balance alerts.
+type AlertMode string
+
+// Alert modes.
+const (
+	AlertsOff     AlertMode = ""
+	AlertsInclude AlertMode = "include"
+	AlertsOnly    AlertMode = "only"
+)
+
+func (m AlertMode) valid() bool { return m == AlertsOff || m == AlertsInclude || m == AlertsOnly }
+
+// alertFilter returns the alerts f wants.
+func (f *EntryFilter) alertFilter() AlertFilter {
+	return AlertFilter{Monitor: f.AlertMonitor, Account: f.AlertAccount}
 }
 
 func (k EntryKind) valid() bool {
@@ -76,9 +104,18 @@ func (f *EntryFilter) validate() *Error {
 		}
 	}
 	if f.Currency != "" {
-		return validateCurrency(f.Currency)
+		if err := validateCurrency(f.Currency); err != nil {
+			return err
+		}
 	}
-	return nil
+	if !f.Alerts.valid() {
+		return errf(CodeInvalid, "alerts must be include or only")
+	}
+	if f.Alerts == AlertsOff && (f.AlertMonitor != "" || f.AlertAccount != "") {
+		return errf(CodeInvalid, "alert_monitor and alert_account need alerts set to include or only")
+	}
+	af := f.alertFilter()
+	return af.validate()
 }
 
 // matches reports whether e matches f. quote returns the other currency of
@@ -140,6 +177,11 @@ func (l *Ledger) quoteCurrency(id string) string {
 type EntryPage struct {
 	// Entries are in sequence order and must not be modified.
 	Entries []Entry
+	// Alerts holds, when the filter opted in to alerts, the wanted alerts
+	// each entry raised, in the order they were raised: Alerts[i] belongs
+	// to Entries[i] and is empty for an entry that raised none. It is nil
+	// when the filter did not opt in.
+	Alerts [][]BalanceAlert
 	// Next is the sequence to pass as after for the following page: the
 	// last sequence this page examined, which is at least the last entry
 	// on it. It is never less than the after the page was asked for.
@@ -154,6 +196,45 @@ type EntryPage struct {
 // written when it was read.
 func (p EntryPage) HasMore() bool { return p.Next < p.Head }
 
+// FeedEntry is a journal entry with the balance alerts it raised that the
+// feed opted in to. Without alerts it encodes exactly as the Entry does.
+type FeedEntry struct {
+	Entry
+	Alerts []BalanceAlert `json:"alerts,omitempty"`
+}
+
+// Item returns the page's i-th entry with its alerts.
+func (p EntryPage) Item(i int) FeedEntry {
+	fe := FeedEntry{Entry: p.Entries[i]}
+	if p.Alerts != nil {
+		fe.Alerts = p.Alerts[i]
+	}
+	return fe
+}
+
+// Items returns the page's entries with their alerts.
+func (p EntryPage) Items() []FeedEntry {
+	out := make([]FeedEntry, len(p.Entries))
+	for i := range out {
+		out[i] = p.Item(i)
+	}
+	return out
+}
+
+// AlertCount is the number of alerts the page carries.
+func (p EntryPage) AlertCount() int {
+	n := 0
+	for _, a := range p.Alerts {
+		n += len(a)
+	}
+	return n
+}
+
+// alertYield is how many alerts an alert walk examines without finding a
+// wanted one before it hands the entry it reached to the page anyway, so the
+// page's scan budget bounds the walk.
+var alertYield = 1024
+
 // Entries returns up to limit journal entries matching f with sequence
 // numbers after after, oldest first.
 func (l *Ledger) Entries(f EntryFilter, after uint64, limit int) (EntryPage, error) {
@@ -163,10 +244,16 @@ func (l *Ledger) Entries(f EntryFilter, after uint64, limit int) (EntryPage, err
 	if err := f.validate(); err != nil {
 		return EntryPage{}, err
 	}
-	// Note the journal and, for an account, its history rows. Both are
-	// append-only, so the prefixes stay valid after the lock is released.
+	// Note the journal, the alerts and, for an account, its history rows.
+	// All are append-only, and an alert is appended in the same commit as
+	// the entry that raised it, so the prefixes agree and stay valid after
+	// the lock is released.
 	l.mu.RLock()
 	journal := l.st.entries
+	var alerts []alertRec
+	if f.Alerts != AlertsOff {
+		alerts = l.st.alerts
+	}
 	var rows []row
 	var known bool
 	if f.Account != "" {
@@ -180,55 +267,155 @@ func (l *Ledger) Entries(f EntryFilter, after uint64, limit int) (EntryPage, err
 		return EntryPage{}, errf(CodeInvalid, "after_seq %d is after the newest entry %d", after, head)
 	}
 	page := EntryPage{Next: head, Head: head}
-	if f.Account != "" && !known {
+	if f.Alerts != AlertsOff {
+		page.Alerts = [][]BalanceAlert{}
+	}
+	if f.Account != "" && !known && f.Alerts != AlertsInclude {
 		// No entry so far touches an account that does not exist.
 		return page, nil
 	}
 
+	// The walk visits candidate sequences in increasing order: every entry,
+	// or the account's own rows (one per line, so an entry with two lines on
+	// the account is visited once), or the entries that raised a wanted
+	// alert, or the last two merged.
+	next := l.baseSeqs(rows, f.Account != "", after, head)
+	af := f.alertFilter()
+	firstAlert := sort.Search(len(alerts), func(i int) bool { return alerts[i].entry > after })
+	switch f.Alerts {
+	case AlertsOnly:
+		next = alertSeqs(alerts, firstAlert, &af)
+	case AlertsInclude:
+		if f.Account != "" {
+			next = mergeSeqs(next, alertSeqs(alerts, firstAlert, &af))
+		}
+	}
+	src := alertSource{l: l, journal: journal, accts: map[string]alertAccount{}}
+	ai := firstAlert // the first alert not before the entry being examined
+
 	budget := feedScanBudget(limit)
 	scanned := 0
-	// examine reports whether the walk goes on after the entry at seq.
-	examine := func(seq uint64) bool {
+	for seq, ok := next(); ok; seq, ok = next() {
 		l.feedStep(seq)
 		e := &journal[seq-1]
-		if f.matches(e, l.quoteCurrency) {
+		var raised []BalanceAlert
+		if alerts != nil {
+			for ai < len(alerts) && alerts[ai].entry < seq {
+				ai++
+			}
+			for k := ai; k < len(alerts) && alerts[k].entry == seq; k++ {
+				if af.matches(&alerts[k]) {
+					raised = append(raised, src.expand(uint64(k)+1, &alerts[k]))
+				}
+			}
+		}
+		var match bool
+		switch f.Alerts {
+		case AlertsOff:
+			match = f.matches(e, l.quoteCurrency)
+		case AlertsInclude:
+			match = len(raised) > 0 || f.matches(e, l.quoteCurrency)
+		default:
+			match = len(raised) > 0 && f.matches(e, l.quoteCurrency)
+		}
+		if match {
 			if len(page.Entries) == limit {
 				// A further match exists: the next page starts after the
 				// last entry on this one.
 				page.Next = page.Entries[limit-1].Seq
-				return false
+				return page, nil
 			}
 			page.Entries = append(page.Entries, *e)
+			if page.Alerts != nil {
+				page.Alerts = append(page.Alerts, raised)
+			}
 		}
 		if scanned++; scanned == budget {
 			page.Next = seq
-			return false
-		}
-		return true
-	}
-	if f.Account != "" {
-		// Walk the account's own rows: one per line, so an entry with two
-		// lines on the account (none today) is examined once.
-		i := sort.Search(len(rows), func(i int) bool { return rows[i].seq > after })
-		var last uint64
-		for ; i < len(rows); i++ {
-			seq := rows[i].seq
-			if seq == last {
-				continue
-			}
-			last = seq
-			if !examine(seq) {
-				return page, nil
-			}
-		}
-		return page, nil
-	}
-	for seq := after + 1; seq <= head; seq++ {
-		if !examine(seq) {
 			return page, nil
 		}
 	}
 	return page, nil
+}
+
+// seqIter yields increasing journal sequences, then false.
+type seqIter func() (uint64, bool)
+
+// baseSeqs yields every sequence after after up to head, or with byAccount
+// the distinct sequences of an account's history rows after after.
+func (l *Ledger) baseSeqs(rows []row, byAccount bool, after, head uint64) seqIter {
+	if !byAccount {
+		seq := after
+		return func() (uint64, bool) {
+			if seq >= head {
+				return 0, false
+			}
+			seq++
+			return seq, true
+		}
+	}
+	i := sort.Search(len(rows), func(i int) bool { return rows[i].seq > after })
+	var last uint64
+	return func() (uint64, bool) {
+		for ; i < len(rows); i++ {
+			if seq := rows[i].seq; seq != last {
+				last = seq
+				i++
+				return seq, true
+			}
+		}
+		return 0, false
+	}
+}
+
+// alertSeqs yields the distinct entries, from alerts[from:], that raised an
+// alert f matches. After alertYield alerts in a row that f does not match it
+// yields the entry it has reached as well, so the caller's scan budget also
+// bounds a walk through other monitors' alerts; examining that entry is
+// harmless, since the caller decides for itself whether it matches.
+func alertSeqs(alerts []alertRec, from int, f *AlertFilter) seqIter {
+	i := from
+	var last uint64
+	return func() (uint64, bool) {
+		missed := 0
+		for ; i < len(alerts); i++ {
+			a := &alerts[i]
+			if a.entry == last {
+				continue
+			}
+			if missed++; f.matches(a) || missed > alertYield {
+				last = a.entry
+				i++
+				return a.entry, true
+			}
+		}
+		return 0, false
+	}
+}
+
+// mergeSeqs yields the sequences either iterator yields, once each, in
+// increasing order.
+func mergeSeqs(a, b seqIter) seqIter {
+	av, aok := a()
+	bv, bok := b()
+	return func() (uint64, bool) {
+		switch {
+		case !aok && !bok:
+			return 0, false
+		case aok && (!bok || av < bv):
+			v := av
+			av, aok = a()
+			return v, true
+		case bok && (!aok || bv < av):
+			v := bv
+			bv, bok = b()
+			return v, true
+		}
+		v := av
+		av, aok = a()
+		bv, bok = b()
+		return v, true
+	}
 }
 
 // EntriesGrown returns a channel that is closed once a commit after this

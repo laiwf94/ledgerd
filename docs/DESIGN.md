@@ -580,13 +580,13 @@ order. Items, in file order:
 
 | Tag | Item | Fields |
 |---|---|---|
-| `H` | header, first | `u` format version (9), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys; from format 8 `u` count of webhook endpoints and `u` newest webhook version; from format 9 `u` counts of monitor definitions, balance monitors and balance alerts |
+| `H` | header, first | `u` format version (10), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys; from format 8 `u` count of webhook endpoints and `u` newest webhook version; from format 9 `u` counts of monitor definitions, balance monitors and balance alerts |
 | `A` | account, by ID | `str` ID, `str` currency, `i` exponent, `str` normal balance, `bool` non-negative, `bool` non-positive, from format 7 `bool` exchange, `meta`, `time` created; `i` debits posted, credits posted, debits pending, credits pending; `u` version; `u` count then per status change `u` journal head, `time`, `str` status, `str` reason; `u` count then per limit change `u` journal head, `time`, `str` kind, `i` amount (-1 for none), `str` reason |
 | `T` | transfer, by ID | `str` ID, state, currency; `u` posting count then per posting `str` account, `str` direction, `i` amount, posted, reversed, and from format 7 `str` currency (empty for the transfer's own); `str` reference, `meta`, `time` created, `time` expires, `str` reverses; `u` count then `str` reversal IDs; `u` count then per entry `u` sequence, `str` kind; from format 5 a balancing byte (0 none, else bit 0 `balance_debit`, bit 1 `balance_credit`) followed, when not 0, by `i` requested amount and `i` amount; from format 7 a rate: `bool` set, then if set `str` base, quote, rate and source and `time` quoted, present exactly when a posting names another currency |
 | `E` | journal entry, by sequence from 1 | `u` sequence, `time`, `str` kind, transfer ID, currency; `u` line count then per line `str` account, `str` direction, `i` posted, `i` pending, and from format 7 `str` currency (empty for the entry's own); from format 6 `time` expires, set only on an `extend_pending` entry, which alone has no lines; from format 7 a rate as in `T`, only on the entry that creates a multi-currency transfer and equal to that transfer's |
 | `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result, 8 batch result, 16 error names a batch item, 32 webhook result, 64 monitor result); then if flagged: `str` code and message, and `u` item index if flag 16; an account as in `A` with `u` version, the four totals, `u` as-of sequence, then `str` status, `str` status reason and `time` changed, then `i` overdraft and credit limits (-1 for none) and `u` effective sequence; a transfer as in `T`; `i` count of reservations expired; `u` number of batch transfers if flag 8; then an endpoint as in `W` if flag 32; finally, if flag 64, a monitor: a definition as in `D` followed by the fields of `M` after its definition |
 | `B` | one transfer of a batch result, right after its `I` item, in batch order | a transfer as in `T` |
-| `W` | webhook endpoint, by ID, from format 8 | `str` ID, URL, secret, account filter; `u` count then `str` kinds; `str` currency filter; `u` max batch, `time` created, `u` version, `u` position, `u` next dead letter ID; `u` count then per dead letter `u` ID, after sequence, through sequence, entries, attempts, `str` error, `time` failed, `bool` replaying |
+| `W` | webhook endpoint, by ID, from format 8 | `str` ID, URL, secret, account filter; `u` count then `str` kinds; `str` currency filter; from format 10 `str` alert mode, alert monitor, alert account; `u` max batch, `time` created, `u` version, `u` position, `u` next dead letter ID; `u` count then per dead letter `u` ID, after sequence, through sequence, entries, attempts, `str` error, `time` failed, `bool` replaying |
 | `D` | monitor definition, numbered from 0, from format 9: the live monitors' in ID order, then deleted monitors' in the order of their first alert | `str` ID, account; condition: `str` field, `str` operator, `i` value; `str` description, `time` created, `u` first entry watched |
 | `M` | balance monitor, by ID, from format 9 | `u` its definition; `bool` condition met, `u` last alert, `u` alert count |
 | `L` | balance alert, by sequence from 1, from format 9 | `u` its monitor's definition, `u` entry sequence, `u` index of the entry's line on the monitor's account, `bool` triggered (else cleared) |
@@ -600,7 +600,8 @@ results, format 5 balancing records, format 6 hold increases and
 extensions (`increase_pending` and `extend_pending` entries, and the
 timeout an extension sets), format 7 multi-currency transfers (the
 exchange flag, posting and line currencies, and rates), format 8 webhook
-endpoints and format 9 balance monitors and alerts; format 1 and 2
+endpoints, format 9 balance monitors and alerts and format 10 the alert
+subscriptions of webhook endpoints (older endpoints have none); format 1 and 2
 files, which lack those fields, still load with every account open and at
 the limits its flags give, and format 3 to 8 files, written before
 batches, balancing transfers, hold changes, multi-currency transfers,
@@ -1166,8 +1167,8 @@ for a kind that is one entry in a hundred.
 ### The live entry stream
 
 `GET /v1/entries/stream` (`internal/api/stream.go`) serves the same feed as
-Server-Sent Events, with the same `account=`, `kind=`, `currency=` and
-`after_seq=` parameters (no `limit` or `cursor`). Each journal entry is one
+Server-Sent Events, with the same `account=`, `kind=`, `currency=`,
+`alerts=` and `after_seq=` parameters (no `limit` or `cursor`). Each journal entry is one
 event:
 
 ```text
@@ -1257,7 +1258,9 @@ arriving on a stream waiting at the head, fsync included, takes about
 A webhook endpoint is a URL that ledgerd POSTs journal entries to, in
 sequence order, until the receiver answers 2xx. It is registered with
 `POST /v1/webhooks` under an ID the client picks, with the feed's filters
-(`account`, `kinds`, `currency`), a `max_batch` of 1 to 1,000 entries per
+(`account`, `kinds`, `currency`) and alert subscription (`alerts`,
+`alert_monitor`, `alert_account`, see [balance monitors](#balance-monitors)),
+a `max_batch` of 1 to 1,000 entries per
 delivery (default 100) and an optional `after_seq`: by default delivery
 starts at the journal head, so only new entries are sent; 0 sends the whole
 journal. At most 4,096 endpoints exist at once.
@@ -1576,6 +1579,54 @@ after that entry, so it can be acted on without another read and lined up
 with the journal feed. `monitor_from_seq` is the monitor's first watched
 entry: a monitor deleted and created again under the same ID starts over,
 and this tells the two apart.
+
+**Alerts with their entries.** The journal feed, the live stream and webhook
+endpoints can subscribe to alerts with `alerts=include` or `alerts=only`,
+narrowed by `alert_monitor=` and `alert_account=`. Then every entry they
+send carries, in `alerts`, the wanted alerts it raised, in the order they
+were raised. `only` sends just the entries that raised one (and that the
+entry filters match); `include` sends what the entry filters match and,
+as well, every entry that raised one, so an endpoint filtered on one
+account can still hear of crossings on another. An alert is appended in
+the same commit as the entry that raised it, so a consumer's position in
+the journal is its position in the alerts: a stream resumes them from
+`Last-Event-ID`, and an endpoint's position, dead letters and replays
+(all ranges of journal sequences) cover them with no state of their own.
+The subscription is fixed when an endpoint is created and kept in
+snapshots (format 10), so a replayed dead letter carries exactly the
+alerts it first did.
+
+The feed finds the entries that raised alerts by walking the alert list,
+which is in journal order, next to the entries: `only` walks the alerts
+alone, and `include` with an account filter merges them with the account's
+history rows, so neither scans the journal. A walk that passes 1,024 alerts
+of other monitors in a row hands the entry it has reached to the page,
+which counts it against its scan budget, so a page stays bounded however
+many alerts it skips. Nothing is copied per subscriber; an alert is
+expanded from its 24 bytes only when a page carries it.
+`TestEntriesWithAlertsMatchBruteForce` checks pages against a brute-force
+answer for every mode and a spread of filters, page sizes, budgets and
+yields over random workloads with monitors created and deleted along the
+way, and `TestAlertsRideWithTheirEntries` delivers to real receivers
+across a dead letter, its replay, a full replay and a restart.
+
+`BenchmarkAlertFanout` (4 vCPU 2.1 GHz Xeon VM, in memory, receiver on
+the same machine) commits one entry that crosses a monitor and waits until
+every endpoint subscribed to the account's alerts has accepted it over
+HTTP, signed, and logged its position:
+
+| Subscribers | Deliveries per second | Per delivery | Allocations per delivery | Until all have it, p50 / p99 | The crossing's commit, p50 |
+|---|---|---|---|---|---|
+| 1 | 3,700 to 8,700 | 115 to 270 µs | 167 (17 KB) | 0.07 to 0.13 ms / 0.5 to 4.3 ms | 10 to 16 µs |
+| 100 | 22,000 to 24,000 | 41 to 45 µs | 147 (13 KB) | 3.6 to 4.1 ms / 10 ms | 52 to 59 µs |
+| 1,000 | 25,000 to 27,000 | 37 to 40 µs | 141 (13.5 KB) | 36 ms / 68 to 98 ms | 3.2 ms |
+
+Nearly all of a delivery is the HTTP round trip, the JSON encoding and the
+signature; reading the feed is a small part. The commit of the next
+crossing waits behind the 1,000 `webhook_progress` commands that the
+previous one's deliveries log through the same writer, which is why its
+p50 rises to 3.2 ms with 1,000 subscribers; positions are still logged
+one per delivery.
 
 **Recovery and checks.** Snapshots (format 9) carry monitors and alerts, and
 `ledgerd verify` compares both with what replaying the log produces. The

@@ -34,6 +34,11 @@ import (
 // longest delay instead, so nothing is dropped. Replayed dead letters are
 // redelivered before the worker carries on from its position.
 //
+// An endpoint subscribed to balance alerts reads the feed with its alert
+// subscription, so each entry it delivers carries the alerts that entry
+// raised; the position and dead letters, being journal ranges, cover the
+// alerts with them.
+//
 // Workers hold no queue. They wait on ledger.EntriesGrown at the head and
 // on ledger.WebhooksChanged for changes to their endpoint, so an idle
 // endpoint costs a goroutine and nothing else, and the writer never waits
@@ -84,8 +89,10 @@ type Delivery struct {
 	ID       string `json:"id"`
 	Endpoint string `json:"endpoint"`
 	// Replay is set on a redelivered dead letter.
-	Replay  bool           `json:"replay,omitempty"`
-	Entries []ledger.Entry `json:"entries"`
+	Replay bool `json:"replay,omitempty"`
+	// Entries carry the balance alerts they raised when the endpoint opted
+	// in to alerts.
+	Entries []ledger.FeedEntry `json:"entries"`
 }
 
 // Dispatcher delivers entries to every registered endpoint until Close.
@@ -99,8 +106,8 @@ type Dispatcher struct {
 	mu      sync.Mutex
 	workers map[string]context.CancelFunc
 
-	mOK, mFailed, mDead, mEntries, mRedelivered *metrics.Counter
-	mAttempt                                    *metrics.Histogram
+	mOK, mFailed, mDead, mEntries, mAlerts, mRedelivered *metrics.Counter
+	mAttempt                                             *metrics.Histogram
 }
 
 // Start starts delivering to the ledger's endpoints.
@@ -141,6 +148,7 @@ func Start(o Options) (*Dispatcher, error) {
 	d.mDead = m.Counter("ledgerd_webhook_dead_letters_total", "", "Webhook deliveries given up on after every attempt.")
 	d.mRedelivered = m.Counter("ledgerd_webhook_redeliveries_total", "", "Dead letters delivered by a replay.")
 	d.mEntries = m.Counter("ledgerd_webhook_entries_delivered_total", "", "Journal entries in accepted webhook deliveries.")
+	d.mAlerts = m.Counter("ledgerd_webhook_alerts_delivered_total", "", "Balance alerts in accepted webhook deliveries.")
 	d.mAttempt = m.Histogram("ledgerd_webhook_attempt_duration_seconds", "", "Time for one webhook delivery attempt.")
 	m.Gauge("ledgerd_webhook_endpoints", "Registered webhook endpoints.", func() float64 { return float64(len(d.l.Webhooks())) })
 	m.Gauge("ledgerd_webhook_backlog_entries", "Journal entries after each endpoint's position, summed over endpoints.", func() float64 {
@@ -255,7 +263,7 @@ func (w *worker) run() {
 			continue
 		}
 		last := page.Entries[len(page.Entries)-1].Seq
-		attempts, ok, derr := w.deliver(h, page.Entries, false)
+		attempts, ok, derr := w.deliver(h, page.Items(), false)
 		switch {
 		case ok:
 			w.progress(&ledger.WebhookProgressSpec{ID: h.ID, Version: h.Version, Through: page.Next})
@@ -282,7 +290,7 @@ func replaying(h *ledger.Webhook) *ledger.DeadLetter {
 // redeliver sends a dead letter's entries again: the entries matching the
 // endpoint's filter in its range, which the journal still holds unchanged.
 func (w *worker) redeliver(h *ledger.Webhook, dl *ledger.DeadLetter) {
-	var entries []ledger.Entry
+	var entries []ledger.FeedEntry
 	after := dl.AfterSeq
 	for after < dl.ThroughSeq {
 		page, err := w.d.l.Entries(h.Filter(), after, h.MaxBatch)
@@ -291,9 +299,9 @@ func (w *worker) redeliver(h *ledger.Webhook, dl *ledger.DeadLetter) {
 			w.sleep(w.d.o.BackoffBase, h.Version)
 			return
 		}
-		for _, e := range page.Entries {
+		for i, e := range page.Entries {
 			if e.Seq <= dl.ThroughSeq {
-				entries = append(entries, e)
+				entries = append(entries, page.Item(i))
 			}
 		}
 		after = page.Next
@@ -343,7 +351,7 @@ func (w *worker) progress(p *ledger.WebhookProgressSpec) {
 // failed. It returns the number of attempts, whether the receiver accepted
 // them, and the last error. With neither ok nor an error, the delivery
 // was abandoned: the worker is stopping or the endpoint changed.
-func (w *worker) deliver(h *ledger.Webhook, entries []ledger.Entry, replay bool) (int, bool, error) {
+func (w *worker) deliver(h *ledger.Webhook, entries []ledger.FeedEntry, replay bool) (int, bool, error) {
 	id := fmt.Sprintf("%s.%d.%d", h.ID, entries[0].Seq, entries[len(entries)-1].Seq)
 	body, err := json.Marshal(Delivery{ID: id, Endpoint: h.ID, Replay: replay, Entries: entries})
 	if err != nil {
@@ -354,6 +362,11 @@ func (w *worker) deliver(h *ledger.Webhook, entries []ledger.Entry, replay bool)
 		if err == nil {
 			w.d.mOK.Inc()
 			w.d.mEntries.Add(uint64(len(entries)))
+			alerts := 0
+			for i := range entries {
+				alerts += len(entries[i].Alerts)
+			}
+			w.d.mAlerts.Add(uint64(alerts))
 			return attempt, true, nil
 		}
 		if w.ctx.Err() != nil {

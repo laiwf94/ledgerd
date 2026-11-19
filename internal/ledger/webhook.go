@@ -51,12 +51,19 @@ type Webhook struct {
 	Secret string `json:"secret,omitempty"`
 	// Account, Kinds and Currency filter the entries delivered, as in the
 	// journal feed.
-	Account   string      `json:"account,omitempty"`
-	Kinds     []EntryKind `json:"kinds,omitempty"`
-	Currency  string      `json:"currency,omitempty"`
-	MaxBatch  int         `json:"max_batch"`
-	CreatedAt time.Time   `json:"created_at"`
-	Version   uint64      `json:"version"`
+	Account  string      `json:"account,omitempty"`
+	Kinds    []EntryKind `json:"kinds,omitempty"`
+	Currency string      `json:"currency,omitempty"`
+	// Alerts, AlertMonitor and AlertAccount opt the endpoint in to balance
+	// alerts, as in the journal feed: each delivered entry carries the
+	// alerts it raised, so the position, dead letters and replays cover
+	// alerts exactly as they cover entries.
+	Alerts       AlertMode `json:"alerts,omitempty"`
+	AlertMonitor string    `json:"alert_monitor,omitempty"`
+	AlertAccount string    `json:"alert_account,omitempty"`
+	MaxBatch     int       `json:"max_batch"`
+	CreatedAt    time.Time `json:"created_at"`
+	Version      uint64    `json:"version"`
 	// Cursor is the last journal sequence the endpoint has dealt with.
 	Cursor      uint64       `json:"delivered_through_seq"`
 	DeadLetters []DeadLetter `json:"dead_letters"`
@@ -66,7 +73,8 @@ type Webhook struct {
 
 // Filter returns the endpoint's entry filter.
 func (h *Webhook) Filter() EntryFilter {
-	return EntryFilter{Account: h.Account, Kinds: h.Kinds, Currency: h.Currency}
+	return EntryFilter{Account: h.Account, Kinds: h.Kinds, Currency: h.Currency, Alerts: h.Alerts, AlertMonitor: h.AlertMonitor,
+		AlertAccount: h.AlertAccount}
 }
 
 // DeadLetter is a delivery the dispatcher gave up on: the entries matching
@@ -96,8 +104,12 @@ type WebhookSpec struct {
 	Account  string      `json:"account,omitempty"`
 	Kinds    []EntryKind `json:"kinds,omitempty"`
 	Currency string      `json:"currency,omitempty"`
-	MaxBatch int         `json:"max_batch,omitempty"`
-	AfterSeq *uint64     `json:"after_seq,omitempty"`
+	// Alerts, AlertMonitor and AlertAccount opt in to balance alerts.
+	Alerts       AlertMode `json:"alerts,omitempty"`
+	AlertMonitor string    `json:"alert_monitor,omitempty"`
+	AlertAccount string    `json:"alert_account,omitempty"`
+	MaxBatch     int       `json:"max_batch,omitempty"`
+	AfterSeq     *uint64   `json:"after_seq,omitempty"`
 }
 
 // WebhookRef names an endpoint, to delete it.
@@ -189,7 +201,8 @@ func (s *WebhookSpec) validate() *Error {
 	if !validSecret(s.Secret) {
 		return errf(CodeInvalid, "secret must be %d to %d printable ASCII characters without spaces", MinWebhookSecret, MaxWebhookSecret)
 	}
-	f := EntryFilter{Account: s.Account, Kinds: s.Kinds, Currency: s.Currency}
+	f := EntryFilter{Account: s.Account, Kinds: s.Kinds, Currency: s.Currency, Alerts: s.Alerts, AlertMonitor: s.AlertMonitor,
+		AlertAccount: s.AlertAccount}
 	if err := f.validate(); err != nil {
 		return err
 	}
@@ -325,7 +338,7 @@ func (t *txn) createWebhook(s *WebhookSpec) (Outcome, *Error) {
 		cursor = *s.AfterSeq
 	}
 	h := &Webhook{ID: s.ID, URL: s.URL, Secret: s.Secret, Account: s.Account, Kinds: slices.Clone(s.Kinds), Currency: s.Currency,
-		MaxBatch: s.MaxBatch, CreatedAt: t.now, Cursor: cursor, DeadLetters: []DeadLetter{}, NextDeadLetter: 1}
+		Alerts: s.Alerts, AlertMonitor: s.AlertMonitor, AlertAccount: s.AlertAccount, MaxBatch: s.MaxBatch, CreatedAt: t.now, Cursor: cursor, DeadLetters: []DeadLetter{}, NextDeadLetter: 1}
 	t.putHook(s.ID, h)
 	return Outcome{Webhook: h}, nil
 }

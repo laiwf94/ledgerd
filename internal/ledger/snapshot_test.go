@@ -433,6 +433,9 @@ func writeSmallSnapshot(t *testing.T, ver int) (dir string, clock *fakeClock) {
 	if ver >= 9 {
 		writeSmallMonitors(t, e)
 	}
+	if ver >= 10 {
+		writeSmallAlertHooks(t, e)
+	}
 	e.l.Close()
 	if nums := snapshotFiles(t, e.dir); len(nums) != 1 {
 		t.Fatalf("snapshots %v", nums)

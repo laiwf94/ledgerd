@@ -72,7 +72,7 @@ func TestWebhookSnapshotRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	for _, l := range []*Ledger{fromSnap, full} {
 		hooks := l.Webhooks()
-		if len(hooks) != 2 || hooks[0].ID != "all" || hooks[1].ID != "orders" {
+		if len(hooks) != 3 || hooks[0].ID != "all" || hooks[1].ID != "orders" || hooks[2].ID != "reserve-alerts" {
 			t.Fatalf("webhooks %+v", hooks)
 		}
 		all := hooks[0]
@@ -115,8 +115,12 @@ func TestWebhookSnapshotRoundTrip(t *testing.T) {
 	}
 	// A new version continues from the counter the snapshot kept.
 	h, _ := fromSnap.Webhook("orders")
+	var newest uint64
+	for _, w := range fromSnap.Webhooks() {
+		newest = max(newest, w.Version)
+	}
 	out, err := fromSnap.Do(ctx, progressCmd("orders", h.Version, 4, nil), nil)
-	if err != nil || out.Webhook.Version != h.Version+1 {
+	if err != nil || out.Webhook.Version != newest+1 {
 		t.Fatalf("progress after loading: %v %+v", err, out.Webhook)
 	}
 }

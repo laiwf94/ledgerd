@@ -17,8 +17,14 @@ type webhookBody struct {
 	Account  string             `json:"account,omitempty"`
 	Kinds    []ledger.EntryKind `json:"kinds,omitempty"`
 	Currency string             `json:"currency,omitempty"`
-	MaxBatch int                `json:"max_batch,omitempty"`
-	AfterSeq *uint64            `json:"after_seq,omitempty"`
+	// Alerts (include or only), AlertMonitor and AlertAccount opt the
+	// endpoint in to balance alerts, carried with the entries that raised
+	// them.
+	Alerts       ledger.AlertMode `json:"alerts,omitempty"`
+	AlertMonitor string           `json:"alert_monitor,omitempty"`
+	AlertAccount string           `json:"alert_account,omitempty"`
+	MaxBatch     int              `json:"max_batch,omitempty"`
+	AfterSeq     *uint64          `json:"after_seq,omitempty"`
 }
 
 // webhookSummary is an endpoint in a listing: no secret, and the number of
@@ -29,6 +35,9 @@ type webhookSummary struct {
 	Account         string             `json:"account,omitempty"`
 	Kinds           []ledger.EntryKind `json:"kinds,omitempty"`
 	Currency        string             `json:"currency,omitempty"`
+	Alerts          ledger.AlertMode   `json:"alerts,omitempty"`
+	AlertMonitor    string             `json:"alert_monitor,omitempty"`
+	AlertAccount    string             `json:"alert_account,omitempty"`
 	MaxBatch        int                `json:"max_batch"`
 	CreatedAt       time.Time          `json:"created_at"`
 	Version         uint64             `json:"version"`
@@ -49,7 +58,8 @@ func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	spec := ledger.WebhookSpec{ID: body.ID, URL: body.URL, Secret: body.Secret, Account: body.Account, Kinds: body.Kinds,
-		Currency: body.Currency, MaxBatch: body.MaxBatch, AfterSeq: body.AfterSeq}
+		Currency: body.Currency, Alerts: body.Alerts, AlertMonitor: body.AlertMonitor, AlertAccount: body.AlertAccount,
+		MaxBatch: body.MaxBatch, AfterSeq: body.AfterSeq}
 	if spec.Secret == "" {
 		spec.Secret = webhook.NewSecret()
 	}
@@ -63,8 +73,9 @@ func (s *Server) listWebhooks(w http.ResponseWriter, r *http.Request) error {
 	hooks := s.l.Webhooks()
 	out := make([]webhookSummary, len(hooks))
 	for i, h := range hooks {
-		out[i] = webhookSummary{ID: h.ID, URL: h.URL, Account: h.Account, Kinds: h.Kinds, Currency: h.Currency, MaxBatch: h.MaxBatch,
-			CreatedAt: h.CreatedAt, Version: h.Version, Cursor: h.Cursor, DeadLetterCount: len(h.DeadLetters)}
+		out[i] = webhookSummary{ID: h.ID, URL: h.URL, Account: h.Account, Kinds: h.Kinds, Currency: h.Currency,
+			Alerts: h.Alerts, AlertMonitor: h.AlertMonitor, AlertAccount: h.AlertAccount, MaxBatch: h.MaxBatch, CreatedAt: h.CreatedAt,
+			Version: h.Version, Cursor: h.Cursor, DeadLetterCount: len(h.DeadLetters)}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"webhooks": out, "head_seq": s.l.Head()})
 	return nil

@@ -80,6 +80,17 @@ current formats.
   `ledgerd verify` and checked by the invariant checker (item 10). Up to
   100,000 monitors, 1,000 per account. Metrics: `ledgerd_balance_monitors`
   and `ledgerd_balance_alerts`.
+- Balance alerts through the feed, the live stream and webhooks:
+  `alerts=include` or `alerts=only` (with `alert_monitor=` and
+  `alert_account=`) on `GET /v1/entries`, `GET /v1/entries/stream` and
+  `POST /v1/webhooks` makes every entry sent carry the alerts it raised.
+  Positions, `Last-Event-ID`, dead letters and replays are journal ranges,
+  so they cover alerts with nothing extra stored. Webhook endpoints keep
+  their subscription in snapshots (format 10; format 9 files still load,
+  with none). Metrics: `ledgerd_webhook_alerts_delivered_total` and
+  `ledgerd_entry_stream_alerts_total`. `BenchmarkAlertFanout` delivers each
+  alert to 1,000 subscribed endpoints at about 26,000 signed HTTP
+  deliveries per second on 4 vCPUs.
 
 #### Tests
 

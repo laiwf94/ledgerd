@@ -220,25 +220,34 @@ func (s *Server) listEntries(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	resp := struct {
-		Entries      []ledger.Entry `json:"entries"`
-		HasMore      bool           `json:"has_more"`
-		NextAfterSeq uint64         `json:"next_after_seq"`
-		HeadSeq      uint64         `json:"head_seq"`
+		Entries      any    `json:"entries"`
+		HasMore      bool   `json:"has_more"`
+		NextAfterSeq uint64 `json:"next_after_seq"`
+		HeadSeq      uint64 `json:"head_seq"`
 	}{Entries: page.Entries, HasMore: page.HasMore(), NextAfterSeq: page.Next, HeadSeq: page.Head}
-	if resp.Entries == nil {
+	switch {
+	case page.Alerts != nil:
+		// Each entry with the alerts it raised.
+		resp.Entries = page.Items()
+	case page.Entries == nil:
 		resp.Entries = []ledger.Entry{}
 	}
 	writeJSON(w, http.StatusOK, resp)
 	return nil
 }
 
-// parseEntryQuery reads the journal feed's query string: after_seq and the
-// account, kind and currency filters, plus limit when paged is set. The live
+// parseEntryQuery reads the journal feed's query string: after_seq, the
+// account, kind and currency filters and the alerts subscription
+// (alerts=include|only, alert_monitor, alert_account), plus limit when paged is set. The live
 // stream sends what it has, so it takes no limit.
 func parseEntryQuery(r *http.Request, paged bool) (ledger.EntryFilter, uint64, int, error) {
 	var f ledger.EntryFilter
 	q, err := parseListQuery(r, func(name string) bool {
-		return name == "after_seq" || name == "account" || name == "kind" || name == "currency"
+		switch name {
+		case "after_seq", "account", "kind", "currency", "alerts", "alert_monitor", "alert_account":
+			return true
+		}
+		return false
 	})
 	if err != nil {
 		return f, 0, 0, err
@@ -271,6 +280,12 @@ func parseEntryQuery(r *http.Request, paged bool) (ledger.EntryFilter, uint64, i
 			f.Kinds = kinds
 		case "currency":
 			f.Currency = v
+		case "alerts":
+			f.Alerts = ledger.AlertMode(v)
+		case "alert_monitor":
+			f.AlertMonitor = v
+		case "alert_account":
+			f.AlertAccount = v
 		}
 	}
 	return f, after, q.limit, nil

@@ -66,8 +66,9 @@ const (
 	// webhook endpoints, with their positions and dead letters, and the
 	// endpoint a keyed webhook command returned. Older versions hold none.
 	// Version 9 adds balance monitors and the balance alerts raised so far,
-	// and the monitor a keyed monitor command returned.
-	snapVersion    = 9
+	// and the monitor a keyed monitor command returned. Version 10 adds a
+	// webhook endpoint's alert subscription; older endpoints have none.
+	snapVersion    = 10
 	snapPrefix     = "snapshot-"
 	snapSuffix     = ".snap"
 	snapTmpSuffix  = ".tmp"
@@ -426,6 +427,11 @@ func (w *snapWriter) hook(h *Webhook) {
 		w.str(string(k))
 	}
 	w.str(h.Currency)
+	if w.ver >= 10 {
+		w.str(string(h.Alerts))
+		w.str(h.AlertMonitor)
+		w.str(h.AlertAccount)
+	}
 	w.u(uint64(h.MaxBatch))
 	w.when(h.CreatedAt)
 	w.u(h.Version)
@@ -1169,6 +1175,9 @@ func (r *snapReader) hook(gen, head uint64) *Webhook {
 		h.Kinds = append(h.Kinds, r.kind())
 	}
 	h.Currency = r.str()
+	if r.ver >= 10 {
+		h.Alerts, h.AlertMonitor, h.AlertAccount = AlertMode(r.str()), r.str(), r.str()
+	}
 	h.MaxBatch = int(min(r.u(), MaxWebhookBatch+1))
 	h.CreatedAt = r.when()
 	h.Version, h.Cursor, h.NextDeadLetter = r.u(), r.u(), r.u()
@@ -1194,7 +1203,8 @@ func (r *snapReader) hook(gen, head uint64) *Webhook {
 	if r.err != nil {
 		return nil
 	}
-	spec := WebhookSpec{ID: h.ID, URL: h.URL, Secret: h.Secret, Account: h.Account, Kinds: h.Kinds, Currency: h.Currency, MaxBatch: h.MaxBatch}
+	spec := WebhookSpec{ID: h.ID, URL: h.URL, Secret: h.Secret, Account: h.Account, Kinds: h.Kinds, Currency: h.Currency,
+		Alerts: h.Alerts, AlertMonitor: h.AlertMonitor, AlertAccount: h.AlertAccount, MaxBatch: h.MaxBatch}
 	switch {
 	case h.MaxBatch < 1:
 		r.fail("webhook %s has max_batch %d", h.ID, h.MaxBatch)
