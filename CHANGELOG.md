@@ -91,6 +91,14 @@ current formats.
   `ledgerd_entry_stream_alerts_total`. `BenchmarkAlertFanout` delivers each
   alert to 1,000 subscribed endpoints at about 26,000 signed HTTP
   deliveries per second on 4 vCPUs.
+- `examples/webhook`: a webhook receiver in standard-library Go that
+  verifies each signature (several secrets during a rotation, a five-minute
+  timestamp tolerance), appends the entries it does not yet hold to an
+  NDJSON file and fsyncs it before answering 200, and on start cuts off a
+  last line a crash left half written, so each entry is applied exactly
+  once across crashes of the receiver and the server, replayed dead letters
+  included. Documented in the README and in DESIGN.md under signed
+  webhooks.
 
 #### Tests
 
@@ -105,6 +113,13 @@ current formats.
   in order per endpoint and identical to the journal, with valid signatures
   and stable delivery IDs, no dead letters and every acknowledged request
   still held.
+- `TestWebhookExampleReceiverAcrossCrashes` builds `examples/webhook` and
+  runs it against the real binary under load, killing the receiver with
+  `SIGKILL` mid-delivery and keeping it down until a delivery is
+  dead-lettered, then killing the server, three times, while forged
+  deliveries are refused with 401. After the dead letters are replayed its
+  file must hold every journal entry exactly once, identical to the feed,
+  and a full redelivery from position 0 must apply nothing.
 
 #### Fixed
 

@@ -248,6 +248,20 @@ $ curl -s localhost:8080/v1/webhooks -H "$AUTH" -H 'Content-Type: application/js
  "max_batch":100,"version":1,"delivered_through_seq":12,"dead_letters":[],"head_seq":12, ...}
 ```
 
+[`examples/webhook`](examples/webhook/main.go) is a complete receiver in
+about 400 lines of standard-library Go: it checks each signature, appends
+the entries it has not seen to an NDJSON file and fsyncs it before
+answering 200, skips entries it already holds, and on start cuts off a line
+a crash left half written. That turns at-least-once delivery into each
+entry applied exactly once, across crashes of the receiver and the server:
+
+```console
+$ go run ./examples/webhook -addr 127.0.0.1:9090 -secret "$SECRET" -out entries.ndjson
+{"time":"...","level":"INFO","msg":"recovered","file":"entries.ndjson","entries":0,"highest_seq":0,"truncated_bytes":0}
+{"time":"...","level":"INFO","msg":"listening","addr":"127.0.0.1:9090","path":"/hook"}
+{"time":"...","level":"INFO","msg":"delivery","delivery":"payouts.13.37","endpoint":"payouts","replay":false,"entries":25,"applied":25,"duplicates":0}
+```
+
 To hear when a balance crosses a line, put a monitor on it. Every journal
 entry that makes the condition true raises a `triggered` alert and every
 entry that makes it false again a `cleared` one, in a feed of their own
@@ -326,6 +340,7 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 | Live entry stream | Consumers read history and then live entries over Server-Sent Events, drop, and resume with `Last-Event-ID`, also while 4 clients write, and must see every entry once and in order; a filtered stream hears heartbeats whose ids follow the head; a consumer that never reads is disconnected within the write timeout and its slot freed, which fails without the per-write deadline; a stream outlives the server's read and write timeouts and ends on shutdown. |
 | Webhooks | Real HTTP receivers check every signature: entries from concurrent writers arrive exactly once and in order, filtered endpoints skip what they do not match, failures retry with growing delays under the same delivery ID, timeouts and unreachable endpoints become dead letters that survive restarts and replay, a replay made during a delivery wins over it, positions survive restarts and snapshots while the receiver is down, a delivery whose position the disk failed to log is sent again, and a full dead-letter list holds entries rather than dropping them. Snapshots with every kind of endpoint state are cut at every byte and bit-flipped. |
 | Webhook delivery under faults | The real binary delivers to four endpoints (unfiltered, by account, by kind, one entry per request) behind receivers that answer 503, reset connections before or during the body, accept and never answer, answer after the timeout or stop listening, while it is killed with `SIGKILL` three times under load. Every matching entry must reach every endpoint at least once, in order, identical to the journal and with a valid signature, with no dead letters. |
+| Webhook receiver example | `examples/webhook`, built and run as a separate process, receives from the real binary while writers post transfers; each of three rounds kills the receiver with `SIGKILL` mid-delivery, keeps it down until a delivery is dead-lettered, restarts it on its file and then kills the server. Forged deliveries (wrong secret, stale timestamp, tampered body, no signature) are refused with 401 throughout. After the dead letters are replayed its file must hold every journal entry exactly once, identical to the feed and in order apart from the replayed ranges, and moving the position back to 0 must redeliver the whole journal without applying anything. The example's own tests check its verifier against the server's signer and cut its file at a torn last line. |
 | Balance monitors | Alerts derived from the journal alone (folding each account's lines and evaluating every monitor after each entry) must equal the ledger's, field for field, for random reference-model workloads with 27 monitors over every field and operator, and again after a restart from the log and from a snapshot. A batch that dips and recovers raises both alerts; a refused one raises none; monitors created and deleted inside one group commit see exactly the entries between them, as replay does; a monitor recreated under its ID starts over. The checker refuses nine kinds of damage to monitors and alerts, and monitors changed while it runs are checked as of its frozen head. Feeds, streams and webhook endpoints subscribed to alerts must carry, on every entry, exactly the alerts brute force finds for it, for every mode and filter, page size and scan budget; real receivers get each alert with its entry across a dead letter, its replay, a full replay and a restart. A stored alert is 24 bytes; one transfer crossing 1,000 monitors commits in about 0.1 to 0.26 ms with no extra allocations (`BenchmarkMonitorFanout`). Snapshots with monitors and alerts are cut at every byte and bit-flipped. |
 | Export | Exports in both formats read back to exactly the entries written (no lines, several lines, two currencies, an FX source with a comma, quotes and a newline). Every cut and every flipped bit of a signed export is reported as damaged; a manifest rebuilt and signed with another key, or claiming the trusted key, is refused; out-of-order, repeated, out-of-period and past-the-head entries, wrong counts and a changed CSV header are each reported, and damage is narrowed to the span between two checkpoints. Live heap stays flat (under 10 KiB of growth) across a 110 MiB export. Over HTTP the export equals the journal feed line for line, a client that stops reading is cut off with no manifest while commits carry on, and `ledgerd verify-export` returns its exit codes against files from the real binary, whose key survives a restart. |
 | Reconciliation | The amount-and-date pass is compared with a maximum bipartite matching on random inputs; a worst case of 10,000 lines against 100,000 identical movements must stay fast. |
@@ -384,6 +399,7 @@ internal/webhook   webhook dispatcher: signed deliveries, retries with backoff, 
 internal/api       HTTP API, auth, errors, logging, metrics wiring
 internal/metrics   Prometheus text exposition
 examples/demo.sh   walkthrough against a running server
+examples/webhook   webhook receiver: verifies signatures, applies each entry once across crashes
 ```
 
 ## License

@@ -1329,7 +1329,8 @@ command means the same entries are sent again; nothing is ever skipped.
 Delivery is therefore at least once and, per endpoint, in sequence order;
 a receiver that must not apply an entry twice keeps the highest sequence it
 has applied and ignores entries at or below it (a replay, flagged `"replay":
-true`, is the one deliberate exception). A filtered endpoint whose filter
+true`, is the one deliberate exception, handled by the example receiver
+below). A filtered endpoint whose filter
 matches nothing still has its position logged once its scan runs 4,096
 entries ahead, so a restart does not rescan a long unmatched stretch.
 
@@ -1419,6 +1420,60 @@ one that treats a 503 as delivered, one that logs one entry past what it
 delivered, and one that resumes from the head instead of its logged
 position after a restart. The test takes about 6 s, or 12 to 14 s under
 `-race`.
+
+**The example receiver.** `examples/webhook` shows the receiving side in
+standard-library Go alone, so the code can be lifted into any service. It
+verifies the signature before parsing the body (a wrong secret, a tampered
+body, a missing header and a timestamp more than `-tolerance`, five
+minutes, from its clock are each a 401), checks that the `Ledgerd-Webhook-Id`
+header names the body's delivery, and accepts several `-secret` values
+during a rotation. It records what it has applied in an append-only NDJSON
+file of the entries themselves, the format of the feed and the export:
+
+1. the entries of a delivery whose sequences it does not hold are
+   compacted to one line each and appended in one write;
+2. the file is fsynced, and only then are those sequences counted as held
+   and the delivery answered 200; a failed write is truncated away and
+   answered 500 so the server retries, and a failed fsync stops the
+   process, since what reached the disk is then unknown;
+3. on start it reads the file back into the set of held sequences. A last
+   line without its newline or that is not an entry was cut short by a
+   crash before its fsync, so it was never answered and will be sent again:
+   it is truncated away. Damage anywhere else, or a sequence held twice,
+   stops the receiver rather than being guessed at.
+
+Within an endpoint entries arrive in order, so skipping every entry at or
+below the highest applied would be enough for ordinary deliveries. A
+replayed dead letter breaks that: it comes after later entries, and may
+hold entries the receiver applied when its answer was lost. Keeping the
+set of held sequences (8 bytes each here; a unique key in a real service's
+database) covers both, and a real service applies the entry and records
+its sequence in one transaction instead of a file.
+
+`TestWebhookExampleReceiverAcrossCrashes` (`cmd/ledgerd`) builds the
+example and runs it as a separate process receiving from the real binary
+(`max_batch` 25, `LEDGERD_WEBHOOK_MAX_ATTEMPTS=4`) while three writers post
+transfers. In each of three rounds the receiver is killed with `SIGKILL`
+after applying at least 100 new entries, so deliveries are in flight, and
+kept down until the server has dead-lettered a delivery; it is restarted on
+its file, forged deliveries are sent to it, and once it has applied 100
+more the server is killed with `SIGKILL` too. After a last restart the
+endpoint must reach the head, the dead letters are replayed until none is
+left, and the file is held against the feed: every journal entry exactly
+once, each identical to the feed's, and in sequence order apart from
+entries inside a replayed dead letter's range. Then a replay with
+`after_seq` 0 sends the whole journal again as ordinary deliveries: the
+receiver must report every entry as a duplicate, apply none, and leave its
+file byte for byte unchanged. Every refusal it logged must be one of the
+16 forged deliveries, all 401, and a SIGTERM must stop it cleanly with the
+journal's entry count. A receiver that does not skip duplicates fails at
+its next start (an entry held twice), and one that skips everything at or
+below its highest sequence, replays included, loses the dead letters'
+entries. The test takes about 1 s, 5 s under `-race`. The example's own
+tests check its verifier against `webhook.Sign` and `webhook.Verify` for
+18 headers, apply overlapping, repeated and replayed deliveries once, cut
+four kinds of torn last line, and refuse to open three kinds of damaged
+file.
 
 ### Exporting a period
 
