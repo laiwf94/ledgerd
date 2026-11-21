@@ -28,11 +28,26 @@ current formats.
   (rule 11). Runs survive replay and are carried in snapshots (format 11)
   and compared by `ledgerd verify`. Limits: 10,000 runs, 2,000,000 matches
   and breaks in all.
+- Many-to-one matching for payout batches: a statement line left unmatched
+  by the one-to-one passes can match two or more movements that sum to it
+  exactly, those whose transfers carry its reference (`reference_batch`)
+  or, after the amount-and-date pass, those within the window
+  (`amount_date_batch`). A batch match lists its `postings`. A bounded
+  subset-sum search finds the set and proposes it only when it is the only
+  one; lines with two or more are counted in `batch_ambiguous`, and lines
+  whose search ran out of its step budget (50,000 per line, 2,000,000 per
+  reconciliation) or had more than 256 candidates in `batch_searches_cut`.
+  Saved runs keep batches of up to 1,000 movements, and the ledger checks
+  that they move the line's way, sum to it, are in journal order and carry
+  its reference or lie within the window.
 
 #### Changed
 
 - `Ledger.Movements` also returns the journal head the movements were read
   at.
+- Reference matching takes exact amounts for every line before it reports
+  any amount mismatch, so a mismatch no longer takes a movement that a later
+  line matches exactly.
 
 ### Change feed, live stream, webhooks and export (#27)
 

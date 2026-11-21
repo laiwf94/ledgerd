@@ -1714,11 +1714,17 @@ currency's exponent (more decimals than the currency has is an error, never a
 rounding). The parser is bounded (4 MiB, 10,000 lines, field lengths) and
 fuzzed: anything it accepts must survive a format-and-parse round trip.
 
-Matching runs in two passes:
+Matching runs in three passes:
 
 1. By reference: a line whose reference equals a movement's reference is the
-   same transaction. An exact amount is preferred; otherwise it is reported as
-   an *amount mismatch* rather than as two unrelated breaks.
+   same transaction. This pass runs in three rounds over the lines: first
+   every line takes a free movement with its reference and exactly its
+   amount (`reference`); then a line left over may take a *batch* of two or
+   more free movements with its reference that sum to it
+   (`reference_batch`); only then is a line with its reference on a
+   movement of another amount reported as an *amount mismatch* rather than
+   as two unrelated breaks. The rounds keep a batch from taking a movement
+   that another line matches exactly.
 2. By amount and date: remaining lines, in date order, take the earliest free
    movement with the same amount whose date is within `window_days` (default
    3, for settlement lag) before or after. For this interval structure the
@@ -1726,6 +1732,58 @@ Matching runs in two passes:
    it with a maximum bipartite matching on random inputs. A union-find "next
    free" index per amount keeps the pass near-linear when thousands of
    movements share an amount.
+3. Batches by amount and date: a remaining line, in date order, may take a
+   batch of two or more free movements dated within the window whose
+   amounts sum to it (`amount_date_batch`): a payout batch, a card
+   settlement or a sweep that the bank shows as one line. A union-find
+   "next free" index over movements in date order skips the ones earlier
+   batches took.
+
+A batch's candidates are the free movements with the line's sign and no
+larger than it. If they sum to the line all together they are the batch (up
+to 1,000 movements; no other set can then sum to it, since every amount is
+positive). Otherwise, if there are at most 256 candidates, a depth-first
+subset-sum search runs over them, largest first, cutting a branch when the
+movements left cannot reach the amount and never trying the same amount
+twice at one depth, so each distinct set of amounts is visited once.
+
+A batch is proposed only when it is the *only* set of candidates that sums
+to the line. Among a few hundred movements of assorted amounts some subset
+hits almost any total by coincidence, and a wrong batch is worse than a
+break: it hides the real one and takes movements from other lines. So the
+search goes on past the first solution, and a line with a second one, or
+whose batch could swap a movement for another of the same amount, stays a
+break and is counted in the summary's `batch_ambiguous`. A random test
+checks the search against an exhaustive count of subsets on small sets: it
+finds a batch exactly when one subset sums to the line and reports
+ambiguity exactly when more than one does. In practice a payout batch
+matches by reference, where the candidates are only the transfers that
+carry the payout's reference; amount and date alone settle sparse windows,
+such as a weekly sweep of a few movements.
+
+Subset sum is NP-complete, so the search is bounded by work rather than by
+the inputs being kind: a step is a scanned candidate or a search node, a
+line may spend 50,000 and a whole reconciliation 2,000,000. A line whose
+search runs out of steps, or has more than 256 candidates (scanning stops
+at 1,001, more than any batch can hold), stays a break
+and is counted in `batch_searches_cut`. The cost of a hostile statement is
+therefore fixed, and the result does not depend on the machine or on time:
+the same statement and movements give the same report whatever order they
+arrive in (tested by shuffling). Measured on one core of a 2.1 GHz Xeon:
+10,000 lines, none matchable, against 100,000 movements in their window
+take 60 to 80 ms (`TestBatchWorstCase`), and against 256 movements no subset of
+which reaches any line, so that every line exhausts its steps until the
+total runs out, 11 ms (`BenchmarkBatchWorstCase`). A month of 500
+interleaved payouts of 20 movements each among 10,000 movements takes 7 ms
+(`BenchmarkPayoutBatches`): the 250 with a reference all match the 20
+transfers they pay, and the 250 without one, which share their window with
+hundreds of movements, are left as breaks rather than matched by
+coincidence. The ordinary `BenchmarkReconcile` (5,000 lines, no batches)
+is unchanged at 9 to 10 ms.
+
+A batch match lists its movements as `postings`, in journal order, with
+`days_apart` the furthest of them from the line and no single
+`transfer_id` or `seq`; the summary counts `batch_matches`.
 
 What is left is *missing in ledger* (statement lines) or *missing in
 statement* (movements dated inside the period). Movements up to the window
@@ -1750,10 +1808,13 @@ The ledger does not trust what it is given. Before accepting a run, the
 writer checks that every movement it names is a posted change on the run's
 account with the amount (signed in the account's normal-balance sense),
 transfer and UTC date the journal has at that sequence, no later than
-`as_of_seq`; that no movement or statement line appears twice; that a
+`as_of_seq`; that no movement or statement line appears twice; that a match's
+movements sum exactly to its line and move the same way; that a
 reference match joins a line to a movement of the same amount whose
 transfer carries the line's reference, an amount-and-date match one of the
-same amount within the window, an amount mismatch a line and movement with
+same amount within the window, a batch 2 to 1,000 movements in journal
+order, each carrying the line's reference (`reference_batch`) or within the
+window (`amount_date_batch`), an amount mismatch a line and movement with
 one reference and different amounts, and a missing-in-statement break a
 movement inside the period. A run that fails is refused with
 `failed_precondition` and nothing is stored. The same check
@@ -1982,6 +2043,7 @@ accounts, so all of these also cross power cuts and snapshots.
 | Statement CSV | 4 MiB, 10,000 lines | |
 | Reconciliation | 4 at once, period 366 days, window 31 days, 100,000 movements | Bounds memory per request. |
 | Saved reconciliation runs | 10,000 runs, 2,000,000 matches and breaks in all, one 16 MiB log record per run | Runs live in memory; a stored match is about 210 bytes. |
+| Batch matches | 1,000 movements per batch; the search runs over at most 256 candidates, 50,000 steps per line and 2,000,000 per reconciliation | Subset sum is exponential; the budget fixes the worst case and keeps reports deterministic. |
 | Statement page | 1,000 lines | |
 | Listing page | 1,000 accounts or transfers, 8 metadata filters, max(16 × limit, 4,096) candidates scanned | Bounds the time a listing holds the read lock. |
 | Log record | 16 MiB | Sized for the largest batch; validation guarantees every accepted command fits (tested). Other commands encode to under 256 KiB. |

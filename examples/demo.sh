@@ -90,7 +90,8 @@ curl -sS -X POST "$URL/v1/accounts/$shop/reconcile?window_days=2" -H "Authorizat
 import sys, json
 r = json.load(sys.stdin)
 for m in r["matched"]:
-    print("   matched           %s -> %s by %s" % (m["external_id"], m["transfer_id"], m["matched_by"]))
+    ids = m.get("transfer_id") or "+".join(p["transfer_id"] for p in m["postings"])
+    print("   matched           %s -> %s by %s" % (m["external_id"], ids, m["matched_by"]))
 for m in r["missing_in_ledger"]:
     print("   not in ledger:    %s %.2f" % (m["external_id"], m["amount"] / 100))
 for m in r["missing_in_statement"]:

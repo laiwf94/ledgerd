@@ -194,7 +194,67 @@ func TestSavedReconciliationsOverHTTP(t *testing.T) {
 // The ledger's limits on a run agree with what a statement may hold.
 func TestReconLimitsAgree(t *testing.T) {
 	if ledger.MaxReconLines != recon.MaxLines || ledger.MaxReconWindow != recon.MaxWindowDays || ledger.MaxReconDays != MaxReconcileDays ||
-		ledger.MaxReference != recon.MaxReference || ledger.MaxReconExternalID != recon.MaxExternalID || ledger.MaxMovements < 1 {
+		ledger.MaxReference != recon.MaxReference || ledger.MaxReconExternalID != recon.MaxExternalID || ledger.MaxMovements < 1 ||
+		ledger.MaxMatchPostings != recon.MaxBatchPostings || string(ledger.ByReferenceBatch) != recon.ByReferenceBatch ||
+		string(ledger.ByAmountDateBatch) != recon.ByAmountDateBatch || string(ledger.ByReference) != recon.ByReference ||
+		string(ledger.ByAmountDate) != recon.ByAmountDate {
 		t.Fatal("reconciliation limits disagree")
+	}
+}
+
+// A payout settled as one bank line matches the transfers it pays: by the
+// reference they share, or by amount within the window, and is saved with
+// every movement.
+func TestBatchReconciliationOverHTTP(t *testing.T) {
+	f := newFixture(t, nil)
+	f.accounts()
+	pay := func(amount, ref string) {
+		f.t.Helper()
+		f.must(201, "POST", "/v1/transfers", `{"currency":"USD","reference":"`+ref+`","postings":[{"account":"bank","direction":"debit","amount":`+amount+
+			`},{"account":"merchant","direction":"credit","amount":`+amount+`}]}`)
+	}
+	pay("1000", "po-7")
+	pay("2500", "po-7")
+	pay("400", "po-7")
+	pay("120", "")
+	pay("80", "")
+	pay("999", "")
+	statement := reconHeader +
+		"bk-1,2030-03-02,39.00,USD,po-7\n" + // 10.00 + 25.00 + 4.00
+		"bk-2,2030-03-02,2.00,USD,\n" // 1.20 + 0.80
+	r := f.call("POST", "/v1/accounts/merchant/reconcile?save=true&id=po&window_days=1&from=2030-03-01", statement, "Content-Type", "text/csv")
+	if r.status != 201 {
+		t.Fatalf("save: %d %s", r.status, r.body)
+	}
+	rep := r.json(t)
+	matched := rep["matched"].([]any)
+	if len(matched) != 2 || rep["summary"].(map[string]any)["batch_matches"] != float64(2) {
+		t.Fatalf("report %s", r.body)
+	}
+	want := []struct {
+		by    string
+		parts int
+	}{{recon.ByReferenceBatch, 3}, {recon.ByAmountDateBatch, 2}}
+	for i, w := range want {
+		m := matched[i].(map[string]any)
+		if m["matched_by"] != w.by || len(m["postings"].([]any)) != w.parts || m["transfer_id"] != nil || m["seq"] != nil {
+			t.Fatalf("match %d: %v", i, m)
+		}
+	}
+	if ms := rep["missing_in_statement"].([]any); len(ms) != 1 || ms[0].(map[string]any)["amount"] != float64(999) {
+		t.Fatalf("missing in statement %v", ms)
+	}
+	run := f.must(200, "GET", "/v1/reconciliations/po", "")
+	if run["summary"].(map[string]any)["ledger_postings"] != float64(6) {
+		t.Fatalf("run %v", run)
+	}
+	for i, w := range want {
+		m := run["matches"].([]any)[i].(map[string]any)
+		if m["matched_by"] != w.by || len(m["postings"].([]any)) != w.parts || m["status"] != "proposed" {
+			t.Fatalf("saved match %d: %v", i, m)
+		}
+	}
+	if ok := f.must(200, "GET", "/v1/admin/invariants", "")["ok"]; ok != true {
+		t.Fatal("invariants")
 	}
 }

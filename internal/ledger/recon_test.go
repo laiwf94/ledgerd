@@ -525,4 +525,115 @@ func writeSmallRecons(t *testing.T, e *env) {
 		t.Fatal(err)
 	}
 	e.do(reopenCmd("rc-1", "", 2))
+	// A run with batches: two movements under one reference, and two
+	// without one settled together.
+	var parts []ReconPosting
+	for _, leg := range []struct {
+		ref string
+		amt int64
+	}{{"B-1", 40}, {"B-1", 60}, {"", 5}, {"", 7}} {
+		tr := e.do(Command{CreateTransfer: &TransferSpec{Currency: "USD", Reference: leg.ref, Postings: []PostingSpec{dr("rc", leg.amt), cr("rc_src", leg.amt)}}}).Transfer
+		parts = append(parts, ReconPosting{Seq: tr.Entries[0].Seq, TransferID: tr.ID, Date: e.clock.Now().UTC().Format(reconDateLayout), Amount: leg.amt})
+	}
+	date = e.clock.Now().UTC().Format(reconDateLayout)
+	e.do(saveCmd(&ReconSpec{ID: "rc-3", Account: "rc", From: date, To: date, WindowDays: 1, AsOfSeq: e.l.Head(),
+		Matches: []ReconMatchSpec{
+			{Line: ReconLine{Row: 2, ExternalID: "y1", Date: date, Amount: 100, Reference: "B-1"}, Postings: parts[:2], By: ByReferenceBatch},
+			{Line: ReconLine{Row: 3, ExternalID: "y2", Date: date, Amount: 12}, Postings: parts[2:], By: ByAmountDateBatch},
+		}}))
+	e.do(confirmCmd("rc-3", false, 2))
+}
+
+// Batch matches join one statement line to several movements: by reference
+// when every transfer carries the line's reference, by amount and date when
+// every movement is within the window. Either way the movements must move
+// the line's way and sum to it exactly.
+func TestSaveBatchReconciliation(t *testing.T) {
+	f := newReconFixture(t, true)
+	pay := func(name, ref string, amt int64) {
+		out := f.do(Command{CreateTransfer: &TransferSpec{Currency: "USD", Reference: ref, Postings: []PostingSpec{dr("settle", amt), cr("equity", amt)}}})
+		f.seqs[name] = out.Transfer.Entries[0].Seq
+	}
+	pay("po1", "PO-9", 100)
+	pay("po2", "PO-9", 200)
+	pay("po3", "PO-9", 300)
+	pay("c1", "", 11)
+	pay("c2", "", 22)
+	batchRun := func(id string) *ReconSpec {
+		return &ReconSpec{ID: id, Account: "settle", From: day(f, 2), To: day(f, 2), WindowDays: 1, AsOfSeq: f.l.Head(),
+			Matches: []ReconMatchSpec{
+				{Line: ReconLine{Row: 2, ExternalID: "po", Date: day(f, 3), Amount: 600, Reference: "PO-9"},
+					Postings: []ReconPosting{f.posting("po1"), f.posting("po2"), f.posting("po3")}, By: ByReferenceBatch},
+				{Line: ReconLine{Row: 3, ExternalID: "card", Date: day(f, 2), Amount: 33},
+					Postings: []ReconPosting{f.posting("c1"), f.posting("c2")}, By: ByAmountDateBatch},
+			}}
+	}
+	f.do(saveCmd(batchRun("b1")))
+	r := f.recon("b1")
+	if r.Summary.Matches != 2 || r.Summary.StatementLines != 2 || r.Summary.LedgerPostings != 5 {
+		t.Fatalf("summary %+v", r.Summary)
+	}
+	if m := r.Matches[0]; m.By != ByReferenceBatch || len(m.Postings) != 3 || m.DaysApart != 1 {
+		t.Fatalf("reference batch %+v", m)
+	}
+	if m := r.Matches[1]; m.By != ByAmountDateBatch || len(m.Postings) != 2 || m.DaysApart != 0 {
+		t.Fatalf("amount and date batch %+v", m)
+	}
+	for _, tc := range []struct {
+		name string
+		code Code
+		edit func(s *ReconSpec)
+	}{
+		{"sum", CodePrecondition, func(s *ReconSpec) { s.Matches[0].Line.Amount = 599 }},
+		{"one movement", CodeInvalid, func(s *ReconSpec) { s.Matches[1].Postings = s.Matches[1].Postings[:1]; s.Matches[1].Line.Amount = 11 }},
+		{"too many movements", CodeInvalid, func(s *ReconSpec) {
+			s.Matches[0].Postings = make([]ReconPosting, MaxMatchPostings+1)
+			for i := range s.Matches[0].Postings {
+				s.Matches[0].Postings[i] = f.posting("po1")
+			}
+		}},
+		{"single with two", CodeInvalid, func(s *ReconSpec) { s.Matches[1].By = ByAmountDate }},
+		{"order", CodePrecondition, func(s *ReconSpec) {
+			p := s.Matches[0].Postings
+			p[0], p[2] = p[2], p[0]
+		}},
+		{"repeated", CodePrecondition, func(s *ReconSpec) {
+			s.Matches[0].Postings = []ReconPosting{f.posting("po1"), f.posting("po1"), f.posting("po2")}
+			s.Matches[0].Line.Amount = 400
+		}},
+		{"reference", CodePrecondition, func(s *ReconSpec) {
+			s.Matches[0].Postings = append(s.Matches[0].Postings, f.posting("c1"))
+			s.Matches[0].Line.Amount += 11
+			s.Matches[1].Postings = []ReconPosting{f.posting("pay2"), f.posting("c2")}
+			s.Matches[1].Line.Amount = 272
+		}},
+		{"no reference on the line", CodePrecondition, func(s *ReconSpec) { s.Matches[0].Line.Reference = "" }},
+		{"window", CodePrecondition, func(s *ReconSpec) { s.Matches[1].Line.Date = day(f, 4) }},
+		{"sign", CodePrecondition, func(s *ReconSpec) {
+			s.Matches[1].Postings = []ReconPosting{f.posting("out"), f.posting("c1"), f.posting("c2")}
+			s.Matches[1].Line.Amount = 33 - 75
+		}},
+	} {
+		s := batchRun("b-" + strings.ReplaceAll(tc.name, " ", "-"))
+		tc.edit(s)
+		err := f.fail(saveCmd(s), tc.code)
+		if testing.Verbose() {
+			t.Logf("%s: %s", tc.name, err.Message)
+		}
+	}
+	f.do(confirmCmd("b1", false, 1))
+	before := f.recon("b1")
+	f.invariants()
+	f.restart()
+	if got := f.recon("b1"); !reflect.DeepEqual(got, before) {
+		t.Fatalf("after replay\n%+v\nwant\n%+v", got, before)
+	}
+	f.opts.SnapshotEvery = 0
+	f.restart()
+	f.opts.SnapshotEvery = -1
+	f.restart()
+	if got := f.recon("b1"); !reflect.DeepEqual(got, before) {
+		t.Fatalf("after snapshot\n%+v\nwant\n%+v", got, before)
+	}
+	f.invariants()
 }

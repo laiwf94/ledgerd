@@ -44,8 +44,9 @@ const (
 	// MaxReconExternalID is the longest statement line ID.
 	MaxReconExternalID = 64
 	MaxReconDays       = 366
-	// MaxMatchPostings is the most ledger movements one match joins.
-	MaxMatchPostings = 64
+	// MaxMatchPostings is the most ledger movements one match joins, the
+	// most recon puts in a batch.
+	MaxMatchPostings = 1000
 	// reconRecordSlack covers what a save_reconciliation record adds around
 	// the command: type, time, an escaped idempotency key and its hash.
 	reconRecordSlack = 4096
@@ -59,7 +60,15 @@ type MatchedBy string
 const (
 	ByReference  MatchedBy = "reference"   // the line's reference is the movement's transfer reference
 	ByAmountDate MatchedBy = "amount_date" // same amount, dates within the window
+	// ByReferenceBatch joins a line to two or more movements whose
+	// transfers carry its reference and whose amounts sum to it.
+	ByReferenceBatch MatchedBy = "reference_batch"
+	// ByAmountDateBatch joins a line to two or more movements within the
+	// window whose amounts sum to it.
+	ByAmountDateBatch MatchedBy = "amount_date_batch"
 )
+
+func (b MatchedBy) batch() bool { return b == ByReferenceBatch || b == ByAmountDateBatch }
 
 // BreakKind says what is wrong with an item reconciliation could not match.
 type BreakKind string
@@ -305,7 +314,7 @@ func daysApart(a, b string) int {
 	return int(y - x)
 }
 
-func validMatchedBy(b MatchedBy) bool { return b == ByReference || b == ByAmountDate }
+func validMatchedBy(b MatchedBy) bool { return b == ByReference || b == ByAmountDate || b.batch() }
 
 func validBreakKind(k BreakKind) bool {
 	return k == BreakAmountMismatch || k == BreakMissingInLedger || k == BreakMissingInStatement
@@ -357,10 +366,13 @@ func (s *ReconSpec) validate() *Error {
 		m := &s.Matches[i]
 		where := fmt.Sprintf("matches[%d]", i)
 		if !validMatchedBy(m.By) {
-			return errf(CodeInvalid, "%s.matched_by must be reference or amount_date", where)
+			return errf(CodeInvalid, "%s.matched_by must be reference, amount_date, reference_batch or amount_date_batch", where)
 		}
-		if len(m.Postings) != 1 {
+		if !m.By.batch() && len(m.Postings) != 1 {
 			return errf(CodeInvalid, "%s must join its line to exactly one movement", where)
+		}
+		if m.By.batch() && (len(m.Postings) < 2 || len(m.Postings) > MaxMatchPostings) {
+			return errf(CodeInvalid, "%s is a batch: it joins its line to 2 to %d movements", where, MaxMatchPostings)
 		}
 		if err := checkLine(where, &m.Line); err != nil {
 			return err
@@ -501,21 +513,32 @@ func reconProblem(s *ReconSpec, j reconJournal) string {
 			return p
 		}
 		var sum int64
+		overflow := false
 		for k := range m.Postings {
 			p := &m.Postings[k]
 			if msg := posting(fmt.Sprintf("%s.postings[%d]", where, k), p); msg != "" {
 				return msg
 			}
-			sum += p.Amount
-			if m.By == ByAmountDate && daysApart(m.Line.Date, p.Date) > s.WindowDays {
+			if k > 0 && p.Seq <= m.Postings[k-1].Seq {
+				return fmt.Sprintf("%s: the movements must be in journal order", where)
+			}
+			if (p.Amount > 0) != (m.Line.Amount > 0) {
+				return fmt.Sprintf("%s: entry %d moves the other way from the line", where, p.Seq)
+			}
+			if next := sum + p.Amount; (p.Amount > 0 && next < sum) || (p.Amount < 0 && next > sum) {
+				overflow = true
+			} else {
+				sum = next
+			}
+			if (m.By == ByAmountDate || m.By == ByAmountDateBatch) && daysApart(m.Line.Date, p.Date) > s.WindowDays {
 				return fmt.Sprintf("%s: entry %d is more than %d days from the line", where, p.Seq, s.WindowDays)
 			}
-			if ref, _ := j.reference(p.TransferID); m.By == ByReference && (m.Line.Reference == "" || ref != m.Line.Reference) {
+			if ref, _ := j.reference(p.TransferID); (m.By == ByReference || m.By == ByReferenceBatch) && (m.Line.Reference == "" || ref != m.Line.Reference) {
 				return fmt.Sprintf("%s: transfer %s does not have the line's reference", where, p.TransferID)
 			}
 		}
-		if len(m.Postings) == 1 && sum != m.Line.Amount {
-			return fmt.Sprintf("%s: the line is for %d, the movement %d", where, m.Line.Amount, sum)
+		if overflow || sum != m.Line.Amount {
+			return fmt.Sprintf("%s: the line is for %d, the movements sum to %d", where, m.Line.Amount, sum)
 		}
 	}
 	for i := range s.Breaks {

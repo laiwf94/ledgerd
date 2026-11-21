@@ -248,7 +248,15 @@ func TestAmountDateMatchingIsMaximal(t *testing.T) {
 		}
 		w := r.Intn(3)
 		rep := Reconcile(lines, ps, base, base.AddDate(0, 0, 10), w)
-		if got, want := len(rep.Matched), maxMatching(lines, ps, int64(w)); got != want {
+		// Pass 2 is maximal among one-to-one matches; batches come after it
+		// from what it leaves.
+		single := 0
+		for _, m := range rep.Matched {
+			if m.Postings == nil {
+				single++
+			}
+		}
+		if got, want := single, maxMatching(lines, ps, int64(w)); got != want {
 			t.Fatalf("iteration %d: matched %d, a maximum matching has %d\nlines %+v\npostings %+v", iter, got, want, lines, ps)
 		}
 		if rep.Summary.Matched+rep.Summary.MissingInLedger != len(lines) {

@@ -1,13 +1,18 @@
 // Package recon reconciles an external statement (a bank or processor file)
 // against the ledger's posted movements for one account.
 //
-// Matching runs in two passes, the way reconciliation teams work by hand:
+// Matching runs in three passes, the way reconciliation teams work by hand:
 //
 //  1. Reference: a statement line whose reference equals a movement's
-//     reference is the same transaction. If the amounts differ it is reported
-//     as an amount mismatch, not as two unrelated breaks.
+//     reference is the same transaction. Failing an exact amount, a set of
+//     movements with the reference that sums to the line is a batch (see
+//     batch.go); otherwise it is reported as an amount mismatch, not as two
+//     unrelated breaks.
 //  2. Amount and date: remaining lines match a remaining movement with the
 //     same amount whose date is within a window of days (settlement lag).
+//  3. Batches by amount and date: a remaining line matches a set of
+//     remaining movements within the window that sums to its amount, such
+//     as a payout batch settled as one bank line.
 //
 // Whatever is left is missing on one side. The report never changes the
 // ledger; fixing a break is a new transfer or a reversal.
@@ -201,16 +206,38 @@ type Posting struct {
 	Amount     int64     `json:"amount"`
 }
 
-// Match is a statement line paired with a ledger posting.
+// Match is a statement line paired with a ledger posting, or for a batch
+// with several.
 type Match struct {
 	ExternalID string `json:"external_id"`
 	Row        int    `json:"row"`
-	TransferID string `json:"transfer_id"`
-	Seq        uint64 `json:"seq"`
+	TransferID string `json:"transfer_id,omitempty"` // the posting; empty for a batch
+	Seq        uint64 `json:"seq,omitempty"`
 	Amount     int64  `json:"amount"`
-	By         string `json:"matched_by"` // "reference" or "amount_date"
-	DaysApart  int64  `json:"days_apart"`
+	// By is "reference" or "amount_date" for one posting, and
+	// "reference_batch" or "amount_date_batch" for a batch.
+	By string `json:"matched_by"`
+	// DaysApart is the most days between the line and any of its postings.
+	DaysApart int64 `json:"days_apart"`
+	// Postings lists a batch's postings, two or more, in journal order.
+	Postings []Part `json:"postings,omitempty"`
 }
+
+// Part is one posting of a batch match.
+type Part struct {
+	Seq        uint64 `json:"seq"`
+	TransferID string `json:"transfer_id"`
+	Date       string `json:"date"`
+	Amount     int64  `json:"amount"`
+}
+
+// Match kinds.
+const (
+	ByReference       = "reference"
+	ByAmountDate      = "amount_date"
+	ByReferenceBatch  = "reference_batch"
+	ByAmountDateBatch = "amount_date_batch"
+)
 
 // Mismatch is a line and posting with the same reference but different amounts.
 type Mismatch struct {
@@ -230,6 +257,16 @@ type Summary struct {
 	AmountMismatches   int `json:"amount_mismatches"`
 	MissingInLedger    int `json:"missing_in_ledger"`
 	MissingInStatement int `json:"missing_in_statement"`
+	// BatchMatches counts the matches that join a line to several postings.
+	BatchMatches int `json:"batch_matches"`
+	// BatchAmbiguous counts the lines reported as breaks (missing in the
+	// ledger or an amount mismatch) for which two or more sets of movements
+	// sum to the line, so no batch was proposed.
+	BatchAmbiguous int `json:"batch_ambiguous"`
+	// BatchSearchesCut counts the lines reported as breaks whose batch
+	// search could not finish (too many candidates or out of budget), so a
+	// batch for them may exist.
+	BatchSearchesCut int `json:"batch_searches_cut"`
 }
 
 // Report is the result of a reconciliation.
@@ -319,34 +356,105 @@ func Reconcile(lines []Line, postings []Posting, from, to time.Time, window int)
 			byRef[p.Reference] = append(byRef[p.Reference], i)
 		}
 	}
+	b := budget{total: SearchSteps}
+	var cs []cand // candidates for the line being searched, reused
+	// batchMatch marks a batch's postings used and describes it.
+	batchMatch := func(ln Line, lday int64, by string, pis []int) Match {
+		sort.Ints(pis) // ps is in seq order
+		m := Match{ExternalID: ln.ExternalID, Row: ln.Row, Amount: ln.Amount, By: by, Postings: make([]Part, len(pis))}
+		for k, pi := range pis {
+			used[pi] = true
+			p := ps[pi]
+			m.Postings[k] = Part{Seq: p.Seq, TransferID: p.TransferID, Date: p.Date, Amount: p.Amount}
+			m.DaysApart = max(m.DaysApart, abs(p.day-lday))
+		}
+		return m
+	}
+	// Pass 1 runs in three rounds, so a batch never takes a movement some
+	// line matches exactly and a mismatch never takes one a batch needs:
+	// exact amounts, then batches, then mismatches.
+	refLine := func(ln line) bool { return ln.Reference != "" && ln.ok }
 	for li, ln := range ls {
-		if ln.Reference == "" || !ln.ok {
+		if !refLine(ln) {
 			continue
 		}
-		pick, exact := -1, false
 		for _, pi := range byRef[ln.Reference] {
-			if used[pi] {
-				continue
-			}
-			if ps[pi].Amount == ln.Amount {
-				pick, exact = pi, true
+			if !used[pi] && ps[pi].Amount == ln.Amount {
+				used[pi], done[li] = true, true
+				p := ps[pi]
+				rep.Matched = append(rep.Matched, Match{ExternalID: ln.ExternalID, Row: ln.Row, TransferID: p.TransferID,
+					Seq: p.Seq, Amount: p.Amount, By: ByReference, DaysApart: abs(p.day - ln.day)})
 				break
 			}
-			if pick < 0 {
-				pick = pi
-			}
 		}
-		if pick < 0 {
+	}
+	// outcome is what the line's batch searches ended in when they found
+	// none: ambiguous if any found two, else cut if any could not finish.
+	outcome := make([]searchResult, len(ls))
+	note := func(li int, res searchResult) {
+		if res == ambiguous || (res == cut && outcome[li] != ambiguous) {
+			outcome[li] = res
+		}
+	}
+	for li, ln := range ls {
+		if done[li] || !refLine(ln) || !batchable(ln.Amount) || len(byRef[ln.Reference]) < 2 {
 			continue
 		}
-		used[pick], done[li] = true, true
-		p := ps[pick]
-		if exact {
-			rep.Matched = append(rep.Matched, Match{ExternalID: ln.ExternalID, Row: ln.Row, TransferID: p.TransferID,
-				Seq: p.Seq, Amount: p.Amount, By: "reference", DaysApart: abs(p.day - ln.day)})
+		if b.total <= 0 {
+			note(li, cut)
+			continue
+		}
+		b.startLine()
+		cs = cs[:0]
+		res := noBatch
+		for _, pi := range byRef[ln.Reference] {
+			if !b.spend() {
+				res = cut
+				break
+			}
+			if !used[pi] && fits(ps[pi].Amount, ln.Amount) {
+				if len(cs) == MaxBatchPostings {
+					res = cut // too many for any batch
+					break
+				}
+				cs = append(cs, cand{pi: pi, amt: absAmount(ps[pi].Amount), seq: ps[pi].Seq})
+			}
+		}
+		var pis []int
+		if res != cut {
+			pis, res = batch(cs, absAmount(ln.Amount), &b)
+		}
+		if pis != nil {
+			done[li] = true
+			rep.Matched = append(rep.Matched, batchMatch(ln.Line, ln.day, ByReferenceBatch, pis))
 		} else {
-			rep.AmountMismatches = append(rep.AmountMismatches, Mismatch{ExternalID: ln.ExternalID, Row: ln.Row,
-				TransferID: p.TransferID, Seq: p.Seq, StatementAmount: ln.Amount, LedgerAmount: p.Amount})
+			note(li, res)
+		}
+	}
+	// counted adds up how the batch searches of lines reported as breaks
+	// ended.
+	var nCut, nAmbiguous int
+	counted := func(li int) {
+		switch outcome[li] {
+		case cut:
+			nCut++
+		case ambiguous:
+			nAmbiguous++
+		}
+	}
+	for li, ln := range ls {
+		if done[li] || !refLine(ln) {
+			continue
+		}
+		for _, pi := range byRef[ln.Reference] {
+			if !used[pi] {
+				used[pi], done[li] = true, true
+				counted(li)
+				p := ps[pi]
+				rep.AmountMismatches = append(rep.AmountMismatches, Mismatch{ExternalID: ln.ExternalID, Row: ln.Row,
+					TransferID: p.TransferID, Seq: p.Seq, StatementAmount: ln.Amount, LedgerAmount: p.Amount})
+				break
+			}
 		}
 	}
 
@@ -404,15 +512,94 @@ func Reconcile(lines []Line, postings []Posting, from, to time.Time, window int)
 		used[pi], done[li] = true, true
 		p := ps[pi]
 		rep.Matched = append(rep.Matched, Match{ExternalID: ln.ExternalID, Row: ln.Row, TransferID: p.TransferID,
-			Seq: p.Seq, Amount: p.Amount, By: "amount_date", DaysApart: abs(p.day - ln.day)})
+			Seq: p.Seq, Amount: p.Amount, By: ByAmountDate, DaysApart: abs(p.day - ln.day)})
+	}
+
+	// Pass 3, for the lines still open. Free postings in (day, seq) order,
+	// with a union-find "next free" index so postings taken by earlier
+	// batches are skipped.
+	open := false
+	for li, ln := range ls {
+		open = open || (!done[li] && ln.ok && batchable(ln.Amount))
+	}
+	var order []int
+	if open {
+		for i := range ps {
+			if !used[i] {
+				order = append(order, i)
+			}
+		}
+	}
+	sort.SliceStable(order, func(x, y int) bool { return ps[order[x]].day < ps[order[y]].day })
+	posOf := make(map[int]int, len(order))
+	for pos, pi := range order {
+		posOf[pi] = pos
+	}
+	next := make([]int, len(order)+1)
+	for i := range next {
+		next[i] = i
+	}
+	free := func(i int) int {
+		for next[i] != i {
+			next[i] = next[next[i]]
+			i = next[i]
+		}
+		return i
+	}
+	for li, ln := range ls {
+		if !open || done[li] || !ln.ok || !batchable(ln.Amount) {
+			continue
+		}
+		if b.total <= 0 {
+			note(li, cut)
+			continue
+		}
+		b.startLine()
+		cs = cs[:0]
+		res := noBatch
+		start := sort.Search(len(order), func(i int) bool { return ps[order[i]].day >= ln.day-w })
+		for pos := free(start); pos < len(order) && ps[order[pos]].day <= ln.day+w; pos = free(pos + 1) {
+			if !b.spend() {
+				res = cut
+				break
+			}
+			if pi := order[pos]; fits(ps[pi].Amount, ln.Amount) {
+				if len(cs) == MaxBatchPostings {
+					res = cut // too many for any batch
+					break
+				}
+				cs = append(cs, cand{pi: pi, amt: absAmount(ps[pi].Amount), seq: ps[pi].Seq})
+			}
+		}
+		var pis []int
+		if res != cut {
+			pis, res = batch(cs, absAmount(ln.Amount), &b)
+		}
+		if pis == nil {
+			note(li, res)
+			continue
+		}
+		done[li] = true
+		rep.Matched = append(rep.Matched, batchMatch(ln.Line, ln.day, ByAmountDateBatch, pis))
+		for _, pi := range pis {
+			next[posOf[pi]] = posOf[pi] + 1
+		}
 	}
 
 	for li, ln := range ls {
 		if !done[li] {
+			counted(li)
 			rep.MissingInLedger = append(rep.MissingInLedger, ln.Line)
 		}
 	}
 	lo, hi := day(from), day(to)
+	missing := 0
+	for i, p := range ps {
+		if !used[i] && p.day >= lo && p.day <= hi {
+			missing++
+		}
+	}
+	rep.MissingInStatement = make([]Posting, 0, missing)
 	for i, p := range ps {
 		if !used[i] && p.day >= lo && p.day <= hi {
 			rep.MissingInStatement = append(rep.MissingInStatement, p.Posting)
@@ -422,7 +609,13 @@ func Reconcile(lines []Line, postings []Posting, from, to time.Time, window int)
 	sort.SliceStable(rep.AmountMismatches, func(i, j int) bool { return rep.AmountMismatches[i].Row < rep.AmountMismatches[j].Row })
 	sort.SliceStable(rep.MissingInLedger, func(i, j int) bool { return rep.MissingInLedger[i].Row < rep.MissingInLedger[j].Row })
 	rep.Summary = Summary{StatementLines: len(lines), LedgerPostings: len(postings), Matched: len(rep.Matched),
-		AmountMismatches: len(rep.AmountMismatches), MissingInLedger: len(rep.MissingInLedger), MissingInStatement: len(rep.MissingInStatement)}
+		AmountMismatches: len(rep.AmountMismatches), MissingInLedger: len(rep.MissingInLedger), MissingInStatement: len(rep.MissingInStatement),
+		BatchSearchesCut: nCut, BatchAmbiguous: nAmbiguous}
+	for _, m := range rep.Matched {
+		if m.Postings != nil {
+			rep.Summary.BatchMatches++
+		}
+	}
 	return rep
 }
 

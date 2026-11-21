@@ -66,8 +66,14 @@ func reconSpec(id, account string, rep recon.Report, lines []recon.Line, posting
 	}
 	spec := ledger.ReconSpec{ID: id, Account: account, From: rep.From, To: rep.To, WindowDays: rep.WindowDays, AsOfSeq: head}
 	for _, m := range rep.Matched {
-		spec.Matches = append(spec.Matches, ledger.ReconMatchSpec{Line: line(m.Row), Postings: []ledger.ReconPosting{posting(m.Seq)},
-			By: ledger.MatchedBy(m.By)})
+		ms := ledger.ReconMatchSpec{Line: line(m.Row), By: ledger.MatchedBy(m.By)}
+		if m.Postings == nil {
+			ms.Postings = []ledger.ReconPosting{posting(m.Seq)}
+		}
+		for _, p := range m.Postings {
+			ms.Postings = append(ms.Postings, posting(p.Seq))
+		}
+		spec.Matches = append(spec.Matches, ms)
 	}
 	for _, m := range rep.AmountMismatches {
 		ln, p := line(m.Row), posting(m.Seq)
