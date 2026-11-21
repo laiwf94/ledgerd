@@ -48,7 +48,9 @@ func (r *exampleReceiver) start(t *testing.T) {
 			t.Fatal(err)
 		}
 		listening := make(chan struct{})
+		drained := make(chan struct{})
 		go func() {
+			defer close(drained)
 			sc := bufio.NewScanner(stdout)
 			sc.Buffer(make([]byte, 64<<10), 1<<20)
 			once := sync.Once{}
@@ -66,8 +68,13 @@ func (r *exampleReceiver) start(t *testing.T) {
 			}
 			io.Copy(io.Discard, stdout)
 		}()
+		// Wait closes the pipe once the process exits, so it may only run
+		// after every line has been read, or the last ones are lost.
 		done := make(chan error, 1)
-		go func() { done <- cmd.Wait() }()
+		go func() {
+			<-drained
+			done <- cmd.Wait()
+		}()
 		select {
 		case <-listening:
 			r.mu.Lock()
