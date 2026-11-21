@@ -25,9 +25,11 @@ package ledger
 // frames. The first item is the header (format version, snapshot number,
 // journal head, time, and the number of accounts, transfers, entries and keys
 // that follow, then the number of webhook endpoints and the newest webhook
-// version, then the number of balance monitors and balance alerts); then
-// come the accounts, transfers, entries, keys, webhook endpoints, monitors
-// and alerts, and last a footer with the number of frames before it.
+// version, then the number of balance monitors and balance alerts, then the
+// number of saved reconciliation runs); then come the accounts, transfers,
+// entries, keys, webhook endpoints, monitors, alerts and reconciliation
+// runs, each run followed by its matches and breaks, and last a footer with
+// the number of frames before it.
 // Anything else, including bytes after the footer, makes the file invalid.
 
 import (
@@ -40,6 +42,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,7 +71,10 @@ const (
 	// Version 9 adds balance monitors and the balance alerts raised so far,
 	// and the monitor a keyed monitor command returned. Version 10 adds a
 	// webhook endpoint's alert subscription; older endpoints have none.
-	snapVersion    = 10
+	// Version 11 adds saved reconciliation runs, with their matches,
+	// breaks and match statuses, and the run a keyed reconciliation
+	// command returned. Older versions hold none.
+	snapVersion    = 11
 	snapPrefix     = "snapshot-"
 	snapSuffix     = ".snap"
 	snapTmpSuffix  = ".tmp"
@@ -85,6 +91,9 @@ const (
 	snapItemMonDef = 'D'
 	snapItemMon    = 'M'
 	snapItemAlert  = 'L'
+	snapItemRecon  = 'R' // a reconciliation run; its matches and breaks follow
+	snapItemMatch  = 'Q'
+	snapItemBreak  = 'K'
 	snapItemFooter = 'Z'
 )
 
@@ -123,8 +132,9 @@ type snapshot struct {
 	idem      []snapIdem  // in the order they were stored
 	hooks     []*Webhook  // committed endpoints are immutable, so these are shared
 	hookGen   uint64
-	monitors  []monState // copies: commit changes monitors in place
-	alerts    []alertRec // a prefix of the alert list, which is append-only
+	monitors  []monState  // copies: commit changes monitors in place
+	alerts    []alertRec  // a prefix of the alert list, which is append-only
+	recons    []*reconRun // a copy: reviews replace runs in place; runs themselves never change
 }
 
 func snapName(num uint64) string { return fmt.Sprintf("%s%020d%s", snapPrefix, num, snapSuffix) }
@@ -154,6 +164,7 @@ func (l *Ledger) capture(num uint64, now time.Time) *snapshot {
 		s.monitors = append(s.monitors, *m)
 	}
 	s.alerts = st.alerts[:len(st.alerts):len(st.alerts)]
+	s.recons = slices.Clone(st.recons)
 	// Keys past their retention are left out: once the segments before the
 	// snapshot are dropped, nothing on disk holds them any more.
 	cutoff := now.Add(-l.opts.IdempotencyTTL)
@@ -493,6 +504,72 @@ func (w *snapWriter) condition(c Condition) {
 	w.i(c.Value)
 }
 
+// recon writes a reconciliation run as items: the run, then each match
+// with its status, then each break.
+func (w *snapWriter) recon(r *reconRun) {
+	d := r.def
+	sp := &d.spec
+	w.tag(snapItemRecon)
+	w.str(sp.ID)
+	w.str(sp.Account)
+	w.str(d.currency)
+	w.str(sp.From)
+	w.str(sp.To)
+	w.u(uint64(sp.WindowDays))
+	w.u(sp.AsOfSeq)
+	w.when(d.created)
+	w.u(uint64(len(sp.Matches)))
+	w.u(uint64(len(sp.Breaks)))
+	w.flag(r.status != nil)
+	w.item()
+	for i := range sp.Matches {
+		m := &sp.Matches[i]
+		w.tag(snapItemMatch)
+		w.reconLine(&m.Line)
+		w.u(uint64(len(m.Postings)))
+		for k := range m.Postings {
+			w.reconPosting(&m.Postings[k])
+		}
+		w.str(string(m.By))
+		if r.status != nil {
+			st := r.status[i]
+			w.str(string(st.status))
+			w.when(st.at)
+			w.str(st.note)
+		}
+		w.item()
+	}
+	for i := range sp.Breaks {
+		b := &sp.Breaks[i]
+		w.tag(snapItemBreak)
+		w.str(string(b.Kind))
+		w.flag(b.Line != nil)
+		if b.Line != nil {
+			w.reconLine(b.Line)
+		}
+		w.flag(b.Posting != nil)
+		if b.Posting != nil {
+			w.reconPosting(b.Posting)
+		}
+		w.item()
+	}
+}
+
+func (w *snapWriter) reconLine(ln *ReconLine) {
+	w.u(uint64(ln.Row))
+	w.str(ln.ExternalID)
+	w.str(ln.Date)
+	w.i(ln.Amount)
+	w.str(ln.Reference)
+}
+
+func (w *snapWriter) reconPosting(p *ReconPosting) {
+	w.u(p.Seq)
+	w.str(p.TransferID)
+	w.str(p.Date)
+	w.i(p.Amount)
+}
+
 // fx writes a rate: a flag, then base, quote, rate, source and quote time.
 func (w *snapWriter) fx(f *FX) {
 	w.flag(f != nil)
@@ -547,6 +624,9 @@ func (w *snapWriter) encode(s *snapshot) error {
 		w.u(uint64(len(defs)))
 		w.u(uint64(len(s.monitors)))
 		w.u(uint64(len(s.alerts)))
+	}
+	if w.ver >= 11 {
+		w.u(uint64(len(s.recons)))
 	}
 	w.item()
 	for i := range s.accounts {
@@ -634,6 +714,9 @@ func (w *snapWriter) encode(s *snapshot) error {
 		if w.ver >= 9 && q.e.out.Monitor != nil {
 			flags |= 64
 		}
+		if w.ver >= 11 && q.e.out.Recon != nil {
+			flags |= 128
+		}
 		w.buf = append(w.buf, flags)
 		if q.e.err != nil {
 			w.str(string(q.e.err.Code))
@@ -671,6 +754,11 @@ func (w *snapWriter) encode(s *snapshot) error {
 		if m := q.e.out.Monitor; flags&64 != 0 {
 			w.monitorDef(&monitorDef{id: m.ID, account: m.Account, cond: m.Condition, desc: m.Description, created: m.CreatedAt, from: m.FromSeq})
 			w.monitorState(m.Met, m.LastAlert, m.Alerts)
+		}
+		if o := q.e.out.Recon; flags&128 != 0 {
+			w.str(o.Run)
+			w.u(o.Number)
+			w.u(uint64(o.Changed))
 		}
 		w.item()
 		// A batch result can hold thousands of transfers, more than one
@@ -710,6 +798,11 @@ func (w *snapWriter) encode(s *snapshot) error {
 			w.u(uint64(a.line))
 			w.flag(a.up)
 			w.item()
+		}
+	}
+	if w.ver >= 11 {
+		for _, r := range s.recons {
+			w.recon(r)
 		}
 	}
 	w.flush()
@@ -1262,6 +1355,90 @@ func (r *snapReader) defIndex(n int) int {
 	return int(k)
 }
 
+// recon reads a reconciliation run, its matches and its breaks, and checks
+// it against the journal as save_reconciliation did, with the statuses
+// review commands could have given its matches.
+func (r *snapReader) recon(number uint64, j reconJournal) *reconRun {
+	r.expect(snapItemRecon)
+	sp := ReconSpec{ID: r.str(), Account: r.str()}
+	currency := r.sym()
+	sp.From, sp.To = r.str(), r.str()
+	sp.WindowDays = int(min(r.u(), MaxReconWindow+1))
+	sp.AsOfSeq = r.u()
+	created := r.when()
+	nm, nb := r.u(), r.u()
+	reviewed := r.flag()
+	if r.err == nil && (nm > MaxReconLines || nb > MaxReconLines+MaxMovements) {
+		r.fail("reconciliation %s holds %d matches and %d breaks", sp.ID, nm, nb)
+	}
+	if r.err != nil {
+		return nil
+	}
+	sp.Matches = make([]ReconMatchSpec, nm)
+	var status []matchState
+	if reviewed {
+		status = make([]matchState, nm)
+	}
+	for i := range sp.Matches {
+		r.expect(snapItemMatch)
+		m := &sp.Matches[i]
+		m.Line = r.reconLine()
+		n := r.count(4)
+		if n > MaxMatchPostings && r.err == nil {
+			r.fail("a match of %d movements", n)
+		}
+		if r.err != nil {
+			return nil
+		}
+		m.Postings = make([]ReconPosting, n)
+		for k := range m.Postings {
+			m.Postings[k] = r.reconPosting()
+		}
+		m.By = MatchedBy(r.sym())
+		if reviewed {
+			status[i] = matchState{status: MatchStatus(r.sym()), at: r.when(), note: r.str()}
+		}
+		if r.err != nil {
+			return nil
+		}
+	}
+	sp.Breaks = make([]ReconBreakSpec, nb)
+	for i := range sp.Breaks {
+		r.expect(snapItemBreak)
+		b := &sp.Breaks[i]
+		b.Kind = BreakKind(r.sym())
+		if r.flag() {
+			ln := r.reconLine()
+			b.Line = &ln
+		}
+		if r.flag() {
+			p := r.reconPosting()
+			b.Posting = &p
+		}
+		if r.err != nil {
+			return nil
+		}
+	}
+	run := &reconRun{def: newReconDef(&sp, number, created, currency), status: status}
+	var problems []string
+	reconRunProblems(run, j, func(f string, args ...any) {
+		problems = append(problems, fmt.Sprintf(f, args...))
+	})
+	if len(problems) > 0 {
+		r.fail("%s", problems[0])
+		return nil
+	}
+	return run
+}
+
+func (r *snapReader) reconLine() ReconLine {
+	return ReconLine{Row: int(min(r.u(), 1<<31)), ExternalID: r.str(), Date: r.str(), Amount: r.i(), Reference: r.str()}
+}
+
+func (r *snapReader) reconPosting() ReconPosting {
+	return ReconPosting{Seq: r.u(), TransferID: r.str(), Date: r.str(), Amount: r.i()}
+}
+
 func entryIndex(t *Transfer, seq uint64) int {
 	for i, ref := range t.Entries {
 		if ref.Seq == seq {
@@ -1311,6 +1488,12 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 		nDefs, nMonitors, nAlerts = r.u(), r.u(), r.u()
 		if (nMonitors > MaxMonitors || nDefs > nMonitors+nAlerts) && r.err == nil {
 			r.fail("%d balance monitors and %d definitions", nMonitors, nDefs)
+		}
+	}
+	var nRecons uint64
+	if r.ver >= 11 {
+		if nRecons = r.u(); nRecons > MaxReconRuns && r.err == nil {
+			r.fail("%d reconciliation runs", nRecons)
 		}
 	}
 	if r.err == nil && nEntries != s.head {
@@ -1487,6 +1670,9 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 		if r.ver >= 9 {
 			known = 127
 		}
+		if r.ver >= 11 {
+			known = 255
+		}
 		if flags&^known != 0 || flags&16 != 0 && flags&1 == 0 {
 			r.fail("bad idempotency flags")
 			break
@@ -1541,6 +1727,13 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 			if m := r.monitorState(r.monitorDef(^uint64(0)), ^uint64(0)); r.err == nil {
 				q.e.out.Monitor = m.view()
 			}
+		}
+		if flags&128 != 0 {
+			o := &ReconOutcome{Run: r.str(), Number: r.u(), Changed: int(min(r.u(), MaxReconLines+1))}
+			if r.err == nil && (!ValidID(o.Run) || o.Number == 0 || o.Number > MaxReconRuns || o.Changed > MaxReconLines) {
+				r.fail("bad reconciliation result for %q", o.Run)
+			}
+			q.e.out.Recon = o
 		}
 		s.idem = append(s.idem, q)
 	}
@@ -1608,6 +1801,35 @@ func readSnapshot(fsys wal.FS, path string) (*snapshot, *state, error) {
 		}
 		prevEntry = a.entry
 		st.alerts = append(st.alerts, a)
+	}
+
+	j := reconJournal{entries: st.entries, account: func(id string) *Account {
+		if a := st.accounts[id]; a != nil {
+			return &a.Account
+		}
+		return nil
+	}, reference: func(id string) (string, bool) {
+		tr, ok := st.transfers[id]
+		if !ok {
+			return "", false
+		}
+		return tr.Reference, true
+	}}
+	for k := uint64(0); k < nRecons && r.err == nil; k++ {
+		run := r.recon(uint64(len(st.recons))+1, j)
+		if r.err != nil {
+			break
+		}
+		if _, dup := st.reconByID[run.def.spec.ID]; dup {
+			r.fail("reconciliation %s appears twice", run.def.spec.ID)
+			break
+		}
+		if st.reconItems += run.def.items(); st.reconItems > MaxReconItems {
+			r.fail("reconciliation runs hold more than %d items", MaxReconItems)
+			break
+		}
+		st.recons = append(st.recons, run)
+		st.reconByID[run.def.spec.ID] = run.def.number
 	}
 
 	r.expect(snapItemFooter)

@@ -205,6 +205,10 @@ type Command struct {
 
 	CreateMonitor *MonitorSpec `json:"create_monitor,omitempty"`
 	DeleteMonitor *MonitorRef  `json:"delete_monitor,omitempty"`
+
+	SaveRecon    *ReconSpec       `json:"save_reconciliation,omitempty"`
+	ConfirmRecon *ReconReviewSpec `json:"confirm_matches,omitempty"`
+	ReopenRecon  *ReconReviewSpec `json:"reopen_matches,omitempty"`
 }
 
 // Idem identifies a request for idempotency. Scope separates callers (the API
@@ -295,7 +299,7 @@ func (c *Command) Validate() *Error {
 	for _, set := range []bool{c.CreateAccount != nil, c.CreateTransfer != nil, c.Post != nil, c.Void != nil, c.Reverse != nil,
 		c.IncreasePending != nil, c.ExtendPending != nil, c.FreezeAccount != nil, c.UnfreezeAccount != nil, c.CloseAccount != nil, c.SetLimit != nil, c.CreateBatch != nil,
 		c.CreateWebhook != nil, c.DeleteWebhook != nil, c.WebhookProgress != nil, c.ReplayWebhook != nil,
-		c.CreateMonitor != nil, c.DeleteMonitor != nil} {
+		c.CreateMonitor != nil, c.DeleteMonitor != nil, c.SaveRecon != nil, c.ConfirmRecon != nil, c.ReopenRecon != nil} {
 		if set {
 			n++
 		}
@@ -344,6 +348,15 @@ func (c *Command) Validate() *Error {
 		return c.CreateMonitor.validate()
 	case c.DeleteMonitor != nil:
 		return c.DeleteMonitor.validate()
+	case c.SaveRecon != nil:
+		if err := c.SaveRecon.validate(); err != nil {
+			return err
+		}
+		return c.reconFits()
+	case c.ConfirmRecon != nil:
+		return c.ConfirmRecon.validate()
+	case c.ReopenRecon != nil:
+		return c.ReopenRecon.validate()
 	default:
 		r := c.Reverse
 		if !ValidID(r.TransferID) {

@@ -54,6 +54,10 @@ type frozen struct {
 	// are read live.
 	monSaved map[string]*monState
 	alerts   []alertRec // st.alerts as of head
+	// recons is st.recons as of head; reconSaved holds, by number, the
+	// runs reviews have replaced since.
+	recons     []*reconRun
+	reconSaved map[uint64]*reconRun
 }
 
 // accountImage is what commit changes in place on an account.
@@ -158,6 +162,8 @@ func (l *Ledger) freeze() *frozen {
 	}
 	v.monSaved = map[string]*monState{}
 	v.alerts = st.alerts[:len(st.alerts):len(st.alerts)]
+	v.recons = st.recons[:len(st.recons):len(st.recons)]
+	v.reconSaved = map[uint64]*reconRun{}
 	st.view = v
 	return v
 }
@@ -206,6 +212,11 @@ func (l *Ledger) step(name string) {
 //     monitor's account, its event agrees with the balance after that
 //     line, and each monitor's alerts alternate between triggered and
 //     cleared.
+//  11. every saved reconciliation run describes the journal truthfully:
+//     each movement it names is a posted change to its account with the
+//     amount, transfer and date the journal has, no movement or statement
+//     line appears twice, every match and break is what its kind says, and
+//     its match statuses are well formed.
 //
 // It checks a frozen view of the committed state (see frozen), so commits
 // continue while it runs: they wait for at most one chunk of auditChunk
@@ -571,6 +582,33 @@ func (l *Ledger) Audit() (head uint64, violations []string) {
 		}
 		return nil
 	}, bad)
+	l.mu.RLock()
+	runs := v.reconsAsOf()
+	numbers := make(map[string]uint64, len(runs))
+	for _, r := range runs {
+		if n, ok := v.st.reconByID[r.def.spec.ID]; ok {
+			numbers[r.def.spec.ID] = n
+		}
+	}
+	l.mu.RUnlock()
+	reconStateProblems(runs, func(id string) (uint64, bool) { n, ok := numbers[id]; return n, ok }, reconJournal{entries: v.entries,
+		account: func(id string) *Account {
+			k, ok := index[id]
+			if !ok {
+				return nil
+			}
+			return &Account{ID: id, Currency: accts[k].cur, NormalBalance: accts[k].normal}
+		},
+		reference: func(id string) (string, bool) {
+			l.mu.RLock()
+			defer l.mu.RUnlock()
+			tr, ok := v.transfer(id)
+			if !ok {
+				return "", false
+			}
+			return tr.Reference, true
+		}}, bad)
+	l.step("reconciliations")
 	for i := range accts {
 		a := &accts[i]
 		var r Balance

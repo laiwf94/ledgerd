@@ -751,14 +751,14 @@ func TestQueries(t *testing.T) {
 		t.Fatal("missing transfer")
 	}
 
-	_, mv, err := e.l.Movements("alice", time.Time{}, e.clock.Now().Add(time.Second))
+	_, mv, _, err := e.l.Movements("alice", time.Time{}, e.clock.Now().Add(time.Second))
 	if err != nil || len(mv) != 3 || mv[0].Amount != 1000 || mv[1].Amount != -100 || mv[2].Amount != -200 {
 		t.Fatalf("movements %+v %v", mv, err)
 	}
-	if _, mv, _ := e.l.Movements("alice", e.clock.Now().Add(time.Second), e.clock.Now().Add(time.Hour)); len(mv) != 0 {
+	if _, mv, _, _ := e.l.Movements("alice", e.clock.Now().Add(time.Second), e.clock.Now().Add(time.Hour)); len(mv) != 0 {
 		t.Fatalf("out-of-range movements %+v", mv)
 	}
-	if _, _, err := e.l.Movements("ghost", time.Time{}, time.Now()); err == nil {
+	if _, _, _, err := e.l.Movements("ghost", time.Time{}, time.Now()); err == nil {
 		t.Fatal("missing account")
 	}
 }

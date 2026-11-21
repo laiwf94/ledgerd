@@ -91,14 +91,15 @@ func (l *Ledger) Statement(id string, afterSeq uint64, limit int) (lines []State
 }
 
 // Movements returns the posted changes to an account with entry times in
-// [from, to), for reconciliation. Pending reservations are not movements:
-// money has not moved until they post.
-func (l *Ledger) Movements(id string, from, to time.Time) (Account, []Movement, error) {
+// [from, to), for reconciliation, and the journal head they were read at.
+// Pending reservations are not movements: money has not moved until they
+// post.
+func (l *Ledger) Movements(id string, from, to time.Time) (Account, []Movement, uint64, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	a, ok := l.st.accounts[id]
 	if !ok {
-		return Account{}, nil, errf(CodeNotFound, "account %s does not exist", id)
+		return Account{}, nil, 0, errf(CodeNotFound, "account %s does not exist", id)
 	}
 	var out []Movement
 	for _, r := range a.rows {
@@ -108,7 +109,7 @@ func (l *Ledger) Movements(id string, from, to time.Time) (Account, []Movement, 
 			continue
 		}
 		if len(out) == MaxMovements {
-			return Account{}, nil, errf(CodeInvalid, "more than %d ledger movements in the period; reconcile a shorter period", MaxMovements)
+			return Account{}, nil, 0, errf(CodeInvalid, "more than %d ledger movements in the period; reconcile a shorter period", MaxMovements)
 		}
 		amt := ln.Posted
 		if ln.Direction != a.NormalBalance {
@@ -117,7 +118,7 @@ func (l *Ledger) Movements(id string, from, to time.Time) (Account, []Movement, 
 		out = append(out, Movement{Seq: e.Seq, Time: e.Time, TransferID: e.TransferID,
 			Reference: l.st.transfers[e.TransferID].Reference, Amount: amt})
 	}
-	return a.Account, out, nil
+	return a.Account, out, l.st.head(), nil
 }
 
 // Stats describes the ledger's size.

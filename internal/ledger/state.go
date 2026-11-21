@@ -40,6 +40,10 @@ type state struct {
 	monitors  map[string]*monState   // balance monitors; see monitor.go
 	byAccount map[string][]*monState // each account's monitors in ID order; changed in place under the write lock
 	alerts    []alertRec             // balance alert i+1 is alerts[i]; append-only
+	recons    []*reconRun            // saved reconciliation run n is recons[n-1]; see recon.go
+	reconByID map[string]uint64      // run ID to number
+	// reconItems counts the matches and breaks all runs hold.
+	reconItems int
 
 	// view is set while the invariant checker scans a frozen copy of the
 	// state. commit saves into it whatever it is about to overwrite.
@@ -48,7 +52,7 @@ type state struct {
 
 func newState() *state {
 	return &state{accounts: map[string]*account{}, transfers: map[string]*Transfer{}, ix: newIndexes(), hooks: map[string]*Webhook{},
-		monitors: map[string]*monState{}, byAccount: map[string][]*monState{}}
+		monitors: map[string]*monState{}, byAccount: map[string][]*monState{}, reconByID: map[string]uint64{}}
 }
 
 func (s *state) head() uint64 { return uint64(len(s.entries)) }
@@ -106,6 +110,7 @@ type txn struct {
 	hooks     map[string]*Webhook // changed webhook endpoints, nil for deleted ones
 	hookGen   uint64              // webhook versions handed out by this txn
 	monOps    []monitorOp         // monitors created and deleted, in order
+	recons    []*reconRun         // runs saved or reviewed, in order
 }
 
 // savepoint is what a txn looked like when a batch began, so a failed batch
@@ -257,6 +262,7 @@ func (t *txn) commit() {
 	}
 	t.st.open += t.open
 	t.commitHooks()
+	t.commitRecons()
 }
 
 // exec executes one command. id is the ID for a transfer the command creates
@@ -332,6 +338,12 @@ func (t *txn) apply(c *Command, id string) (Outcome, *Error) {
 		return t.createMonitor(c.CreateMonitor)
 	case c.DeleteMonitor != nil:
 		return t.deleteMonitor(c.DeleteMonitor)
+	case c.SaveRecon != nil:
+		return t.saveRecon(c.SaveRecon)
+	case c.ConfirmRecon != nil:
+		return t.reviewRecon(c.ConfirmRecon, MatchConfirmed)
+	case c.ReopenRecon != nil:
+		return t.reviewRecon(c.ReopenRecon, MatchReopened)
 	}
 	return Outcome{}, errf(CodeInvalid, "empty command")
 }

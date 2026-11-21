@@ -98,7 +98,9 @@ state and replay only the log written since: a million-entry ledger opens in
 
 Reconciliation takes a bank or processor statement as CSV and reports what
 matched, what matched by reference but with a different amount, and what is
-missing on either side. An invariant checker (debits equal credits per
+missing on either side. A run can be saved in the log, listed, and reviewed
+match by match (confirm or reopen); the ledger checks every saved run
+against the journal before it accepts it. An invariant checker (debits equal credits per
 currency, every balance equals the fold of its entries, limits hold,
 reservations match open pending transfers) runs at startup and on demand;
 it checks a frozen copy-on-write view of the ledger, so commits keep going
@@ -165,7 +167,11 @@ JSON bodies and an optional `Idempotency-Key` header.
 | `POST /v1/accounts/{id}/freeze` | Freeze an open account; optional `{"reason":"..."}`. New transfers, posts of its holds and reversals that touch it get `account_frozen`; voids and expiries still apply. |
 | `POST /v1/accounts/{id}/unfreeze` | Return a frozen account to open; optional reason. |
 | `POST /v1/accounts/{id}/close` | Close an account whose posted balance is zero and that holds no reservations (else `failed_precondition`); optional reason. Final: anything touching it afterwards gets `account_closed`. |
-| `POST /v1/accounts/{id}/reconcile` | Match a `text/csv` statement; `?window_days=&from=&to=`. Read only. |
+| `POST /v1/accounts/{id}/reconcile` | Match a `text/csv` statement; `?window_days=&from=&to=`. Read only, unless `save=true` (with optional `id=`): then the result is stored as a reconciliation run, returned as `reconciliation` with a 201. |
+| `GET /v1/reconciliations` | Saved runs, oldest first, with their summaries; `?account=&after=&limit=`, paged by `next_after`. |
+| `GET /v1/reconciliations/{id}` | One run with every match (`status` `proposed`, `confirmed` or `reopened`, `status_changed_at`, `note`) and every break (`amount_mismatch`, `missing_in_ledger`, `missing_in_statement`). |
+| `POST /v1/reconciliations/{id}/confirm` | Confirm matches: `{"matches":[1,2]}` or `{"all":true}`, optional `note`. Returns `changed` and the run's summary. |
+| `POST /v1/reconciliations/{id}/reopen` | Reopen matches, the same way; their line and movement are open items again. |
 | `POST /v1/transfers` | Create a transfer; `"pending": true` for two-phase. `"balance_debit"` / `"balance_credit"` (two postings only) cut the amount to what that account's limits allow, an unset limit counting as zero; `balancing` in the response has `requested_amount` and `amount`, and nothing to move is 422 `limit_exceeded`. A posting with its own `currency` makes a multi-currency transfer: two currencies at most, balanced in each, with `"fx":{"rate":"0.9234","source":"...","quoted_at":"..."}` checked against the exchange accounts' amounts. |
 | `POST /v1/transfers/batch` | Create up to 8,190 transfers atomically: `{"transfers":[...]}`, each as for `POST /v1/transfers`. 201 with `results` in order, each `{"status":"created","transfer":{...}}`. If one is refused, nothing happens: the status and `error` are that transfer's, `error.item` is its index, and `results` has it as `failed` and the rest as `not_applied`. One `Idempotency-Key` covers the whole batch. Bodies up to 16 MiB. |
 | `GET /v1/transfers` | List transfers in creation order, `order=desc` for newest first; `?account=&state=&currency=&reference=&metadata[key]=value&limit=&cursor=`. `reference=` finds the transfers that carry an external reference. Same cursors as accounts. |

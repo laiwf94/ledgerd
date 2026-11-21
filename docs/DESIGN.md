@@ -580,16 +580,19 @@ order. Items, in file order:
 
 | Tag | Item | Fields |
 |---|---|---|
-| `H` | header, first | `u` format version (10), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys; from format 8 `u` count of webhook endpoints and `u` newest webhook version; from format 9 `u` counts of monitor definitions, balance monitors and balance alerts |
+| `H` | header, first | `u` format version (11), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys; from format 8 `u` count of webhook endpoints and `u` newest webhook version; from format 9 `u` counts of monitor definitions, balance monitors and balance alerts; from format 11 `u` count of reconciliation runs |
 | `A` | account, by ID | `str` ID, `str` currency, `i` exponent, `str` normal balance, `bool` non-negative, `bool` non-positive, from format 7 `bool` exchange, `meta`, `time` created; `i` debits posted, credits posted, debits pending, credits pending; `u` version; `u` count then per status change `u` journal head, `time`, `str` status, `str` reason; `u` count then per limit change `u` journal head, `time`, `str` kind, `i` amount (-1 for none), `str` reason |
 | `T` | transfer, by ID | `str` ID, state, currency; `u` posting count then per posting `str` account, `str` direction, `i` amount, posted, reversed, and from format 7 `str` currency (empty for the transfer's own); `str` reference, `meta`, `time` created, `time` expires, `str` reverses; `u` count then `str` reversal IDs; `u` count then per entry `u` sequence, `str` kind; from format 5 a balancing byte (0 none, else bit 0 `balance_debit`, bit 1 `balance_credit`) followed, when not 0, by `i` requested amount and `i` amount; from format 7 a rate: `bool` set, then if set `str` base, quote, rate and source and `time` quoted, present exactly when a posting names another currency |
 | `E` | journal entry, by sequence from 1 | `u` sequence, `time`, `str` kind, transfer ID, currency; `u` line count then per line `str` account, `str` direction, `i` posted, `i` pending, and from format 7 `str` currency (empty for the entry's own); from format 6 `time` expires, set only on an `extend_pending` entry, which alone has no lines; from format 7 a rate as in `T`, only on the entry that creates a multi-currency transfer and equal to that transfer's |
-| `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result, 8 batch result, 16 error names a batch item, 32 webhook result, 64 monitor result); then if flagged: `str` code and message, and `u` item index if flag 16; an account as in `A` with `u` version, the four totals, `u` as-of sequence, then `str` status, `str` status reason and `time` changed, then `i` overdraft and credit limits (-1 for none) and `u` effective sequence; a transfer as in `T`; `i` count of reservations expired; `u` number of batch transfers if flag 8; then an endpoint as in `W` if flag 32; finally, if flag 64, a monitor: a definition as in `D` followed by the fields of `M` after its definition |
+| `I` | idempotency key, oldest first | `str` key, 32-byte request hash, `time` stored, flags byte (1 error, 2 account result, 4 transfer result, 8 batch result, 16 error names a batch item, 32 webhook result, 64 monitor result, 128 reconciliation result); then if flagged: `str` code and message, and `u` item index if flag 16; an account as in `A` with `u` version, the four totals, `u` as-of sequence, then `str` status, `str` status reason and `time` changed, then `i` overdraft and credit limits (-1 for none) and `u` effective sequence; a transfer as in `T`; `i` count of reservations expired; `u` number of batch transfers if flag 8; then an endpoint as in `W` if flag 32; then, if flag 64, a monitor: a definition as in `D` followed by the fields of `M` after its definition; finally, if flag 128, `str` run ID, `u` run number, `u` matches changed |
 | `B` | one transfer of a batch result, right after its `I` item, in batch order | a transfer as in `T` |
 | `W` | webhook endpoint, by ID, from format 8 | `str` ID, URL, secret, account filter; `u` count then `str` kinds; `str` currency filter; from format 10 `str` alert mode, alert monitor, alert account; `u` max batch, `time` created, `u` version, `u` position, `u` next dead letter ID; `u` count then per dead letter `u` ID, after sequence, through sequence, entries, attempts, `str` error, `time` failed, `bool` replaying |
 | `D` | monitor definition, numbered from 0, from format 9: the live monitors' in ID order, then deleted monitors' in the order of their first alert | `str` ID, account; condition: `str` field, `str` operator, `i` value; `str` description, `time` created, `u` first entry watched |
 | `M` | balance monitor, by ID, from format 9 | `u` its definition; `bool` condition met, `u` last alert, `u` alert count |
 | `L` | balance alert, by sequence from 1, from format 9 | `u` its monitor's definition, `u` entry sequence, `u` index of the entry's line on the monitor's account, `bool` triggered (else cleared) |
+| `R` | reconciliation run, by number from 1, from format 11; its `Q` and `K` items follow it | `str` ID, account, currency, first day, last day (YYYY-MM-DD); `u` window days, `u` as-of sequence, `time` saved; `u` match count, `u` break count; `bool` reviewed (the matches carry statuses) |
+| `Q` | one match of the run before it, in order | a line: `u` row, `str` external ID, `str` date, `i` amount, `str` reference; `u` movement count then per movement `u` entry sequence, `str` transfer ID, `str` date, `i` amount; `str` matched by; if the run is reviewed `str` status (empty for proposed), `time` changed, `str` note |
+| `K` | one break of the run before it, in order | `str` kind; `bool` then a line as in `Q`; `bool` then a movement as in `Q` |
 | `Z` | footer, alone in the last frame | `u` number of frames before it |
 
 Each format carries a version: the log's `header` record, the manifest's
@@ -600,15 +603,16 @@ results, format 5 balancing records, format 6 hold increases and
 extensions (`increase_pending` and `extend_pending` entries, and the
 timeout an extension sets), format 7 multi-currency transfers (the
 exchange flag, posting and line currencies, and rates), format 8 webhook
-endpoints, format 9 balance monitors and alerts and format 10 the alert
-subscriptions of webhook endpoints (older endpoints have none); format 1 and 2
+endpoints, format 9 balance monitors and alerts, format 10 the alert
+subscriptions of webhook endpoints (older endpoints have none) and format
+11 saved reconciliation runs; format 1 and 2
 files, which lack those fields, still load with every account open and at
 the limits its flags give, and format 3 to 8 files, written before
 batches, balancing transfers, hold changes, multi-currency transfers,
-webhooks or monitors existed, load as they are; a file older than 6 holding either new entry
+webhooks, monitors or saved reconciliations existed, load as they are; a file older than 6 holding either new entry
 kind is refused. A batch result is spread
-over `B` items because thousands of transfers can be more than one frame
-holds. New command kinds in `cmd` records keep
+over `B` items, and a run over `Q` and `K` items, because thousands of
+transfers or matches can be more than one frame holds. New command kinds in `cmd` records keep
 the log at version 1: an older binary refuses a log holding a command it
 does not know, as an unknown field, rather than misreading it.
 
@@ -1729,6 +1733,59 @@ outside the period are candidates for matching but are not reported as
 missing. The report never changes the ledger; fixing a break is a transfer or
 a reversal. Dates are UTC.
 
+### Saved reconciliation runs
+
+With `save=true` the report is also kept as a *run* (`id=` names it, or the
+server generates `rec_` and 20 hex digits). The API logs it with a
+`save_reconciliation` command holding the period, the window, the journal
+head it was computed against (`as_of_seq`, read under the same lock as the
+movements), and every match and break with its statement line and ledger
+movements. The result is stored, not recomputed on replay: a run keeps
+meaning what it meant when it was saved after the matching rules change,
+and replay, snapshots (format 11) and `ledgerd verify` see the same runs.
+An `Idempotency-Key` covers the statement and the query, not the journal,
+so a retry after new entries gets the original run back.
+
+The ledger does not trust what it is given. Before accepting a run, the
+writer checks that every movement it names is a posted change on the run's
+account with the amount (signed in the account's normal-balance sense),
+transfer and UTC date the journal has at that sequence, no later than
+`as_of_seq`; that no movement or statement line appears twice; that a
+reference match joins a line to a movement of the same amount whose
+transfer carries the line's reference, an amount-and-date match one of the
+same amount within the window, an amount mismatch a line and movement with
+one reference and different amounts, and a missing-in-statement break a
+movement inside the period. A run that fails is refused with
+`failed_precondition` and nothing is stored. The same check
+(`reconProblem`) runs when a snapshot is loaded and in the invariant
+checker, so a stored run always describes the journal truthfully, and a
+command whose run would not fit in one 16 MiB log record is refused before
+it is logged.
+
+Review changes only the status of matches: `POST
+/v1/reconciliations/{id}/confirm` moves proposed or reopened matches to
+*confirmed*, `.../reopen` moves proposed or confirmed ones to *reopened*,
+which puts the line and movement back among the open items. Each takes
+`matches` (ids from 1, in the run's order) or `"all": true`, and an optional
+`note` kept with each changed match along with the time. Naming a match
+that already has the status asked for is `failed_precondition`; `all`
+leaves such matches alone and reports how many it `changed`. A run is
+never edited otherwise; reconciling again makes a new run.
+
+Runs are immutable values. A review commits a new run value holding a new
+status slice (nil while every match is proposed), so readers, snapshots and
+earlier responses keep the old one without a lock, and the invariant
+checker's frozen view saves the run a review replaces. `GET
+/v1/reconciliations` lists runs oldest first by number, `?account=`,
+`after=` and `limit=`, with `next_after` and `has_more`; listings carry
+the summary (matches proposed, confirmed and reopened, breaks by kind),
+and `GET /v1/reconciliations/{id}` adds every match with its status,
+`days_apart`, `status_changed_at` and note, and every break. A stored
+match costs about 210 bytes of heap and 57 more once its run has been
+reviewed (measured on the heap of a ledger reopened with and without a
+10,000-match run); at most 10,000 runs and 2,000,000 matches and breaks are
+kept.
+
 ## What the invariant checker proves
 
 `GET /v1/admin/invariants` and startup both run the checker:
@@ -1771,7 +1828,13 @@ a reversal. Dates are UTC.
     condition holds of the balance the account's history has after that
     line, and follows the previous alert of the same monitor with the
     opposite event (see
-    [balance monitors](#balance-monitors)).
+    [balance monitors](#balance-monitors));
+11. every saved reconciliation run is numbered in order and describes the
+    journal truthfully, as when it was saved: each movement it names is a
+    posted change to its account with the journal's amount, transfer and
+    date, nothing appears twice, every match and break is what its kind
+    says, its summary counts its items, and its match statuses are valid
+    (see [saved reconciliation runs](#saved-reconciliation-runs)).
 
 The checker is linear in the journal size, but commits do not wait for it.
 It checks a frozen, copy-on-write view of the committed state as of the
@@ -1918,6 +1981,7 @@ accounts, so all of these also cross power cuts and snapshots.
 | Rate source | 1 to 64 chars | |
 | Statement CSV | 4 MiB, 10,000 lines | |
 | Reconciliation | 4 at once, period 366 days, window 31 days, 100,000 movements | Bounds memory per request. |
+| Saved reconciliation runs | 10,000 runs, 2,000,000 matches and breaks in all, one 16 MiB log record per run | Runs live in memory; a stored match is about 210 bytes. |
 | Statement page | 1,000 lines | |
 | Listing page | 1,000 accounts or transfers, 8 metadata filters, max(16 × limit, 4,096) candidates scanned | Bounds the time a listing holds the read lock. |
 | Log record | 16 MiB | Sized for the largest batch; validation guarantees every accepted command fits (tested). Other commands encode to under 256 KiB. |

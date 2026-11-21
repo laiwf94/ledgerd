@@ -8,6 +8,32 @@ current formats.
 
 ## Unreleased
 
+### Reconciliation v2 (#28)
+
+#### Added
+
+- Saved reconciliation runs: `POST /v1/accounts/{id}/reconcile?save=true`
+  (optionally `&id=`) stores the report as a run in the log with a
+  `save_reconciliation` command: the period, the window, the journal head it
+  was computed against and every match and break with its statement line
+  and ledger movements. `GET /v1/reconciliations` lists runs with their
+  summaries (`?account=&after=&limit=`) and `GET /v1/reconciliations/{id}`
+  returns one with its matches and breaks. `POST .../confirm` and
+  `POST .../reopen` review matches by id or all at once, with a note, and
+  are logged as `confirm_matches` and `reopen_matches`. The writer checks
+  every run against the journal before accepting it (each movement is a
+  posted change on the account with the journal's amount, transfer and
+  date; nothing appears twice; each match and break is what its kind says),
+  and the same check runs on snapshot load and in the invariant checker
+  (rule 11). Runs survive replay and are carried in snapshots (format 11)
+  and compared by `ledgerd verify`. Limits: 10,000 runs, 2,000,000 matches
+  and breaks in all.
+
+#### Changed
+
+- `Ledger.Movements` also returns the journal head the movements were read
+  at.
+
 ### Change feed, live stream, webhooks and export (#27)
 
 #### Added

@@ -375,6 +375,13 @@ func stateDiff(l *Ledger, s *snapshot, st *state) string {
 			}
 		}
 		return fmt.Sprintf("the snapshot holds %d balance alerts, the log %d", len(st.alerts), len(l.st.alerts))
+	case !reflect.DeepEqual(l.st.recons, st.recons) || !reflect.DeepEqual(l.st.reconByID, st.reconByID) || l.st.reconItems != st.reconItems:
+		for i, r := range l.st.recons {
+			if i >= len(st.recons) || !reflect.DeepEqual(r, st.recons[i]) {
+				return fmt.Sprintf("reconciliation %s differs", r.def.spec.ID)
+			}
+		}
+		return fmt.Sprintf("the snapshot holds %d reconciliation runs, the log %d", len(st.recons), len(l.st.recons))
 	}
 	if d := indexDiff(l.st.ix, st.ix); d != "" {
 		return "secondary indexes differ: " + d

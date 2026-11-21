@@ -202,6 +202,10 @@ func New(cfg Config) (*Server, error) {
 	s.route("GET /v1/balance-monitors/{id}", s.getMonitor, authKey)
 	s.route("DELETE /v1/balance-monitors/{id}", s.deleteMonitor, authKey)
 	s.route("GET /v1/balance-alerts", s.listAlerts, authKey)
+	s.route("GET /v1/reconciliations", s.listRecons, authKey)
+	s.route("GET /v1/reconciliations/{id}", s.getRecon, authKey)
+	s.route("POST /v1/reconciliations/{id}/confirm", s.reviewRecon(false), authKey)
+	s.route("POST /v1/reconciliations/{id}/reopen", s.reviewRecon(true), authKey)
 	s.route("GET /v1/admin/invariants", s.invariants, authAdmin)
 	s.route("/", func(http.ResponseWriter, *http.Request) error {
 		return &apiError{http.StatusNotFound, "not_found", "no such endpoint"}
@@ -822,13 +826,18 @@ func (s *Server) reverseTransfer(w http.ResponseWriter, r *http.Request) error {
 }
 
 // reconcile matches a CSV statement against the account's posted movements.
-// It reads only; nothing is stored.
+// With save=true the result is stored as a reconciliation run (see
+// recons.go); otherwise nothing is stored.
 func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) error {
 	id, err := pathID(r)
 	if err != nil {
 		return err
 	}
 	if err := requireType(r, "text/csv"); err != nil {
+		return err
+	}
+	save, runID, err := saveParams(r)
+	if err != nil {
 		return err
 	}
 	window, err := queryUint(r, "window_days", DefaultWindowDays, recon.MaxWindowDays)
@@ -882,7 +891,7 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) error {
 		return badRequest("the period must run forwards and cover at most %d days", MaxReconcileDays)
 	}
 	pad := time.Duration(window) * 24 * time.Hour
-	_, movements, err := s.l.Movements(id, lo.Add(-pad), hi.Add(24*time.Hour+pad))
+	_, movements, head, err := s.l.Movements(id, lo.Add(-pad), hi.Add(24*time.Hour+pad))
 	if err != nil {
 		return err
 	}
@@ -891,11 +900,36 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) error {
 		postings[i] = recon.Posting{Seq: m.Seq, Time: m.Time, TransferID: m.TransferID, Reference: m.Reference, Amount: m.Amount}
 	}
 	rep := recon.Reconcile(lines, postings, lo, hi, int(window))
-	writeJSON(w, http.StatusOK, struct {
+	resp := struct {
 		Account  string `json:"account"`
 		Currency string `json:"currency"`
 		recon.Report
-	}{id, acct.Currency, rep})
+		Run *ledger.ReconRun `json:"reconciliation,omitempty"`
+	}{Account: id, Currency: acct.Currency, Report: rep}
+	if save {
+		params := struct {
+			ID         string       `json:"id,omitempty"`
+			From       string       `json:"from"`
+			To         string       `json:"to"`
+			WindowDays uint64       `json:"window_days"`
+			Lines      []recon.Line `json:"lines"`
+		}{runID, rep.From, rep.To, window, lines}
+		if runID == "" {
+			runID = newRunID()
+		}
+		spec := reconSpec(runID, id, rep, lines, postings, head)
+		out, err := s.do(w, r, ledger.Command{SaveRecon: &spec}, params)
+		if err != nil {
+			return err
+		}
+		if resp.Run, err = s.l.Recon(out.Recon.Run); err != nil {
+			return err
+		}
+		resp.Run.Matches, resp.Run.Breaks = nil, nil
+		writeJSON(w, http.StatusCreated, resp)
+		return nil
+	}
+	writeJSON(w, http.StatusOK, resp)
 	return nil
 }
 

@@ -147,6 +147,9 @@ func sameState(t testing.TB, what string, a, b *Ledger) {
 	if !reflect.DeepEqual(a.st.alerts, b.st.alerts) {
 		t.Fatalf("%s: balance alerts differ: %d and %d", what, len(a.st.alerts), len(b.st.alerts))
 	}
+	if !reflect.DeepEqual(a.st.recons, b.st.recons) || !reflect.DeepEqual(a.st.reconByID, b.st.reconByID) || a.st.reconItems != b.st.reconItems {
+		t.Fatalf("%s: reconciliation runs differ: %d and %d", what, len(a.st.recons), len(b.st.recons))
+	}
 	if d := indexDiff(a.st.ix, b.st.ix); d != "" {
 		t.Fatalf("%s: secondary indexes differ: %s", what, d)
 	}
@@ -435,6 +438,9 @@ func writeSmallSnapshot(t *testing.T, ver int) (dir string, clock *fakeClock) {
 	}
 	if ver >= 10 {
 		writeSmallAlertHooks(t, e)
+	}
+	if ver >= 11 {
+		writeSmallRecons(t, e)
 	}
 	e.l.Close()
 	if nums := snapshotFiles(t, e.dir); len(nums) != 1 {
