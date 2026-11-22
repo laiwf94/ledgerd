@@ -442,6 +442,9 @@ func writeSmallSnapshot(t *testing.T, ver int) (dir string, clock *fakeClock) {
 	if ver >= 11 {
 		writeSmallRecons(t, e)
 	}
+	if ver >= 12 {
+		writeSmallNearRecons(t, e)
+	}
 	e.l.Close()
 	if nums := snapshotFiles(t, e.dir); len(nums) != 1 {
 		t.Fatalf("snapshots %v", nums)

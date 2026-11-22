@@ -73,8 +73,10 @@ const (
 	// webhook endpoint's alert subscription; older endpoints have none.
 	// Version 11 adds saved reconciliation runs, with their matches,
 	// breaks and match statuses, and the run a keyed reconciliation
-	// command returned. Older versions hold none.
-	snapVersion    = 11
+	// command returned. Older versions hold none. Version 12 adds a run's
+	// tolerances for near-matches; older runs have none and so no
+	// near-matches.
+	snapVersion    = 12
 	snapPrefix     = "snapshot-"
 	snapSuffix     = ".snap"
 	snapTmpSuffix  = ".tmp"
@@ -516,6 +518,10 @@ func (w *snapWriter) recon(r *reconRun) {
 	w.str(sp.From)
 	w.str(sp.To)
 	w.u(uint64(sp.WindowDays))
+	if w.ver >= 12 {
+		w.i(sp.Tolerance)
+		w.i(sp.ToleranceBP)
+	}
 	w.u(sp.AsOfSeq)
 	w.when(d.created)
 	w.u(uint64(len(sp.Matches)))
@@ -1364,6 +1370,9 @@ func (r *snapReader) recon(number uint64, j reconJournal) *reconRun {
 	currency := r.sym()
 	sp.From, sp.To = r.str(), r.str()
 	sp.WindowDays = int(min(r.u(), MaxReconWindow+1))
+	if r.ver >= 12 {
+		sp.Tolerance, sp.ToleranceBP = r.i(), r.i()
+	}
 	sp.AsOfSeq = r.u()
 	created := r.when()
 	nm, nb := r.u(), r.u()

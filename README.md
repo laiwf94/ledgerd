@@ -101,7 +101,10 @@ matched, what matched by reference but with a different amount, and what is
 missing on either side. One statement line can match a payout batch: the
 set of movements that carry its reference, or that fall in its date window,
 and sum to it exactly, found by a bounded subset-sum search that proposes a
-batch only when exactly one set fits. A run can be saved in the log, listed, and reviewed
+batch only when exactly one set fits. With a tolerance (an amount, a
+percentage of the line, or both), fees and rounding become labelled
+near-matches that record the difference, proposed only when the line and
+the movement are each other's only candidate. A run can be saved in the log, listed, and reviewed
 match by match (confirm or reopen); the ledger checks every saved run
 against the journal before it accepts it. An invariant checker (debits equal credits per
 currency, every balance equals the fold of its entries, limits hold,
@@ -170,7 +173,7 @@ JSON bodies and an optional `Idempotency-Key` header.
 | `POST /v1/accounts/{id}/freeze` | Freeze an open account; optional `{"reason":"..."}`. New transfers, posts of its holds and reversals that touch it get `account_frozen`; voids and expiries still apply. |
 | `POST /v1/accounts/{id}/unfreeze` | Return a frozen account to open; optional reason. |
 | `POST /v1/accounts/{id}/close` | Close an account whose posted balance is zero and that holds no reservations (else `failed_precondition`); optional reason. Final: anything touching it afterwards gets `account_closed`. |
-| `POST /v1/accounts/{id}/reconcile` | Match a `text/csv` statement; `?window_days=&from=&to=`. Read only, unless `save=true` (with optional `id=`): then the result is stored as a reconciliation run, returned as `reconciliation` with a 201. |
+| `POST /v1/accounts/{id}/reconcile` | Match a `text/csv` statement; `?window_days=&from=&to=`, and `tolerance=` (an amount such as `0.05`) and `tolerance_pct=` (up to `10`) for near-matches (`reference_near`, `amount_date_near`, with `difference`). Read only, unless `save=true` (with optional `id=`): then the result is stored as a reconciliation run, returned as `reconciliation` with a 201. |
 | `GET /v1/reconciliations` | Saved runs, oldest first, with their summaries; `?account=&after=&limit=`, paged by `next_after`. |
 | `GET /v1/reconciliations/{id}` | One run with every match (`status` `proposed`, `confirmed` or `reopened`, `status_changed_at`, `note`) and every break (`amount_mismatch`, `missing_in_ledger`, `missing_in_statement`). |
 | `POST /v1/reconciliations/{id}/confirm` | Confirm matches: `{"matches":[1,2]}` or `{"all":true}`, optional `note`. Returns `changed` and the run's summary. |

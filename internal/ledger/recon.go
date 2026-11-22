@@ -6,6 +6,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/laiwf94/ledgerd/internal/money"
 	"github.com/laiwf94/ledgerd/internal/wal"
 )
 
@@ -23,7 +24,8 @@ import (
 // statement line appears twice, and that every match and break is what its
 // kind says (a reference match joins a line to a movement with its reference
 // and amount, an amount-and-date match one with its amount within the
-// window). The same check runs on snapshot load and in the invariant
+// window, and a near-match one whose amount differs from the line's by no
+// more than the run's tolerance). The same check runs on snapshot load and in the invariant
 // checker, so a stored run always describes the journal truthfully.
 //
 // Reviewing a run changes only the status of its matches: confirm_matches
@@ -51,6 +53,9 @@ const (
 	// the command: type, time, an escaped idempotency key and its hash.
 	reconRecordSlack = 4096
 	reconDateLayout  = "2006-01-02"
+	// MaxReconToleranceBP is the largest percentage tolerance a run may
+	// have, in basis points (10%).
+	MaxReconToleranceBP = money.MaxToleranceBasisPoints
 )
 
 // MatchedBy says how a match was found.
@@ -66,9 +71,21 @@ const (
 	// ByAmountDateBatch joins a line to two or more movements within the
 	// window whose amounts sum to it.
 	ByAmountDateBatch MatchedBy = "amount_date_batch"
+	// ByReferenceNear joins a line to a movement whose transfer carries its
+	// reference and whose amount is within the run's tolerance of it.
+	ByReferenceNear MatchedBy = "reference_near"
+	// ByAmountDateNear joins a line to a movement within the window whose
+	// amount is within the run's tolerance of it.
+	ByAmountDateNear MatchedBy = "amount_date_near"
 )
 
 func (b MatchedBy) batch() bool { return b == ByReferenceBatch || b == ByAmountDateBatch }
+
+func (b MatchedBy) near() bool { return b == ByReferenceNear || b == ByAmountDateNear }
+
+func (b MatchedBy) byReference() bool {
+	return b == ByReference || b == ByReferenceBatch || b == ByReferenceNear
+}
 
 // BreakKind says what is wrong with an item reconciliation could not match.
 type BreakKind string
@@ -134,16 +151,20 @@ type ReconBreakSpec struct {
 
 // ReconSpec saves a reconciliation run. From and To are the period's first
 // and last days (UTC, YYYY-MM-DD) and AsOfSeq the journal head the run was
-// computed against.
+// computed against. Tolerance (minor units) and ToleranceBP (basis points
+// of a line's amount) bound how far a near-match may differ from its line;
+// the larger of the two applies (money.Tolerance).
 type ReconSpec struct {
-	ID         string           `json:"id"`
-	Account    string           `json:"account"`
-	From       string           `json:"from"`
-	To         string           `json:"to"`
-	WindowDays int              `json:"window_days"`
-	AsOfSeq    uint64           `json:"as_of_seq"`
-	Matches    []ReconMatchSpec `json:"matches"`
-	Breaks     []ReconBreakSpec `json:"breaks"`
+	ID          string           `json:"id"`
+	Account     string           `json:"account"`
+	From        string           `json:"from"`
+	To          string           `json:"to"`
+	WindowDays  int              `json:"window_days"`
+	Tolerance   int64            `json:"tolerance,omitempty"`
+	ToleranceBP int64            `json:"tolerance_bp,omitempty"`
+	AsOfSeq     uint64           `json:"as_of_seq"`
+	Matches     []ReconMatchSpec `json:"matches"`
+	Breaks      []ReconBreakSpec `json:"breaks"`
 }
 
 // ReconReviewSpec confirms or reopens matches of a run: those numbered in
@@ -164,16 +185,18 @@ type ReconOutcome struct {
 	Changed int    `json:"changed"`
 }
 
-// ReconMatch is a match as clients see it.
+// ReconMatch is a match as clients see it. Difference is the line's amount
+// less the movement's, for a near-match.
 type ReconMatch struct {
-	ID        int            `json:"id"`
-	Line      ReconLine      `json:"line"`
-	Postings  []ReconPosting `json:"postings"`
-	By        MatchedBy      `json:"matched_by"`
-	DaysApart int            `json:"days_apart"`
-	Status    MatchStatus    `json:"status"`
-	ChangedAt time.Time      `json:"status_changed_at,omitzero"`
-	Note      string         `json:"note,omitempty"`
+	ID         int            `json:"id"`
+	Line       ReconLine      `json:"line"`
+	Postings   []ReconPosting `json:"postings"`
+	By         MatchedBy      `json:"matched_by"`
+	Difference int64          `json:"difference,omitempty"`
+	DaysApart  int            `json:"days_apart"`
+	Status     MatchStatus    `json:"status"`
+	ChangedAt  time.Time      `json:"status_changed_at,omitzero"`
+	Note       string         `json:"note,omitempty"`
 }
 
 // ReconBreak is a break as clients see it.
@@ -189,6 +212,7 @@ type ReconCounts struct {
 	StatementLines     int `json:"statement_lines"`
 	LedgerPostings     int `json:"ledger_postings"`
 	Matches            int `json:"matches"`
+	NearMatches        int `json:"near_matches"`
 	Proposed           int `json:"proposed"`
 	Confirmed          int `json:"confirmed"`
 	Reopened           int `json:"reopened"`
@@ -201,18 +225,21 @@ type ReconCounts struct {
 // ReconRun is a saved run as clients see it. Matches and Breaks are left
 // out of listings.
 type ReconRun struct {
-	ID         string       `json:"id"`
-	Number     uint64       `json:"number"`
-	Account    string       `json:"account"`
-	Currency   string       `json:"currency"`
-	From       string       `json:"from"`
-	To         string       `json:"to"`
-	WindowDays int          `json:"window_days"`
-	AsOfSeq    uint64       `json:"as_of_seq"`
-	CreatedAt  time.Time    `json:"created_at"`
-	Summary    ReconCounts  `json:"summary"`
-	Matches    []ReconMatch `json:"matches,omitempty"`
-	Breaks     []ReconBreak `json:"breaks,omitempty"`
+	ID         string `json:"id"`
+	Number     uint64 `json:"number"`
+	Account    string `json:"account"`
+	Currency   string `json:"currency"`
+	From       string `json:"from"`
+	To         string `json:"to"`
+	WindowDays int    `json:"window_days"`
+	Tolerance  int64  `json:"tolerance"`
+	// ToleranceBP is the percentage tolerance in basis points.
+	ToleranceBP int64        `json:"tolerance_bp"`
+	AsOfSeq     uint64       `json:"as_of_seq"`
+	CreatedAt   time.Time    `json:"created_at"`
+	Summary     ReconCounts  `json:"summary"`
+	Matches     []ReconMatch `json:"matches,omitempty"`
+	Breaks      []ReconBreak `json:"breaks,omitempty"`
 }
 
 // reconDef is what never changes about a run.
@@ -274,7 +301,7 @@ func (r *reconRun) view(detail bool) *ReconRun {
 	d := r.def
 	s := &d.spec
 	v := &ReconRun{ID: s.ID, Number: d.number, Account: s.Account, Currency: d.currency, From: s.From, To: s.To,
-		WindowDays: s.WindowDays, AsOfSeq: s.AsOfSeq, CreatedAt: d.created, Summary: r.counts()}
+		WindowDays: s.WindowDays, Tolerance: s.Tolerance, ToleranceBP: s.ToleranceBP, AsOfSeq: s.AsOfSeq, CreatedAt: d.created, Summary: r.counts()}
 	if !detail {
 		return v
 	}
@@ -288,6 +315,9 @@ func (r *reconRun) view(detail bool) *ReconRun {
 		}
 		v.Matches[i] = ReconMatch{ID: i + 1, Line: m.Line, Postings: m.Postings, By: m.By, DaysApart: days,
 			Status: st.view(), ChangedAt: st.at, Note: st.note}
+		if m.By.near() {
+			v.Matches[i].Difference = m.Line.Amount - m.Postings[0].Amount // checked: same sign, so no overflow
+		}
 	}
 	v.Breaks = make([]ReconBreak, len(s.Breaks))
 	for i := range s.Breaks {
@@ -314,7 +344,9 @@ func daysApart(a, b string) int {
 	return int(y - x)
 }
 
-func validMatchedBy(b MatchedBy) bool { return b == ByReference || b == ByAmountDate || b.batch() }
+func validMatchedBy(b MatchedBy) bool {
+	return b == ByReference || b == ByAmountDate || b.batch() || b.near()
+}
 
 func validBreakKind(k BreakKind) bool {
 	return k == BreakAmountMismatch || k == BreakMissingInLedger || k == BreakMissingInStatement
@@ -338,6 +370,12 @@ func (s *ReconSpec) validate() *Error {
 	}
 	if s.WindowDays < 0 || s.WindowDays > MaxReconWindow {
 		return errf(CodeInvalid, "window_days must be between 0 and %d", MaxReconWindow)
+	}
+	if s.Tolerance < 0 {
+		return errf(CodeInvalid, "tolerance must not be negative")
+	}
+	if s.ToleranceBP < 0 || s.ToleranceBP > MaxReconToleranceBP {
+		return errf(CodeInvalid, "tolerance_bp must be between 0 and %d (10%%)", MaxReconToleranceBP)
 	}
 	lines, postings := 0, 0
 	checkLine := func(where string, ln *ReconLine) *Error {
@@ -366,7 +404,8 @@ func (s *ReconSpec) validate() *Error {
 		m := &s.Matches[i]
 		where := fmt.Sprintf("matches[%d]", i)
 		if !validMatchedBy(m.By) {
-			return errf(CodeInvalid, "%s.matched_by must be reference, amount_date, reference_batch or amount_date_batch", where)
+			return errf(CodeInvalid, "%s.matched_by must be reference, amount_date, reference_batch, amount_date_batch, "+
+				"reference_near or amount_date_near", where)
 		}
 		if !m.By.batch() && len(m.Postings) != 1 {
 			return errf(CodeInvalid, "%s must join its line to exactly one movement", where)
@@ -530,14 +569,25 @@ func reconProblem(s *ReconSpec, j reconJournal) string {
 			} else {
 				sum = next
 			}
-			if (m.By == ByAmountDate || m.By == ByAmountDateBatch) && daysApart(m.Line.Date, p.Date) > s.WindowDays {
+			if !m.By.byReference() && daysApart(m.Line.Date, p.Date) > s.WindowDays {
 				return fmt.Sprintf("%s: entry %d is more than %d days from the line", where, p.Seq, s.WindowDays)
 			}
-			if ref, _ := j.reference(p.TransferID); (m.By == ByReference || m.By == ByReferenceBatch) && (m.Line.Reference == "" || ref != m.Line.Reference) {
+			if ref, _ := j.reference(p.TransferID); m.By.byReference() && (m.Line.Reference == "" || ref != m.Line.Reference) {
 				return fmt.Sprintf("%s: transfer %s does not have the line's reference", where, p.TransferID)
 			}
 		}
-		if overflow || sum != m.Line.Amount {
+		if m.By.near() {
+			// One movement the line's way (checked above), so the
+			// difference cannot overflow.
+			allowed := money.Tolerance(m.Line.Amount, s.Tolerance, s.ToleranceBP)
+			if allowed == 0 {
+				return fmt.Sprintf("%s is a near-match, but the run allows no difference from line %d", where, m.Line.Row)
+			}
+			if d := m.Line.Amount - sum; d == 0 || d > allowed || -d > allowed {
+				return fmt.Sprintf("%s: a near-match must differ from its line by 1 to %d; the line is for %d, the movement %d",
+					where, allowed, m.Line.Amount, sum)
+			}
+		} else if overflow || sum != m.Line.Amount {
 			return fmt.Sprintf("%s: the line is for %d, the movements sum to %d", where, m.Line.Amount, sum)
 		}
 	}
@@ -584,6 +634,9 @@ func newReconDef(s *ReconSpec, number uint64, created time.Time, currency string
 	for i := range s.Matches {
 		c.StatementLines++
 		c.LedgerPostings += len(s.Matches[i].Postings)
+		if s.Matches[i].By.near() {
+			c.NearMatches++
+		}
 	}
 	for i := range s.Breaks {
 		switch b := &s.Breaks[i]; b.Kind {

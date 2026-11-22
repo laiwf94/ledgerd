@@ -13,6 +13,10 @@
 //  3. Batches by amount and date: a remaining line matches a set of
 //     remaining movements within the window that sums to its amount, such
 //     as a payout batch settled as one bank line.
+//  4. Near-matches by amount and date: with a tolerance (see near.go), a
+//     remaining line matches the remaining movement within the window
+//     nearest its amount. Pass 1 likewise tries a near-match by reference
+//     before it reports an amount mismatch.
 //
 // Whatever is left is missing on one side. The report never changes the
 // ledger; fixing a break is a new transfer or a reversal.
@@ -214,9 +218,14 @@ type Match struct {
 	TransferID string `json:"transfer_id,omitempty"` // the posting; empty for a batch
 	Seq        uint64 `json:"seq,omitempty"`
 	Amount     int64  `json:"amount"`
-	// By is "reference" or "amount_date" for one posting, and
-	// "reference_batch" or "amount_date_batch" for a batch.
+	// By is "reference" or "amount_date" for one posting with the line's
+	// amount, "reference_near" or "amount_date_near" for one within the
+	// run's tolerance, and "reference_batch" or "amount_date_batch" for a
+	// batch.
 	By string `json:"matched_by"`
+	// Difference is the line's amount minus the posting's, for a
+	// near-match; zero otherwise.
+	Difference int64 `json:"difference,omitempty"`
 	// DaysApart is the most days between the line and any of its postings.
 	DaysApart int64 `json:"days_apart"`
 	// Postings lists a batch's postings, two or more, in journal order.
@@ -237,6 +246,8 @@ const (
 	ByAmountDate      = "amount_date"
 	ByReferenceBatch  = "reference_batch"
 	ByAmountDateBatch = "amount_date_batch"
+	ByReferenceNear   = "reference_near"
+	ByAmountDateNear  = "amount_date_near"
 )
 
 // Mismatch is a line and posting with the same reference but different amounts.
@@ -267,13 +278,27 @@ type Summary struct {
 	// search could not finish (too many candidates or out of budget), so a
 	// batch for them may exist.
 	BatchSearchesCut int `json:"batch_searches_cut"`
+	// NearMatches counts the matches within the tolerance rather than
+	// exact.
+	NearMatches int `json:"near_matches"`
+	// NearAmbiguous counts the lines reported as breaks that had a
+	// movement within the tolerance but no unique one: two or more, or one
+	// that another open line could equally take.
+	NearAmbiguous int `json:"near_ambiguous"`
+	// NearSearchesCut counts the lines reported as breaks whose near-match
+	// search ran out of budget, so a near-match for them may exist.
+	NearSearchesCut int `json:"near_searches_cut"`
 }
 
 // Report is the result of a reconciliation.
 type Report struct {
-	From               string     `json:"from"`
-	To                 string     `json:"to"`
-	WindowDays         int        `json:"window_days"`
+	From       string `json:"from"`
+	To         string `json:"to"`
+	WindowDays int    `json:"window_days"`
+	// Tolerance (minor units) and ToleranceBP (basis points of a line's
+	// amount) are the run's tolerance for near-matches.
+	Tolerance          int64      `json:"tolerance"`
+	ToleranceBP        int64      `json:"tolerance_bp"`
 	Matched            []Match    `json:"matched"`
 	AmountMismatches   []Mismatch `json:"amount_mismatches"`
 	MissingInLedger    []Line     `json:"missing_in_ledger"`
@@ -312,12 +337,21 @@ func day(t time.Time) int64 {
 
 func dayDate(d int64) string { return time.Unix(d*86400, 0).UTC().Format(dateLayout) }
 
-// Reconcile matches statement lines against postings. from and to are the
-// period's first and last days (UTC); postings may come from up to window
-// days either side, so lines near the edges can still match, but only
-// postings inside the period are reported as missing from the statement.
+// Reconcile matches statement lines against postings exactly, within a
+// window of days. See ReconcileWith.
 func Reconcile(lines []Line, postings []Posting, from, to time.Time, window int) Report {
+	return ReconcileWith(lines, postings, from, to, Options{WindowDays: window})
+}
+
+// ReconcileWith matches statement lines against postings. from and to are
+// the period's first and last days (UTC); postings may come from up to
+// opt.WindowDays days either side, so lines near the edges can still match,
+// but only postings inside the period are reported as missing from the
+// statement.
+func ReconcileWith(lines []Line, postings []Posting, from, to time.Time, opt Options) Report {
+	window := opt.WindowDays
 	rep := Report{From: from.Format(dateLayout), To: to.Format(dateLayout), WindowDays: window,
+		Tolerance: max(opt.Tolerance, 0), ToleranceBP: max(opt.ToleranceBP, 0),
 		Matched: []Match{}, AmountMismatches: []Mismatch{}, MissingInLedger: []Line{}, MissingInStatement: []Posting{}}
 	type posting struct {
 		Posting
@@ -445,15 +479,100 @@ func Reconcile(lines []Line, postings []Posting, from, to time.Time, window int)
 			note(li, res)
 		}
 	}
-	// counted adds up how the batch searches of lines reported as breaks
-	// ended.
-	var nCut, nAmbiguous int
+	// Near-matches by reference, before any amount mismatch is reported.
+	nb := budget{total: NearSearchSteps}
+	nearCut := make([]bool, len(ls))
+	near := func(ln line, by string, p posting) Match {
+		m := Match{ExternalID: ln.ExternalID, Row: ln.Row, TransferID: p.TransferID, Seq: p.Seq, Amount: p.Amount,
+			By: by, DaysApart: abs(p.day - ln.day)}
+		if d := ln.Amount - p.Amount; d != 0 { // same sign, so no overflow
+			m.Difference = d
+		} else if by == ByReferenceNear {
+			m.By = ByReference
+		} else {
+			m.By = ByAmountDate
+		}
+		return m
+	}
+	nearAmbiguous := make([]bool, len(ls))
+	nearLine := func(ln line) bool { return ln.ok && ln.Amount != 0 && opt.allowed(ln.Amount) > 0 }
+	sameWay := func(a, b int64) bool { return (a > 0) == (b > 0) }
+	// nearPass finds the near-matches among the open lines want accepts
+	// and records each. One round is enough: a match is a line and a
+	// movement that are each other's only candidate, so taking them changes
+	// no other line's candidates or movement's rivals.
+	var tryLines []int
+	nearPass := func(want func(li int) bool, cands func(li int) ([]int, searchResult), rivals func(pi, li int) ([]int, searchResult),
+		matched func(li, pi int)) {
+		tryLines = tryLines[:0]
+		for li := range ls {
+			if !done[li] && want(li) {
+				tryLines = append(tryLines, li)
+			}
+		}
+		for _, pr := range nearRound(tryLines, cands, rivals, nearAmbiguous, nearCut) {
+			li, pi := pr[0], pr[1]
+			used[pi], done[li] = true, true
+			matched(li, pi)
+		}
+	}
+	var cbuf, rbuf []int
+	linesByRef := map[string][]int{}
+	for li, ln := range ls {
+		if !done[li] && refLine(ln) && nearLine(ln) {
+			linesByRef[ln.Reference] = append(linesByRef[ln.Reference], li)
+		}
+	}
+	if len(linesByRef) > 0 {
+		nearPass(func(li int) bool { return refLine(ls[li]) && nearLine(ls[li]) },
+			func(li int) ([]int, searchResult) {
+				ln := ls[li]
+				allowed := opt.allowed(ln.Amount)
+				cbuf = cbuf[:0]
+				nb.startLineOf(NearLineSteps)
+				for _, pi := range byRef[ln.Reference] {
+					if !nb.spend() {
+						return cbuf, cut
+					}
+					if p := ps[pi]; !used[pi] && sameWay(p.Amount, ln.Amount) && abs(ln.Amount-p.Amount) <= allowed {
+						if cbuf = append(cbuf, pi); len(cbuf) == 2 {
+							break
+						}
+					}
+				}
+				return cbuf, noBatch
+			},
+			func(pi, li int) ([]int, searchResult) {
+				p := ps[pi]
+				rbuf = rbuf[:0]
+				nb.startLineOf(NearLineSteps)
+				for _, lj := range linesByRef[p.Reference] {
+					if !nb.spend() {
+						return rbuf, cut
+					}
+					if ln := ls[lj]; lj != li && !done[lj] && sameWay(ln.Amount, p.Amount) && abs(ln.Amount-p.Amount) <= opt.allowed(ln.Amount) {
+						return append(rbuf, lj), noBatch
+					}
+				}
+				return rbuf, noBatch
+			},
+			func(li, pi int) { rep.Matched = append(rep.Matched, near(ls[li], ByReferenceNear, ps[pi])) })
+	}
+	// counted adds up how the batch and near-match searches of lines
+	// reported as breaks ended.
+	var nCut, nAmbiguous, nNearCut, nNearAmbiguous int
 	counted := func(li int) {
 		switch outcome[li] {
 		case cut:
 			nCut++
 		case ambiguous:
 			nAmbiguous++
+		}
+		switch {
+		case nearCut[li]:
+			nNearCut++
+		case nearAmbiguous[li]:
+			nNearAmbiguous++
 		}
 	}
 	// Postings only ever become used, so each reference's cursor moves
@@ -608,6 +727,58 @@ func Reconcile(lines []Line, postings []Posting, from, to time.Time, window int)
 		}
 	}
 
+	// Pass 4: near-matches by amount and date, for the lines still open.
+	// Free movements and open lines are indexed by amount, so a line finds
+	// its candidates and a movement its rival lines without a scan.
+	var freeMovements, lineItems []int
+	for li, ln := range ls {
+		if !done[li] && nearLine(ln) {
+			lineItems = append(lineItems, li)
+		}
+	}
+	if len(lineItems) > 0 {
+		for i := range ps {
+			if !used[i] {
+				freeMovements = append(freeMovements, i)
+			}
+		}
+		pdays, ldays := make([]int64, len(ps)), make([]int64, len(ls))
+		for i := range ps {
+			pdays[i] = ps[i].day
+		}
+		for i := range ls {
+			ldays[i] = ls[i].day
+		}
+		movements := newNearIndex(freeMovements, func(pi int) int64 { return ps[pi].Amount }, pdays)
+		openLines := newNearIndex(lineItems, func(li int) int64 { return ls[li].Amount }, ldays)
+		anyMovement := func(int) bool { return true }
+		nearPass(func(li int) bool { return nearLine(ls[li]) },
+			func(li int) ([]int, searchResult) {
+				ln := ls[li]
+				lo, hi := span(ln.Amount, opt.allowed(ln.Amount))
+				nb.startLineOf(NearLineSteps)
+				var res searchResult
+				cbuf, res = movements.collect(cbuf[:0], lo, hi, ln.day, w, -1, 2, anyMovement, &nb)
+				return cbuf, res
+			},
+			func(pi, li int) ([]int, searchResult) {
+				p := ps[pi]
+				lo, hi := span(p.Amount, reach(p.Amount, opt))
+				nb.startLineOf(NearLineSteps)
+				var res searchResult
+				rbuf, res = openLines.collect(rbuf[:0], lo, hi, p.day, w, li, 1, func(lj int) bool {
+					ln := ls[lj]
+					return sameWay(ln.Amount, p.Amount) && abs(ln.Amount-p.Amount) <= opt.allowed(ln.Amount)
+				}, &nb)
+				return rbuf, res
+			},
+			func(li, pi int) {
+				movements.take(pi)
+				openLines.take(li)
+				rep.Matched = append(rep.Matched, near(ls[li], ByAmountDateNear, ps[pi]))
+			})
+	}
+
 	for li, ln := range ls {
 		if !done[li] {
 			counted(li)
@@ -632,10 +803,13 @@ func Reconcile(lines []Line, postings []Posting, from, to time.Time, window int)
 	sort.SliceStable(rep.MissingInLedger, func(i, j int) bool { return rep.MissingInLedger[i].Row < rep.MissingInLedger[j].Row })
 	rep.Summary = Summary{StatementLines: len(lines), LedgerPostings: len(postings), Matched: len(rep.Matched),
 		AmountMismatches: len(rep.AmountMismatches), MissingInLedger: len(rep.MissingInLedger), MissingInStatement: len(rep.MissingInStatement),
-		BatchSearchesCut: nCut, BatchAmbiguous: nAmbiguous}
+		BatchSearchesCut: nCut, BatchAmbiguous: nAmbiguous, NearSearchesCut: nNearCut, NearAmbiguous: nNearAmbiguous}
 	for _, m := range rep.Matched {
 		if m.Postings != nil {
 			rep.Summary.BatchMatches++
+		}
+		if m.By == ByReferenceNear || m.By == ByAmountDateNear {
+			rep.Summary.NearMatches++
 		}
 	}
 	return rep

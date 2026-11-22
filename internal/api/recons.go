@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/laiwf94/ledgerd/internal/ledger"
+	"github.com/laiwf94/ledgerd/internal/money"
 	"github.com/laiwf94/ledgerd/internal/recon"
 )
 
@@ -16,6 +17,34 @@ import (
 // with its matches and breaks. POST .../confirm and .../reopen review
 // matches. The ledger checks a saved run against the journal before
 // accepting it; see internal/ledger/recon.go.
+
+// toleranceParams reads a reconcile request's tolerances for near-matches:
+// tolerance= an amount in the account's currency (0.50 USD) and
+// tolerance_pct= a percentage of each line with at most two decimals (0.25
+// for a quarter of a percent), up to 10.
+func toleranceParams(r *http.Request, currency string) (recon.Options, error) {
+	var opt recon.Options
+	q := r.URL.Query()
+	if v := q.Get("tolerance"); v != "" {
+		cur, ok := money.Lookup(currency)
+		if !ok {
+			return opt, badRequest("account currency %s has no minor unit", currency)
+		}
+		n, err := money.ParseDecimal(v, cur.Exponent)
+		if err != nil || len(v) > maxQueryValueBytes || n < 0 {
+			return opt, badRequest("tolerance must be an amount in %s of zero or more, with at most %d decimals", currency, cur.Exponent)
+		}
+		opt.Tolerance = n
+	}
+	if v := q.Get("tolerance_pct"); v != "" {
+		bp, err := money.ParseDecimal(v, 2)
+		if err != nil || len(v) > maxQueryValueBytes || bp < 0 || bp > recon.MaxToleranceBasisPoints {
+			return opt, badRequest("tolerance_pct must be a percentage from 0 to %d with at most 2 decimals", recon.MaxToleranceBasisPoints/100)
+		}
+		opt.ToleranceBP = bp
+	}
+	return opt, nil
+}
 
 // saveParams reads save= and id= from a reconcile request.
 func saveParams(r *http.Request) (save bool, id string, err error) {
@@ -64,7 +93,8 @@ func reconSpec(id, account string, rep recon.Report, lines []recon.Line, posting
 		p := bySeq[seq]
 		return ledger.ReconPosting{Seq: p.Seq, TransferID: p.TransferID, Date: utcDate(p.Time), Amount: p.Amount}
 	}
-	spec := ledger.ReconSpec{ID: id, Account: account, From: rep.From, To: rep.To, WindowDays: rep.WindowDays, AsOfSeq: head}
+	spec := ledger.ReconSpec{ID: id, Account: account, From: rep.From, To: rep.To, WindowDays: rep.WindowDays,
+		Tolerance: rep.Tolerance, ToleranceBP: rep.ToleranceBP, AsOfSeq: head}
 	for _, m := range rep.Matched {
 		ms := ledger.ReconMatchSpec{Line: line(m.Row), By: ledger.MatchedBy(m.By)}
 		if m.Postings == nil {

@@ -1,6 +1,8 @@
 package api
 
 import (
+	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -256,5 +258,84 @@ func TestBatchReconciliationOverHTTP(t *testing.T) {
 	}
 	if ok := f.must(200, "GET", "/v1/admin/invariants", "")["ok"]; ok != true {
 		t.Fatal("invariants")
+	}
+}
+
+// Tolerances turn fees and rounding into labelled near-matches with the
+// difference recorded, in the report and in a saved run.
+func TestReconcileWithTolerancesOverHTTP(t *testing.T) {
+	f := reconFixture(t)
+	csv := []string{"Content-Type", "text/csv"}
+	stmt := reconHeader +
+		"s1,2030-03-01,10.00,USD,ord-1\n" + // exact
+		"s2,2030-03-02,2.48,USD,\n" + // 0.02 less than the 2.50 payment
+		"s3,2030-03-01,4.99,USD,ord-3\n" // 0.01 less than the 5.00 payment
+	r := f.call("POST", "/v1/accounts/merchant/reconcile", stmt, csv...)
+	if sum := r.json(t)["summary"].(map[string]any); r.status != 200 || sum["near_matches"] != float64(0) ||
+		sum["amount_mismatches"] != float64(1) || sum["missing_in_ledger"] != float64(1) {
+		t.Fatalf("exact: %d %s", r.status, r.body)
+	}
+	for _, q := range []string{"tolerance=0.05", "tolerance_pct=1", "tolerance=0.01&tolerance_pct=0.81"} {
+		r = f.call("POST", "/v1/accounts/merchant/reconcile?"+q, stmt, csv...)
+		rep := r.json(t)
+		sum := rep["summary"].(map[string]any)
+		if r.status != 200 || sum["matched"] != float64(3) || sum["near_matches"] != float64(2) || sum["amount_mismatches"] != float64(0) {
+			t.Fatalf("%s: %d %s", q, r.status, r.body)
+		}
+		got := map[string]string{}
+		for _, m := range rep["matched"].([]any) {
+			m := m.(map[string]any)
+			got[m["external_id"].(string)] = fmt.Sprint(m["matched_by"], " ", m["difference"])
+		}
+		if want := map[string]string{"s1": "reference <nil>", "s2": "amount_date_near -2", "s3": "reference_near -1"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s: matches %v", q, got)
+		}
+	}
+	// 0.81% of 2.48 rounds down to 0.02 and of 4.99 to 0.04; 0.80% of 2.48
+	// is 0.01, so with a 0.01 floor s2 stays open.
+	r = f.call("POST", "/v1/accounts/merchant/reconcile?tolerance=0.01&tolerance_pct=0.80", stmt, csv...)
+	if sum := r.json(t)["summary"].(map[string]any); sum["near_matches"] != float64(1) || sum["missing_in_ledger"] != float64(1) {
+		t.Fatalf("0.80%%: %s", r.body)
+	}
+
+	// A saved run keeps its tolerance and its near-matches.
+	r = f.call("POST", "/v1/accounts/merchant/reconcile?save=true&id=fees&tolerance=0.05&tolerance_pct=0.5", stmt, csv...)
+	if r.status != 201 {
+		t.Fatalf("save: %d %s", r.status, r.body)
+	}
+	run := f.must(200, "GET", "/v1/reconciliations/fees", "")
+	if run["tolerance"] != float64(5) || run["tolerance_bp"] != float64(50) || run["summary"].(map[string]any)["near_matches"] != float64(2) {
+		t.Fatalf("run %v", run)
+	}
+	for _, m := range run["matches"].([]any) {
+		m := m.(map[string]any)
+		line := m["line"].(map[string]any)
+		switch line["external_id"] {
+		case "s1":
+			if m["matched_by"] != "reference" || m["difference"] != nil {
+				t.Fatalf("exact match %v", m)
+			}
+		case "s2":
+			if m["matched_by"] != "amount_date_near" || m["difference"] != float64(-2) {
+				t.Fatalf("near-match %v", m)
+			}
+		case "s3":
+			if m["matched_by"] != "reference_near" || m["difference"] != float64(-1) {
+				t.Fatalf("near-match %v", m)
+			}
+		}
+	}
+	if list := f.must(200, "GET", "/v1/reconciliations", "")["reconciliations"].([]any); list[0].(map[string]any)["tolerance"] != float64(5) {
+		t.Fatalf("listing %v", list)
+	}
+
+	for _, q := range []string{"tolerance=-0.01", "tolerance=0.001", "tolerance=abc", "tolerance=1e3",
+		"tolerance_pct=10.01", "tolerance_pct=0.001", "tolerance_pct=-1", "tolerance_pct=%25"} {
+		if r := f.call("POST", "/v1/accounts/merchant/reconcile?"+q, stmt, csv...); r.status != 400 || r.code() != "invalid_argument" {
+			t.Fatalf("%s: %d %s", q, r.status, r.body)
+		}
+	}
+	if r := f.call("POST", "/v1/accounts/merchant/reconcile?tolerance_pct=10", stmt, csv...); r.status != 200 {
+		t.Fatalf("10%%: %d %s", r.status, r.body)
 	}
 }

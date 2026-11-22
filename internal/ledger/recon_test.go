@@ -3,6 +3,7 @@ package ledger
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -636,4 +637,133 @@ func TestSaveBatchReconciliation(t *testing.T) {
 		t.Fatalf("after snapshot\n%+v\nwant\n%+v", got, before)
 	}
 	f.invariants()
+}
+
+// writeSmallNearRecons adds a run with tolerances and a near-match of each
+// kind, one of them confirmed, to the small snapshot.
+func writeSmallNearRecons(t *testing.T, e *env) {
+	t.Helper()
+	fee := e.do(Command{CreateTransfer: &TransferSpec{Currency: "USD", Reference: "FEE-1", Postings: []PostingSpec{dr("rc", 1000), cr("rc_src", 1000)}}}).Transfer
+	fx := e.do(move(dr("rc", 2000), cr("rc_src", 2000))).Transfer
+	date := e.clock.Now().UTC().Format(reconDateLayout)
+	e.do(saveCmd(&ReconSpec{ID: "rc-near", Account: "rc", From: date, To: date, WindowDays: 1, Tolerance: 3, ToleranceBP: 50, AsOfSeq: e.l.Head(),
+		Matches: []ReconMatchSpec{
+			{Line: ReconLine{Row: 2, ExternalID: "n1", Date: date, Amount: 997, Reference: "FEE-1"},
+				Postings: []ReconPosting{{Seq: fee.Entries[0].Seq, TransferID: fee.ID, Date: date, Amount: 1000}}, By: ByReferenceNear},
+			{Line: ReconLine{Row: 3, ExternalID: "n2", Date: date, Amount: 2009},
+				Postings: []ReconPosting{{Seq: fx.Entries[0].Seq, TransferID: fx.ID, Date: date, Amount: 2000}}, By: ByAmountDateNear},
+		}}))
+	e.do(confirmCmd("rc-near", false, 2))
+}
+
+// A near-match joins a line to one movement whose amount differs from it
+// by no more than the run's tolerance: the larger of an absolute amount
+// and a percentage of the line. The ledger checks the difference against
+// the run's own tolerance, and the run keeps both through replay and
+// snapshots.
+func TestSaveNearReconciliation(t *testing.T) {
+	f := newReconFixture(t, true)
+	p1, p2 := f.posting("pay1"), f.posting("pay2")
+	nearRun := func(id string) *ReconSpec {
+		return &ReconSpec{ID: id, Account: "settle", From: day(f, 0), To: day(f, 2), WindowDays: 1, Tolerance: 5, ToleranceBP: 100, AsOfSeq: f.l.Head(),
+			Matches: []ReconMatchSpec{
+				// 1% of 9.91 is 0.09, more than 0.05.
+				{Line: ReconLine{Row: 2, ExternalID: "n1", Date: day(f, 0), Amount: 991, Reference: "PAY-1"}, Postings: []ReconPosting{p1}, By: ByReferenceNear},
+				// 1% of 2.53 is 0.02, so 0.05 applies.
+				{Line: ReconLine{Row: 3, ExternalID: "n2", Date: day(f, 2), Amount: 253}, Postings: []ReconPosting{p2}, By: ByAmountDateNear},
+			}}
+	}
+	f.do(saveCmd(nearRun("near")))
+	r := f.recon("near")
+	if r.Tolerance != 5 || r.ToleranceBP != 100 || r.Summary.NearMatches != 2 || r.Summary.Matches != 2 {
+		t.Fatalf("run %+v", r)
+	}
+	if m := r.Matches[0]; m.By != ByReferenceNear || m.Difference != -9 || m.DaysApart != 0 {
+		t.Fatalf("reference near-match %+v", m)
+	}
+	if m := r.Matches[1]; m.By != ByAmountDateNear || m.Difference != 3 || m.DaysApart != 1 {
+		t.Fatalf("amount and date near-match %+v", m)
+	}
+	// Exact matches carry no difference.
+	f.do(saveCmd(f.run("exact")))
+	if r := f.recon("exact"); r.Matches[0].Difference != 0 || r.Summary.NearMatches != 0 || r.Tolerance != 0 {
+		t.Fatalf("exact run %+v", r)
+	}
+	for _, tc := range []struct {
+		name string
+		code Code
+		edit func(s *ReconSpec)
+	}{
+		{"past the tolerance", CodePrecondition, func(s *ReconSpec) { s.Matches[0].Line.Amount = 990 }},
+		{"past the absolute tolerance", CodePrecondition, func(s *ReconSpec) { s.Matches[1].Line.Amount = 256 }},
+		{"no difference", CodePrecondition, func(s *ReconSpec) { s.Matches[1].Line.Amount = 250 }},
+		{"no tolerance", CodePrecondition, func(s *ReconSpec) { s.Tolerance, s.ToleranceBP = 0, 0 }},
+		{"negative tolerance", CodeInvalid, func(s *ReconSpec) { s.Tolerance = -1 }},
+		{"negative percentage", CodeInvalid, func(s *ReconSpec) { s.ToleranceBP = -1 }},
+		{"percentage too large", CodeInvalid, func(s *ReconSpec) { s.ToleranceBP = MaxReconToleranceBP + 1 }},
+		{"two movements", CodeInvalid, func(s *ReconSpec) {
+			s.Matches[1].Postings = append(s.Matches[1].Postings, f.posting("pay3"))
+			s.Matches[1].Line.Amount = 752
+		}},
+		{"reference", CodePrecondition, func(s *ReconSpec) { s.Matches[0].Line.Reference = "PAY-3" }},
+		{"no reference on the line", CodePrecondition, func(s *ReconSpec) { s.Matches[0].Line.Reference = "" }},
+		{"window", CodePrecondition, func(s *ReconSpec) { s.Matches[1].Line.Date = day(f, 4) }},
+		{"sign", CodePrecondition, func(s *ReconSpec) {
+			s.Matches[1].Postings = []ReconPosting{f.posting("out")}
+			s.Matches[1].Line.Amount = 72
+		}},
+		{"kind", CodeInvalid, func(s *ReconSpec) { s.Matches[1].By = "amount_near" }},
+	} {
+		s := nearRun("n-" + strings.ReplaceAll(tc.name, " ", "-"))
+		tc.edit(s)
+		err := f.fail(saveCmd(s), tc.code)
+		if testing.Verbose() {
+			t.Logf("%s: %s", tc.name, err.Message)
+		}
+	}
+	// The largest percentage and the largest amounts do not overflow.
+	big := nearRun("big")
+	big.Tolerance, big.ToleranceBP = math.MaxInt64, MaxReconToleranceBP
+	f.do(saveCmd(big))
+
+	f.do(confirmCmd("near", false, 1))
+	before := f.recon("near")
+	f.invariants()
+	f.restart()
+	if got := f.recon("near"); !reflect.DeepEqual(got, before) {
+		t.Fatalf("after replay\n%+v\nwant\n%+v", got, before)
+	}
+	f.opts.SnapshotEvery = 0
+	f.restart()
+	f.opts.SnapshotEvery = -1
+	f.restart()
+	if got := f.recon("near"); !reflect.DeepEqual(got, before) {
+		t.Fatalf("after snapshot\n%+v\nwant\n%+v", got, before)
+	}
+	f.invariants()
+}
+
+// A version 11 snapshot, written before runs had tolerances, still loads:
+// its runs have none.
+func TestReconSnapshotVersion11(t *testing.T) {
+	old := snapWriteVersion
+	snapWriteVersion = 11
+	t.Cleanup(func() { snapWriteVersion = old })
+	dir, clock := writeSmallSnapshot(t, 11)
+	snapWriteVersion = old
+	fromSnap := openAt(t, copyDir(t, dir, true), clock, nil)
+	full := openAt(t, copyDir(t, dir, false), clock, nil)
+	sameState(t, "v11", fromSnap, full)
+	page, err := fromSnap.Recons(ReconFilter{}, 0, MaxListLimit)
+	if err != nil || len(page.Runs) == 0 {
+		t.Fatalf("%+v %v", page, err)
+	}
+	for _, r := range page.Runs {
+		if r.Tolerance != 0 || r.ToleranceBP != 0 || r.Summary.NearMatches != 0 {
+			t.Fatalf("%+v", r)
+		}
+	}
+	if v := allChecks(fromSnap); len(v) > 0 {
+		t.Fatal(v)
+	}
 }

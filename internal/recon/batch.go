@@ -56,7 +56,10 @@ type budget struct {
 	line, total int
 }
 
-func (b *budget) startLine() { b.line = min(LineSearchSteps, b.total) }
+func (b *budget) startLine() { b.startLineOf(LineSearchSteps) }
+
+// startLineOf starts a line that may spend up to n steps.
+func (b *budget) startLineOf(n int) { b.line = min(n, b.total) }
 
 // spend takes one step and reports whether there was one to take.
 func (b *budget) spend() bool {

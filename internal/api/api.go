@@ -856,6 +856,11 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	opt, err := toleranceParams(r, acct.Currency)
+	if err != nil {
+		return err
+	}
+	opt.WindowDays = int(window)
 	select {
 	case s.recon <- struct{}{}:
 		defer func() { <-s.recon }()
@@ -899,7 +904,7 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) error {
 	for i, m := range movements {
 		postings[i] = recon.Posting{Seq: m.Seq, Time: m.Time, TransferID: m.TransferID, Reference: m.Reference, Amount: m.Amount}
 	}
-	rep := recon.Reconcile(lines, postings, lo, hi, int(window))
+	rep := recon.ReconcileWith(lines, postings, lo, hi, opt)
 	resp := struct {
 		Account  string `json:"account"`
 		Currency string `json:"currency"`
@@ -908,12 +913,14 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) error {
 	}{Account: id, Currency: acct.Currency, Report: rep}
 	if save {
 		params := struct {
-			ID         string       `json:"id,omitempty"`
-			From       string       `json:"from"`
-			To         string       `json:"to"`
-			WindowDays uint64       `json:"window_days"`
-			Lines      []recon.Line `json:"lines"`
-		}{runID, rep.From, rep.To, window, lines}
+			ID          string       `json:"id,omitempty"`
+			From        string       `json:"from"`
+			To          string       `json:"to"`
+			WindowDays  uint64       `json:"window_days"`
+			Tolerance   int64        `json:"tolerance,omitempty"`
+			ToleranceBP int64        `json:"tolerance_bp,omitempty"`
+			Lines       []recon.Line `json:"lines"`
+		}{runID, rep.From, rep.To, window, rep.Tolerance, rep.ToleranceBP, lines}
 		if runID == "" {
 			runID = newRunID()
 		}

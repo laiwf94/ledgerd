@@ -40,6 +40,22 @@ current formats.
   Saved runs keep batches of up to 1,000 movements, and the ledger checks
   that they move the line's way, sum to it, are in journal order and carry
   its reference or lie within the window.
+- Amount tolerances: `tolerance=` (an amount in the account's currency) and
+  `tolerance_pct=` (a percentage of each statement line, up to 10%, with
+  at most two decimals) let a line match one movement that differs from it
+  by up to the larger of the two, after every exact match and batch. Such
+  a match is labelled `reference_near` (a movement with the line's
+  reference, tried before amount mismatches are reported) or
+  `amount_date_near` (a movement within the window) and records
+  `difference`, the line's amount minus the movement's. It is proposed only
+  when the line and the movement are each other's only candidate; lines
+  with a candidate but no unique one stay breaks counted in
+  `near_ambiguous`, and lines whose search ran out of its step budget
+  (10,000 per search, 1,000,000 per reconciliation) in `near_searches_cut`.
+  The summary counts `near_matches`. Saved runs keep `tolerance` and
+  `tolerance_bp`, and the ledger checks each near-match against the run's
+  own tolerance. Snapshots move to format 12, which adds a run's
+  tolerances; format 11 snapshots still load.
 
 #### Changed
 

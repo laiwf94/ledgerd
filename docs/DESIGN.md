@@ -580,7 +580,7 @@ order. Items, in file order:
 
 | Tag | Item | Fields |
 |---|---|---|
-| `H` | header, first | `u` format version (11), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys; from format 8 `u` count of webhook endpoints and `u` newest webhook version; from format 9 `u` counts of monitor definitions, balance monitors and balance alerts; from format 11 `u` count of reconciliation runs |
+| `H` | header, first | `u` format version (12), `u` snapshot number, `u` journal head, `time` taken, `u` counts of accounts, transfers, entries and keys; from format 8 `u` count of webhook endpoints and `u` newest webhook version; from format 9 `u` counts of monitor definitions, balance monitors and balance alerts; from format 11 `u` count of reconciliation runs |
 | `A` | account, by ID | `str` ID, `str` currency, `i` exponent, `str` normal balance, `bool` non-negative, `bool` non-positive, from format 7 `bool` exchange, `meta`, `time` created; `i` debits posted, credits posted, debits pending, credits pending; `u` version; `u` count then per status change `u` journal head, `time`, `str` status, `str` reason; `u` count then per limit change `u` journal head, `time`, `str` kind, `i` amount (-1 for none), `str` reason |
 | `T` | transfer, by ID | `str` ID, state, currency; `u` posting count then per posting `str` account, `str` direction, `i` amount, posted, reversed, and from format 7 `str` currency (empty for the transfer's own); `str` reference, `meta`, `time` created, `time` expires, `str` reverses; `u` count then `str` reversal IDs; `u` count then per entry `u` sequence, `str` kind; from format 5 a balancing byte (0 none, else bit 0 `balance_debit`, bit 1 `balance_credit`) followed, when not 0, by `i` requested amount and `i` amount; from format 7 a rate: `bool` set, then if set `str` base, quote, rate and source and `time` quoted, present exactly when a posting names another currency |
 | `E` | journal entry, by sequence from 1 | `u` sequence, `time`, `str` kind, transfer ID, currency; `u` line count then per line `str` account, `str` direction, `i` posted, `i` pending, and from format 7 `str` currency (empty for the entry's own); from format 6 `time` expires, set only on an `extend_pending` entry, which alone has no lines; from format 7 a rate as in `T`, only on the entry that creates a multi-currency transfer and equal to that transfer's |
@@ -590,7 +590,7 @@ order. Items, in file order:
 | `D` | monitor definition, numbered from 0, from format 9: the live monitors' in ID order, then deleted monitors' in the order of their first alert | `str` ID, account; condition: `str` field, `str` operator, `i` value; `str` description, `time` created, `u` first entry watched |
 | `M` | balance monitor, by ID, from format 9 | `u` its definition; `bool` condition met, `u` last alert, `u` alert count |
 | `L` | balance alert, by sequence from 1, from format 9 | `u` its monitor's definition, `u` entry sequence, `u` index of the entry's line on the monitor's account, `bool` triggered (else cleared) |
-| `R` | reconciliation run, by number from 1, from format 11; its `Q` and `K` items follow it | `str` ID, account, currency, first day, last day (YYYY-MM-DD); `u` window days, `u` as-of sequence, `time` saved; `u` match count, `u` break count; `bool` reviewed (the matches carry statuses) |
+| `R` | reconciliation run, by number from 1, from format 11; its `Q` and `K` items follow it | `str` ID, account, currency, first day, last day (YYYY-MM-DD); `u` window days; from format 12 `i` tolerance (minor units) and `i` tolerance in basis points; `u` as-of sequence, `time` saved; `u` match count, `u` break count; `bool` reviewed (the matches carry statuses) |
 | `Q` | one match of the run before it, in order | a line: `u` row, `str` external ID, `str` date, `i` amount, `str` reference; `u` movement count then per movement `u` entry sequence, `str` transfer ID, `str` date, `i` amount; `str` matched by; if the run is reviewed `str` status (empty for proposed), `time` changed, `str` note |
 | `K` | one break of the run before it, in order | `str` kind; `bool` then a line as in `Q`; `bool` then a movement as in `Q` |
 | `Z` | footer, alone in the last frame | `u` number of frames before it |
@@ -1714,7 +1714,7 @@ currency's exponent (more decimals than the currency has is an error, never a
 rounding). The parser is bounded (4 MiB, 10,000 lines, field lengths) and
 fuzzed: anything it accepts must survive a format-and-parse round trip.
 
-Matching runs in three passes:
+Matching runs in four passes:
 
 1. By reference: a line whose reference equals a movement's reference is the
    same transaction. This pass runs in three rounds over the lines: first
@@ -1743,6 +1743,11 @@ Matching runs in three passes:
    settlement or a sweep that the bank shows as one line. A union-find
    "next free" index over movements in date order skips the ones earlier
    batches took.
+4. Near-matches by amount and date: with a tolerance, a remaining line may
+   take a free movement within the window whose amount is within the
+   tolerance of its own (`amount_date_near`). Pass 1 likewise tries a
+   near-match by reference (`reference_near`) before it reports an amount
+   mismatch. See [near-matches](#near-matches-within-a-tolerance) below.
 
 A batch's candidates are the free movements with the line's sign and no
 larger than it. If they sum to the line all together they are the batch (up
@@ -1790,6 +1795,70 @@ A batch match lists its movements as `postings`, in journal order, with
 `days_apart` the furthest of them from the line and no single
 `transfer_id` or `seq`; the summary counts `batch_matches`.
 
+### Near-matches within a tolerance
+
+Card fees, rounding and FX spreads make a bank line differ a little from
+the movement it settles, and exact matching reports each one as an amount
+mismatch or as two breaks. `tolerance=` (an amount in the account's
+currency, such as `0.05`) and `tolerance_pct=` (a percentage of the
+statement line, at most 10 with at most two decimals, such as `0.25`) set
+a run's tolerance. With both, the larger applies to each line: a line of
+amount *a* may differ from its movement by up to max(`tolerance`,
+|*a*| × `tolerance_pct` / 100), rounded down to a minor unit and computed
+exactly in 128 bits (`money.Tolerance`, the one rule the matcher and the
+ledger's check share). The report and a saved run carry `tolerance` in
+minor units and `tolerance_bp` in basis points.
+
+Only lines and movements still open after the exact rounds and batches are
+considered, so a tolerance never takes a movement some line matches
+exactly or a batch needs, and without one nothing changes. A candidate
+moves the line's way (never across zero) and is within the tolerance: by
+reference, a free movement with the line's reference at any date, tried
+before amount mismatches are reported; by amount and date, a free movement
+within the window, tried after batches.
+
+A near-match is proposed only when the line and the movement are each
+other's only candidate. Choosing the nearest movement looks natural but is
+wrong too often: under a percentage tolerance the number of unrelated
+movements within reach of a line grows with the line's amount, and among
+5,000 settlements in a month with a 0.5% tolerance each line has about six,
+so a fee of up to 0.49% cannot be told from coincidence. Picking the
+nearest paired 73% of lines with another settlement's movement
+(`BenchmarkNearMatches/fees`, measured while designing this); the rule
+pairs 247 lines, leaves the other 4,619 as breaks counted in
+`near_ambiguous`, and gets 12 wrong (coincidental exact amounts included).
+With a 2-cent rounding tolerance the same month matches 4,878 lines near,
+leaves 101 open and pairs 19 wrongly (`BenchmarkNearMatches/rounding`),
+so a tolerance should be as tight as the fee schedule allows.
+Each pass decides over the state at its start, so the order of the lines
+does not matter, and one round is enough: a pair that are each other's
+only candidate can be taken without changing anything for any other line
+or movement. A random test checks, against brute force over every line and
+movement, that each near-match is valid and that no such pair is left
+among the open lines and free movements, and that shuffling the inputs
+does not change the report.
+
+Free movements and open lines are each indexed by amount (sorted groups,
+by date within a group, with union-find "next untaken" indexes), so a line
+finds up to two candidates and a movement a rival line by scanning only
+the amounts in reach. From the movement's side, a line of amount *l* can
+reach a movement *m* only if |*l* - *m*| ≤ max(`tolerance`, |*m*| × bp /
+(10,000 - bp)), which bounds the scan. A step is a probed amount or an
+examined movement or line; a search may spend 10,000 steps and a
+reconciliation 1,000,000, and a line whose search runs out stays a break
+counted in `near_searches_cut`. On one core of a 2.3 GHz Xeon, 10,000 lines
+against 100,000 movements under one reference, all within a 10% tolerance,
+take 75 to 105 ms (each line stops at its second candidate), and the same
+without references, every amount in reach but outside the window, 90 to
+140 ms (every line runs out of steps; `TestNearWorstCase`). The 5,000-line
+benchmarks take 21 to 26 ms against 11 to 16 ms for exact matching alone
+(`BenchmarkReconcile`).
+
+A near-match has one movement, `matched_by` `reference_near` or
+`amount_date_near`, and `difference`, the line's amount minus the
+movement's; the summary counts `near_matches`. Like any match it is
+proposed until a reviewer confirms or reopens it.
+
 What is left is *missing in ledger* (statement lines) or *missing in
 statement* (movements dated inside the period). Movements up to the window
 outside the period are candidates for matching but are not reported as
@@ -1805,7 +1874,8 @@ head it was computed against (`as_of_seq`, read under the same lock as the
 movements), and every match and break with its statement line and ledger
 movements. The result is stored, not recomputed on replay: a run keeps
 meaning what it meant when it was saved after the matching rules change,
-and replay, snapshots (format 11) and `ledgerd verify` see the same runs.
+and replay, snapshots (format 11; tolerances from format 12) and `ledgerd
+verify` see the same runs. A run keeps its `tolerance` and `tolerance_bp`.
 An `Idempotency-Key` covers the statement and the query, not the journal,
 so a retry after new entries gets the original run back.
 
@@ -1819,8 +1889,11 @@ reference match joins a line to a movement of the same amount whose
 transfer carries the line's reference, an amount-and-date match one of the
 same amount within the window, a batch 2 to 1,000 movements in journal
 order, each carrying the line's reference (`reference_batch`) or within the
-window (`amount_date_batch`), an amount mismatch a line and movement with
-one reference and different amounts, and a missing-in-statement break a
+window (`amount_date_batch`), a near-match one movement the line's way
+whose amount differs from the line's by at least one minor unit and no
+more than the run's tolerance, carrying the line's reference
+(`reference_near`) or within the window (`amount_date_near`), an amount
+mismatch a line and movement with one reference and different amounts, and a missing-in-statement break a
 movement inside the period. A run that fails is refused with
 `failed_precondition` and nothing is stored. The same check
 (`reconProblem`) runs when a snapshot is loaded and in the invariant
