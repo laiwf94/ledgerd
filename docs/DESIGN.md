@@ -1724,7 +1724,12 @@ Matching runs in three passes:
    (`reference_batch`); only then is a line with its reference on a
    movement of another amount reported as an *amount mismatch* rather than
    as two unrelated breaks. The rounds keep a batch from taking a movement
-   that another line matches exactly.
+   that another line matches exactly. Movements are indexed by reference
+   and by reference and amount, and the rounds take from the front of
+   those lists or move a cursor along them, so 10,000 lines against
+   100,000 movements under one reference take about 70 ms rather than 2
+   seconds, and four times the input takes about four times as long
+   (`TestReferenceMatchingScales`).
 2. By amount and date: remaining lines, in date order, take the earliest free
    movement with the same amount whose date is within `window_days` (default
    3, for settlement lag) before or after. For this interval structure the

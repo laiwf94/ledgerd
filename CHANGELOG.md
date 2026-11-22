@@ -49,6 +49,12 @@ current formats.
   any amount mismatch, so a mismatch no longer takes a movement that a later
   line matches exactly.
 
+#### Fixed
+
+- Reference matching no longer rescans every movement with a reference for
+  each statement line: 10,000 lines against 100,000 movements under one
+  reference took about 2 to 4 seconds and now take about 60 ms (#85).
+
 ### Change feed, live stream, webhooks and export (#27)
 
 #### Added

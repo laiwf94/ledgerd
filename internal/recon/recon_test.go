@@ -291,6 +291,67 @@ func TestReconcileScales(t *testing.T) {
 	}
 }
 
+// refWorkload is n statement lines and 10n movements under one reference.
+// Half the lines match a movement exactly; the rest have amounts no
+// movement has.
+func refWorkload(n int) ([]Line, []Posting) {
+	var lines []Line
+	var ps []Posting
+	for i := 0; i < n; i++ {
+		amt := int64(1_000_000_000)
+		if i%2 == 0 {
+			amt = int64(2*i + 1)
+		}
+		lines = append(lines, Line{Row: i + 2, ExternalID: fmt.Sprint(i), Date: "2030-01-01", Amount: amt, Reference: "R"})
+	}
+	for i := 0; i < 10*n; i++ {
+		ps = append(ps, Posting{Seq: uint64(i + 1), Time: at("2030-03-01"), TransferID: fmt.Sprint("t", i), Reference: "R", Amount: int64(2*i + 1)})
+	}
+	return lines, ps
+}
+
+// Thousands of lines and movements under one reference: the reference
+// rounds must not rescan the movements for each line (#85). Exact matches
+// take their movement and each mismatch the earliest one left free.
+// Rescanning made the work grow with lines times movements, so four times
+// the lines and movements took sixteen times as long; it must now grow
+// about linearly. Timings are the best of three runs, so a busy machine
+// slows both sizes alike.
+func TestReferenceMatchingScales(t *testing.T) {
+	lines, ps := refWorkload(MaxLines)
+	rep := Reconcile(lines, ps, day0("2030-01-01"), day0("2030-01-01"), 0)
+	if rep.Summary.Matched != MaxLines/2 || rep.Summary.AmountMismatches != MaxLines/2 {
+		t.Fatalf("summary %+v", rep.Summary)
+	}
+	for _, m := range rep.Matched {
+		if m.By != ByReference || m.Amount != lines[m.Row-2].Amount {
+			t.Fatalf("match %+v", m)
+		}
+	}
+	// The first mismatch, row 3, takes the earliest movement no exact
+	// match took: entry 2 (amount 3), since only line 2*k matched 4k+1.
+	if mm := rep.AmountMismatches[0]; mm.Row != 3 || mm.Seq != 2 {
+		t.Fatalf("first mismatch %+v", mm)
+	}
+	best := func(n int) time.Duration {
+		lines, ps := refWorkload(n)
+		var b time.Duration
+		for k := 0; k < 3; k++ {
+			start := time.Now()
+			Reconcile(lines, ps, day0("2030-01-01"), day0("2030-01-01"), 0)
+			if d := time.Since(start); k == 0 || d < b {
+				b = d
+			}
+		}
+		return b
+	}
+	small, large := best(MaxLines/4), best(MaxLines)
+	t.Logf("%d lines: %v; %d lines: %v", MaxLines/4, small, MaxLines, large)
+	if large > 8*small {
+		t.Fatalf("4 times the input took %.1f times as long: %v against %v", float64(large)/float64(small), large, small)
+	}
+}
+
 func FuzzParse(f *testing.F) {
 	f.Add(hdr + "bk-1,2030-01-02,12.34,USD,ord-1\n")
 	f.Add(hdr + `"a""b",2030-01-02,-0.5,KWD,"x,y"` + "\n")

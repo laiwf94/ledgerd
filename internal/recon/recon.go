@@ -350,10 +350,22 @@ func Reconcile(lines []Line, postings []Posting, from, to time.Time, window int)
 	used := make([]bool, len(ps))
 	done := make([]bool, len(ls))
 
+	// byRef lists the postings with each reference, and exact those with
+	// each reference and amount, in journal order. The rounds below take
+	// from the front of these lists, or move a cursor along them, so a
+	// reference shared by thousands of lines and movements costs linear
+	// time, not lines times movements.
+	type refAmount struct {
+		ref string
+		amt int64
+	}
 	byRef := map[string][]int{}
+	exact := map[refAmount][]int{}
 	for i, p := range ps {
 		if p.Reference != "" {
 			byRef[p.Reference] = append(byRef[p.Reference], i)
+			k := refAmount{p.Reference, p.Amount}
+			exact[k] = append(exact[k], i)
 		}
 	}
 	b := budget{total: SearchSteps}
@@ -378,14 +390,16 @@ func Reconcile(lines []Line, postings []Posting, from, to time.Time, window int)
 		if !refLine(ln) {
 			continue
 		}
-		for _, pi := range byRef[ln.Reference] {
-			if !used[pi] && ps[pi].Amount == ln.Amount {
-				used[pi], done[li] = true, true
-				p := ps[pi]
-				rep.Matched = append(rep.Matched, Match{ExternalID: ln.ExternalID, Row: ln.Row, TransferID: p.TransferID,
-					Seq: p.Seq, Amount: p.Amount, By: ByReference, DaysApart: abs(p.day - ln.day)})
-				break
-			}
+		// Nothing is used before this round, so the front of the list is
+		// the earliest free posting.
+		k := refAmount{ln.Reference, ln.Amount}
+		if pis := exact[k]; len(pis) > 0 {
+			pi := pis[0]
+			exact[k] = pis[1:]
+			used[pi], done[li] = true, true
+			p := ps[pi]
+			rep.Matched = append(rep.Matched, Match{ExternalID: ln.ExternalID, Row: ln.Row, TransferID: p.TransferID,
+				Seq: p.Seq, Amount: p.Amount, By: ByReference, DaysApart: abs(p.day - ln.day)})
 		}
 	}
 	// outcome is what the line's batch searches ended in when they found
@@ -442,20 +456,28 @@ func Reconcile(lines []Line, postings []Posting, from, to time.Time, window int)
 			nAmbiguous++
 		}
 	}
+	// Postings only ever become used, so each reference's cursor moves
+	// forward past them and never back.
+	cursor := map[string]int{}
 	for li, ln := range ls {
 		if done[li] || !refLine(ln) {
 			continue
 		}
-		for _, pi := range byRef[ln.Reference] {
-			if !used[pi] {
-				used[pi], done[li] = true, true
-				counted(li)
-				p := ps[pi]
-				rep.AmountMismatches = append(rep.AmountMismatches, Mismatch{ExternalID: ln.ExternalID, Row: ln.Row,
-					TransferID: p.TransferID, Seq: p.Seq, StatementAmount: ln.Amount, LedgerAmount: p.Amount})
-				break
-			}
+		pis := byRef[ln.Reference]
+		c := cursor[ln.Reference]
+		for c < len(pis) && used[pis[c]] {
+			c++
 		}
+		cursor[ln.Reference] = c
+		if c == len(pis) {
+			continue
+		}
+		pi := pis[c]
+		used[pi], done[li] = true, true
+		counted(li)
+		p := ps[pi]
+		rep.AmountMismatches = append(rep.AmountMismatches, Mismatch{ExternalID: ln.ExternalID, Row: ln.Row,
+			TransferID: p.TransferID, Seq: p.Seq, StatementAmount: ln.Amount, LedgerAmount: p.Amount})
 	}
 
 	// Pass 2. Lines go in date order and each takes the earliest free posting
