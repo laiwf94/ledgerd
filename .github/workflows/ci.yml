@@ -29,6 +29,7 @@ jobs:
           go test ./internal/money -run=^$ -fuzz=FuzzParseDecimal -fuzztime=20s
           go test ./internal/wal -run=^$ -fuzz=FuzzReplay -fuzztime=20s
           go test ./internal/recon -run=^$ -fuzz=FuzzParse -fuzztime=20s
+          go test ./internal/recon -run=^$ -fuzz=FuzzCamt053 -fuzztime=20s
           go test ./internal/api -run=^$ -fuzz=FuzzCreateTransfer -fuzztime=20s
           go test ./internal/api -run=^$ -fuzz=FuzzListQuery -fuzztime=20s
           go test ./internal/export -run=^$ -fuzz=FuzzVerify -fuzztime=20s

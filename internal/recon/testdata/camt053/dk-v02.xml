@@ -1,0 +1,212 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Layout of a German (DK) daily statement, camt.053.001.02. Fictitious data. -->
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02 camt.053.001.02.xsd">
+  <BkToCstmrStmt>
+    <GrpHdr>
+      <MsgId>camt53-20301102-0001</MsgId>
+      <CreDtTm>2030-11-03T06:12:44.000+01:00</CreDtTm>
+      <MsgPgntn>
+        <PgNb>1</PgNb>
+        <LastPgInd>true</LastPgInd>
+      </MsgPgntn>
+    </GrpHdr>
+    <Stmt>
+      <Id>2030110200001</Id>
+      <ElctrncSeqNb>214</ElctrncSeqNb>
+      <CreDtTm>2030-11-03T06:12:44.000+01:00</CreDtTm>
+      <FrToDt>
+        <FrDtTm>2030-11-02T00:00:00.000+01:00</FrDtTm>
+        <ToDtTm>2030-11-02T23:59:59.000+01:00</ToDtTm>
+      </FrToDt>
+      <Acct>
+        <Id>
+          <IBAN>DE89370400440532013000</IBAN>
+        </Id>
+        <Ccy>EUR</Ccy>
+        <Ownr>
+          <Nm>Example Shop GmbH</Nm>
+        </Ownr>
+        <Svcr>
+          <FinInstnId>
+            <BIC>COBADEFFXXX</BIC>
+          </FinInstnId>
+        </Svcr>
+      </Acct>
+      <Bal>
+        <Tp>
+          <CdOrPrtry>
+            <Cd>PRCD</Cd>
+          </CdOrPrtry>
+        </Tp>
+        <Amt Ccy="EUR">12500.00</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <Dt>
+          <Dt>2030-11-01</Dt>
+        </Dt>
+      </Bal>
+      <Bal>
+        <Tp>
+          <CdOrPrtry>
+            <Cd>CLBD</Cd>
+          </CdOrPrtry>
+        </Tp>
+        <Amt Ccy="EUR">13466.95</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <Dt>
+          <Dt>2030-11-02</Dt>
+        </Dt>
+      </Bal>
+      <Ntry>
+        <Amt Ccy="EUR">1250.00</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <Sts>BOOK</Sts>
+        <BookgDt>
+          <Dt>2030-11-02</Dt>
+        </BookgDt>
+        <ValDt>
+          <Dt>2030-11-02</Dt>
+        </ValDt>
+        <AcctSvcrRef>2030110212345678</AcctSvcrRef>
+        <BkTxCd>
+          <Domn>
+            <Cd>PMNT</Cd>
+            <Fmly>
+              <Cd>RCDT</Cd>
+              <SubFmlyCd>ESCT</SubFmlyCd>
+            </Fmly>
+          </Domn>
+          <Prtry>
+            <Cd>NTRF+166+9310+997</Cd>
+            <Issr>DK</Issr>
+          </Prtry>
+        </BkTxCd>
+        <NtryDtls>
+          <TxDtls>
+            <Refs>
+              <MsgId>MSG-77120</MsgId>
+              <EndToEndId>INV-2030-0815</EndToEndId>
+            </Refs>
+            <AmtDtls>
+              <TxAmt>
+                <Amt Ccy="EUR">1250.00</Amt>
+              </TxAmt>
+            </AmtDtls>
+            <RltdPties>
+              <Dbtr>
+                <Nm>Customer AG</Nm>
+              </Dbtr>
+              <DbtrAcct>
+                <Id>
+                  <IBAN>DE02120300000000202051</IBAN>
+                </Id>
+              </DbtrAcct>
+            </RltdPties>
+            <RmtInf>
+              <Ustrd>Invoice 2030-0815 thank you</Ustrd>
+            </RmtInf>
+          </TxDtls>
+        </NtryDtls>
+        <AddtlNtryInf>SEPA CREDIT TRANSFER</AddtlNtryInf>
+      </Ntry>
+      <Ntry>
+        <Amt Ccy="EUR">89.90</Amt>
+        <CdtDbtInd>DBIT</CdtDbtInd>
+        <Sts>BOOK</Sts>
+        <BookgDt>
+          <Dt>2030-11-02</Dt>
+        </BookgDt>
+        <ValDt>
+          <Dt>2030-11-02</Dt>
+        </ValDt>
+        <AcctSvcrRef>2030110212345679</AcctSvcrRef>
+        <BkTxCd>
+          <Domn>
+            <Cd>PMNT</Cd>
+            <Fmly>
+              <Cd>IDDT</Cd>
+              <SubFmlyCd>ESDD</SubFmlyCd>
+            </Fmly>
+          </Domn>
+        </BkTxCd>
+        <NtryDtls>
+          <TxDtls>
+            <Refs>
+              <EndToEndId>NOTPROVIDED</EndToEndId>
+              <MndtId>M-2029-004</MndtId>
+            </Refs>
+            <RmtInf>
+              <Ustrd>hosting 2030-11</Ustrd>
+              <Ustrd>customer 4471</Ustrd>
+            </RmtInf>
+          </TxDtls>
+        </NtryDtls>
+        <AddtlNtryInf>SEPA DIRECT DEBIT</AddtlNtryInf>
+      </Ntry>
+      <Ntry>
+        <Amt Ccy="EUR">320.00</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <Sts>PDNG</Sts>
+        <ValDt>
+          <Dt>2030-11-03</Dt>
+        </ValDt>
+        <AcctSvcrRef>2030110212345680</AcctSvcrRef>
+        <BkTxCd/>
+      </Ntry>
+      <Ntry>
+        <Amt Ccy="EUR">4.15</Amt>
+        <CdtDbtInd>DBIT</CdtDbtInd>
+        <Sts>BOOK</Sts>
+        <BookgDt>
+          <Dt>2030-11-02</Dt>
+        </BookgDt>
+        <ValDt>
+          <Dt>2030-11-01</Dt>
+        </ValDt>
+        <AcctSvcrRef>2030110212345681</AcctSvcrRef>
+        <BkTxCd>
+          <Domn>
+            <Cd>ACMT</Cd>
+            <Fmly>
+              <Cd>MDOP</Cd>
+              <SubFmlyCd>CHRG</SubFmlyCd>
+            </Fmly>
+          </Domn>
+        </BkTxCd>
+        <AddtlNtryInf>ACCOUNT FEES 10/2030</AddtlNtryInf>
+      </Ntry>
+      <Ntry>
+        <Amt Ccy="EUR">311.00</Amt>
+        <CdtDbtInd>DBIT</CdtDbtInd>
+        <RvslInd>false</RvslInd>
+        <Sts>BOOK</Sts>
+        <BookgDt>
+          <Dt>2030-11-02</Dt>
+        </BookgDt>
+        <ValDt>
+          <Dt>2030-11-02</Dt>
+        </ValDt>
+        <AcctSvcrRef>2030110212345682</AcctSvcrRef>
+        <BkTxCd/>
+        <NtryDtls>
+          <TxDtls>
+            <Refs>
+              <EndToEndId>NOTPROVIDED</EndToEndId>
+            </Refs>
+            <RmtInf>
+              <Strd>
+                <CdtrRefInf>
+                  <Tp>
+                    <CdOrPrtry>
+                      <Cd>SCOR</Cd>
+                    </CdOrPrtry>
+                  </Tp>
+                  <Ref>RF18539007547034</Ref>
+                </CdtrRefInf>
+              </Strd>
+            </RmtInf>
+          </TxDtls>
+        </NtryDtls>
+      </Ntry>
+    </Stmt>
+  </BkToCstmrStmt>
+</Document>

@@ -56,6 +56,17 @@ current formats.
   `tolerance_bp`, and the ledger checks each near-match against the run's
   own tolerance. Snapshots move to format 12, which adds a run's
   tolerances; format 11 snapshots still load.
+- ISO 20022 camt.053 statements: `POST /v1/accounts/{id}/reconcile` takes
+  `application/xml` (or `text/xml`) as well as CSV. Every version of the
+  message is read (`recon.ParseCamt053`); each booked entry is one line
+  (amount signed by `CdtDbtInd`, booking or value date, the bank's entry
+  reference as the external ID, and the batch `PmtInfId`, `EndToEndId`,
+  creditor reference or remittance text as the reference), pending and
+  information entries are skipped and counted, and `statement_account=`
+  picks one account from a file holding several. The response's `camt053`
+  lists the statements. The parser streams, is limited to 4 MiB, 10,000
+  entries, 32 levels and 1,024 bytes of text per element read, refuses
+  DTDs, and is fuzzed in CI (`FuzzCamt053`).
 
 #### Changed
 

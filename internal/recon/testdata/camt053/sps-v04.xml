@@ -1,0 +1,155 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Layout of a Swiss Payment Standards account statement, camt.053.001.04,
+     with a batch booking of QR-bill payments. Fictitious data. -->
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.04" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <BkToCstmrStmt>
+    <GrpHdr>
+      <MsgId>20301102375204000000001</MsgId>
+      <CreDtTm>2030-11-02T19:30:47.0+01:00</CreDtTm>
+      <MsgPgntn>
+        <PgNb>1</PgNb>
+        <LastPgInd>true</LastPgInd>
+      </MsgPgntn>
+      <AddtlInf>SPS/1.7/PROD</AddtlInf>
+    </GrpHdr>
+    <Stmt>
+      <Id>20301102375204000000002</Id>
+      <ElctrncSeqNb>217</ElctrncSeqNb>
+      <CreDtTm>2030-11-02T19:30:47.0+01:00</CreDtTm>
+      <Acct>
+        <Id>
+          <IBAN>CH93 0076 2011 6238 5295 7</IBAN>
+        </Id>
+        <Ccy>CHF</Ccy>
+      </Acct>
+      <Bal>
+        <Tp>
+          <CdOrPrtry>
+            <Cd>OPBD</Cd>
+          </CdOrPrtry>
+        </Tp>
+        <Amt Ccy="CHF">8000.00</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <Dt>
+          <Dt>2030-11-02</Dt>
+        </Dt>
+      </Bal>
+      <Ntry>
+        <NtryRef>CH9300762011623852957</NtryRef>
+        <Amt Ccy="CHF">735.50</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <RvslInd>false</RvslInd>
+        <Sts>BOOK</Sts>
+        <BookgDt>
+          <Dt>2030-11-02</Dt>
+        </BookgDt>
+        <ValDt>
+          <Dt>2030-11-02</Dt>
+        </ValDt>
+        <AcctSvcrRef>DD0312A0B3C42C7F</AcctSvcrRef>
+        <BkTxCd>
+          <Domn>
+            <Cd>PMNT</Cd>
+            <Fmly>
+              <Cd>RCDT</Cd>
+              <SubFmlyCd>VCOM</SubFmlyCd>
+            </Fmly>
+          </Domn>
+        </BkTxCd>
+        <NtryDtls>
+          <Btch>
+            <MsgId>QRR-20301102-01</MsgId>
+            <PmtInfId>PAYOUT-20301102-A</PmtInfId>
+            <NbOfTxs>3</NbOfTxs>
+            <TtlAmt Ccy="CHF">735.50</TtlAmt>
+            <CdtDbtInd>CRDT</CdtDbtInd>
+          </Btch>
+          <TxDtls>
+            <Refs>
+              <AcctSvcrRef>A0B3C42C7F-1</AcctSvcrRef>
+              <EndToEndId>NOTPROVIDED</EndToEndId>
+            </Refs>
+            <Amt Ccy="CHF">400.00</Amt>
+            <CdtDbtInd>CRDT</CdtDbtInd>
+            <RmtInf>
+              <Strd>
+                <CdtrRefInf>
+                  <Tp>
+                    <CdOrPrtry>
+                      <Prtry>QRR</Prtry>
+                    </CdOrPrtry>
+                  </Tp>
+                  <Ref>210000000003139471430009017</Ref>
+                </CdtrRefInf>
+              </Strd>
+            </RmtInf>
+          </TxDtls>
+          <TxDtls>
+            <Refs>
+              <AcctSvcrRef>A0B3C42C7F-2</AcctSvcrRef>
+              <EndToEndId>NOTPROVIDED</EndToEndId>
+            </Refs>
+            <Amt Ccy="CHF">250.00</Amt>
+            <CdtDbtInd>CRDT</CdtDbtInd>
+          </TxDtls>
+          <TxDtls>
+            <Refs>
+              <AcctSvcrRef>A0B3C42C7F-3</AcctSvcrRef>
+              <EndToEndId>NOTPROVIDED</EndToEndId>
+            </Refs>
+            <Amt Ccy="CHF">85.50</Amt>
+            <CdtDbtInd>CRDT</CdtDbtInd>
+          </TxDtls>
+        </NtryDtls>
+      </Ntry>
+      <Ntry>
+        <Amt Ccy="CHF">129.95</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <RvslInd>false</RvslInd>
+        <Sts>BOOK</Sts>
+        <BookgDt>
+          <Dt>2030-11-02</Dt>
+        </BookgDt>
+        <ValDt>
+          <Dt>2030-11-02</Dt>
+        </ValDt>
+        <AcctSvcrRef>DD0312A0B3C42C80</AcctSvcrRef>
+        <BkTxCd/>
+        <NtryDtls>
+          <TxDtls>
+            <Refs>
+              <AcctSvcrRef>A0B3C42C80-1</AcctSvcrRef>
+              <EndToEndId>NOTPROVIDED</EndToEndId>
+            </Refs>
+            <RmtInf>
+              <Strd>
+                <CdtrRefInf>
+                  <Tp>
+                    <CdOrPrtry>
+                      <Prtry>QRR</Prtry>
+                    </CdOrPrtry>
+                  </Tp>
+                  <Ref>210000000003139471430009025</Ref>
+                </CdtrRefInf>
+              </Strd>
+            </RmtInf>
+          </TxDtls>
+        </NtryDtls>
+      </Ntry>
+      <Ntry>
+        <Amt Ccy="CHF">1.50</Amt>
+        <CdtDbtInd>DBIT</CdtDbtInd>
+        <Sts>BOOK</Sts>
+        <BookgDt>
+          <Dt>2030-11-02</Dt>
+        </BookgDt>
+        <ValDt>
+          <Dt>2030-11-02</Dt>
+        </ValDt>
+        <AcctSvcrRef>DD0312A0B3C42C81</AcctSvcrRef>
+        <BkTxCd/>
+        <AddtlNtryInf>Charges QR-bill batch</AddtlNtryInf>
+      </Ntry>
+    </Stmt>
+  </BkToCstmrStmt>
+</Document>

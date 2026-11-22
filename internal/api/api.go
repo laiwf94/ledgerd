@@ -436,6 +436,29 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// camtSummary describes the statements of a camt.053 file in a
+// reconciliation's response.
+type camtSummary struct {
+	Statements []recon.CamtStatement `json:"statements"`
+	Skipped    int                   `json:"skipped_entries"`
+}
+
+// statementType reports whether a reconcile body is camt.053 XML
+// (application/xml or text/xml) rather than CSV (text/csv).
+func statementType(r *http.Request) (camt bool, err error) {
+	ct := r.Header.Get("Content-Type")
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	switch strings.ToLower(strings.TrimSpace(ct)) {
+	case "text/csv":
+		return false, nil
+	case "application/xml", "text/xml":
+		return true, nil
+	}
+	return false, &apiError{http.StatusUnsupportedMediaType, "invalid_argument", "Content-Type must be text/csv, or application/xml for a camt.053 statement"}
+}
+
 func requireType(r *http.Request, want string) error {
 	ct := r.Header.Get("Content-Type")
 	if i := strings.IndexByte(ct, ';'); i >= 0 {
@@ -825,16 +848,21 @@ func (s *Server) reverseTransfer(w http.ResponseWriter, r *http.Request) error {
 	return s.execute(w, r, cmd, body, http.StatusCreated)
 }
 
-// reconcile matches a CSV statement against the account's posted movements.
-// With save=true the result is stored as a reconciliation run (see
+// reconcile matches a statement, CSV or ISO 20022 camt.053 XML, against the
+// account's posted movements. With save=true the result is stored as a reconciliation run (see
 // recons.go); otherwise nothing is stored.
 func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) error {
 	id, err := pathID(r)
 	if err != nil {
 		return err
 	}
-	if err := requireType(r, "text/csv"); err != nil {
+	camt, err := statementType(r)
+	if err != nil {
 		return err
+	}
+	stmtAcct := r.URL.Query().Get("statement_account")
+	if stmtAcct != "" && !camt {
+		return badRequest("statement_account chooses a statement of a camt.053 file; a CSV statement has none")
 	}
 	save, runID, err := saveParams(r)
 	if err != nil {
@@ -868,7 +896,15 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) error {
 		w.Header().Set("Retry-After", "1")
 		return &apiError{http.StatusTooManyRequests, "resource_exhausted", fmt.Sprintf("at most %d reconciliations run at once; retry shortly", MaxConcurrentReconciles)}
 	}
-	lines, err := recon.Parse(r.Body)
+	var lines []recon.Line
+	var camtRes *recon.CamtResult
+	if camt {
+		if camtRes, err = recon.ParseCamt053(r.Body, recon.CamtOptions{Account: stmtAcct}); err == nil {
+			lines = camtRes.Lines
+		}
+	} else {
+		lines, err = recon.Parse(r.Body)
+	}
 	var mbe *http.MaxBytesError
 	switch {
 	case errors.As(err, &mbe), errors.Is(err, recon.ErrTooLarge):
@@ -878,8 +914,12 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) error {
 	}
 	for _, ln := range lines {
 		if ln.Currency != acct.Currency {
+			where := fmt.Sprintf("row %d", ln.Row)
+			if camt {
+				where = fmt.Sprintf("entry %d", ln.Row-1)
+			}
 			return &apiError{http.StatusUnprocessableEntity, string(ledger.CodeCurrencyMismatch),
-				fmt.Sprintf("statement row %d is in %s but account %s holds %s", ln.Row, ln.Currency, id, acct.Currency)}
+				fmt.Sprintf("statement %s is in %s but account %s holds %s", where, ln.Currency, id, acct.Currency)}
 		}
 	}
 	lo, hi, ok := recon.Period(lines)
@@ -909,8 +949,12 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) error {
 		Account  string `json:"account"`
 		Currency string `json:"currency"`
 		recon.Report
-		Run *ledger.ReconRun `json:"reconciliation,omitempty"`
+		Camt *camtSummary     `json:"camt053,omitempty"`
+		Run  *ledger.ReconRun `json:"reconciliation,omitempty"`
 	}{Account: id, Currency: acct.Currency, Report: rep}
+	if camtRes != nil {
+		resp.Camt = &camtSummary{Statements: camtRes.Statements, Skipped: camtRes.Skipped}
+	}
 	if save {
 		params := struct {
 			ID          string       `json:"id,omitempty"`

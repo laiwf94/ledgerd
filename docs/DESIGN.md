@@ -1713,6 +1713,8 @@ positive amount raises the account's normal balance, parsed exactly with the
 currency's exponent (more decimals than the currency has is an error, never a
 rounding). The parser is bounded (4 MiB, 10,000 lines, field lengths) and
 fuzzed: anything it accepts must survive a format-and-parse round trip.
+A bank's ISO 20022 camt.053 file is accepted too; see
+[camt.053 statements](#camt053-statements) below.
 
 Matching runs in four passes:
 
@@ -1864,6 +1866,60 @@ statement* (movements dated inside the period). Movements up to the window
 outside the period are candidates for matching but are not reported as
 missing. The report never changes the ledger; fixing a break is a transfer or
 a reversal. Dates are UTC.
+
+### camt.053 statements
+
+Banks send end-of-day statements as ISO 20022 camt.053
+(BankToCustomerStatement) XML. With `Content-Type: application/xml` (or
+`text/xml`) the reconcile endpoint reads one with `recon.ParseCamt053`
+(internal/recon/camt053.go), which accepts every version of the message
+(namespace `urn:iso:std:iso:20022:tech:xsd:camt.053.001.NN`) and turns each booked entry (`Ntry`) into one statement line, the
+same `Line` the CSV parser produces, so matching, tolerances, batches and
+saved runs work unchanged:
+
+| Line field | From the entry |
+|---|---|
+| amount | `Amt` in its `Ccy`, positive for `CRDT` (money into the account) and negative for `DBIT`; exact to the currency's minor unit, with trailing zero decimals allowed (`500.00` JPY), never rounded |
+| date | booking date (`BookgDt/Dt`, or the calendar date the bank wrote in `BookgDt/DtTm`), else the value date |
+| external_id | the bank's entry reference `AcctSvcrRef`, else `NtryRef`, else the `AcctSvcrRef` of its only transaction, else `entry-N` for the Nth entry of the file |
+| reference | a batch entry's `NtryDtls/Btch/PmtInfId`; for one transaction its `EndToEndId`, structured creditor reference (`RmtInf/Strd/CdtrRefInf/Ref`: RF, QRR), first `RmtInf/Ustrd` line or `PmtInfId`; for several transactions the `PmtInfId` they all share; `NOTPROVIDED` and text that is not printable or longer than 128 bytes are passed over |
+| row | the entry's position in the file plus one, so the first entry is row 2 as the first CSV data row is, and rows stay distinct when a file is all on one line |
+
+A sign follows money, not debits and credits: money into the bank
+account raises the balance of the ledger account that mirrors it, whichever
+its normal balance. Only booked entries (`Sts` `BOOK`, or `Sts/Cd` `BOOK`
+from version 08) become lines; pending (`PDNG`) and information (`INFO`)
+entries are left out and counted in the response's
+`camt053.skipped_entries`. A reversal (`RvslInd` true) is the opposite
+indicator of the entry it reverses, so it needs no special case. A batch
+booking is one line, so the payouts it settles match it as a batch by its
+`PmtInfId` (`TestCamt053Batch`).
+
+A file may hold statements for several accounts. All of them must be for
+the same account unless `statement_account=` names one, by IBAN or other
+identification, ignoring case and spaces; the response's
+`camt053.statements` lists every statement with its account, entry and
+booked counts and whether it was read.
+
+The parser streams `encoding/xml` tokens and keeps only those fields, so
+its memory beyond the file is the lines it returns. Its limits: 4 MiB and
+10,000 entries as for CSV, elements nested at most 32 deep, at most 1,024
+bytes of text in any element it reads, one `Document`, UTF-8 only, and no
+document type declaration (so no entity is ever defined, let alone
+expanded) or processing instruction. Elements of other namespaces, such as
+supplementary data, are skipped whatever their names. Errors give the line
+of the file and the entry number. An element the parser reads that the schema
+allows once in its place (an entry's `Amt`, say) is an error if it appears
+twice. 10,000 entries with transaction details (2.7 MB)
+parse in 110 to 130 ms on one core of a 2.1 GHz Xeon, of which 87 ms is
+`encoding/xml` tokenizing (`BenchmarkCamt053`). The tests parse samples in
+the layouts of three market practices, a German DK statement
+(camt.053.001.02), a Swiss Payment Standards statement with a QR-bill batch
+booking (001.04) and a version 08 file with date-time bookings and two
+accounts (testdata/camt053, with fictitious accounts and amounts); the
+fuzz target (`FuzzCamt053`) requires that anything accepted has rows
+increasing from 2 and unique external IDs and is a CSV statement the CSV
+parser reads back to the same lines.
 
 ### Saved reconciliation runs
 
@@ -2119,6 +2175,7 @@ accounts, so all of these also cross power cuts and snapshots.
 | Exchange rate | positive plain decimal, 30 digits | Exact, no floats or exponents; `big.Rat` checks it. |
 | Rate source | 1 to 64 chars | |
 | Statement CSV | 4 MiB, 10,000 lines | |
+| Statement camt.053 | 4 MiB, 10,000 entries, 32 levels of elements, 1,024 bytes of text in an element read | Streamed; no DTDs or entities. |
 | Reconciliation | 4 at once, period 366 days, window 31 days, 100,000 movements | Bounds memory per request. |
 | Saved reconciliation runs | 10,000 runs, 2,000,000 matches and breaks in all, one 16 MiB log record per run | Runs live in memory; a stored match is about 210 bytes. |
 | Batch matches | 1,000 movements per batch; the search runs over at most 256 candidates, 50,000 steps per line and 2,000,000 per reconciliation | Subset sum is exponential; the budget fixes the worst case and keeps reports deterministic. |
