@@ -122,6 +122,7 @@ type Ledger struct {
 	snapIdle  chan struct{}
 	snapMu    sync.Mutex
 	snapIndex map[uint64]uint64 // snapshot number to the log index of its record
+	aging     agingCache        // open reconciliation breaks; see aging.go
 	dropMu    sync.Mutex        // serializes segment drops; tests hold it to keep segments in place
 
 	mCommitted, mRejected, mBatches, mRecords *metrics.Counter
@@ -483,6 +484,11 @@ func (l *Ledger) registerMetrics() {
 		defer l.mu.RUnlock()
 		return float64(len(l.st.monitors))
 	})
+	for i, b := range AgingBuckets {
+		m.LabeledGauge("ledgerd_recon_open_breaks", `bucket="`+b.Label+`"`,
+			"Open reconciliation breaks of saved runs, by days since the item's date.",
+			func() float64 { return float64(l.openBreaksByBucket()[i]) })
+	}
 	m.Gauge("ledgerd_balance_alerts", "Sequence number of the newest balance alert.", func() float64 { return float64(l.AlertHead()) })
 }
 

@@ -67,6 +67,15 @@ current formats.
   lists the statements. The parser streams, is limited to 4 MiB, 10,000
   entries, 32 levels and 1,024 bytes of text per element read, refuses
   DTDs, and is fuzzed in CI (`FuzzCamt053`).
+- Aging of open breaks: `GET /v1/reconciliations/breaks/aging`
+  (`?account=&as_of=`) puts the open breaks of the saved runs into buckets
+  of 0-2, 3-7, 8-30 and 30+ days since the item's date, each with counts by
+  kind, the oldest date and totals per currency. A break stays open until a
+  later run on the account names its statement line or movement; reopened
+  matches count. The gauge `ledgerd_recon_open_breaks{bucket=...}` reports
+  the same counts as of the clock. The report is computed from a summary
+  rebuilt only when a run is saved or reviewed, so nothing new is stored.
+  `metrics.Registry.LabeledGauge` registers one labelled gauge series.
 
 #### Changed
 

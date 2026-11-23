@@ -101,6 +101,15 @@ func (r *Registry) Gauge(name, help string, fn func() float64) {
 	r.help[name] = help
 }
 
+// LabeledGauge registers a function read at scrape time for one labelled
+// series of a gauge, such as `bucket="0-2"`.
+func (r *Registry) LabeledGauge(name, labels, help string, fn func() float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.gauges[series(name, labels)] = fn
+	r.help[name] = help
+}
+
 func series(name, labels string) string {
 	if labels == "" {
 		return name
@@ -134,7 +143,8 @@ func (r *Registry) Write(w io.Writer) error {
 		fmt.Fprintf(&b, "%s %d\n", k, r.counters[k].Value())
 	}
 	for _, k := range sortedKeys(r.gauges) {
-		header(k, "gauge")
+		name, _ := splitSeries(k)
+		header(name, "gauge")
 		fmt.Fprintf(&b, "%s %s\n", k, formatFloat(r.gauges[k]()))
 	}
 	for _, k := range sortedKeys(r.histograms) {

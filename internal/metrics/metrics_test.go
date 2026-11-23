@@ -24,6 +24,8 @@ func TestExposition(t *testing.T) {
 	}
 	r.Histogram("plain_seconds", "", "No labels.").Observe(time.Millisecond)
 	r.Gauge("head", "Head.", func() float64 { return 12 })
+	r.LabeledGauge("open", `bucket="0-2"`, "Open items.", func() float64 { return 3 })
+	r.LabeledGauge("open", `bucket="30+"`, "Open items.", func() float64 { return 1 })
 	var b strings.Builder
 	if err := r.Write(&b); err != nil {
 		t.Fatal(err)
@@ -35,6 +37,7 @@ func TestExposition(t *testing.T) {
 		`reqs_total{code="500"} 1`,
 		"# TYPE head gauge",
 		"head 12",
+		"# HELP open Open items.\n# TYPE open gauge\n" + `open{bucket="0-2"} 3` + "\n" + `open{bucket="30+"} 1` + "\n",
 		"# TYPE lat_seconds histogram",
 		`lat_seconds_bucket{route="/x",le="0.00005"} 1`,
 		`lat_seconds_bucket{route="/x",le="0.0025"} 2`,
@@ -46,6 +49,9 @@ func TestExposition(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)
 		}
+	}
+	if strings.Count(out, "# TYPE open") != 1 {
+		t.Error("labelled gauge TYPE line repeated")
 	}
 	if strings.Count(out, "# TYPE reqs_total") != 1 {
 		t.Error("TYPE line repeated")

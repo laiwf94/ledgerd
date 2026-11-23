@@ -1981,6 +1981,40 @@ reviewed (measured on the heap of a ledger reopened with and without a
 10,000-match run); at most 10,000 runs and 2,000,000 matches and breaks are
 kept.
 
+### Aging of open breaks
+
+`GET /v1/reconciliations/breaks/aging` sorts the open breaks of every saved
+run, or with `?account=` of one account's runs, into four buckets by age:
+0-2, 3-7, 8-30 and 30+ (31 days and older). An item's age is whole days
+from its earliest date (the statement line's booking date, the movement's
+journal date, the earlier of the two for an amount mismatch) to `as_of=`,
+today in UTC by default; an item dated after that day is 0 days old. Each
+bucket gives the open count, the count by kind (`amount_mismatches`,
+`missing_in_ledger`, `missing_in_statement`, `reopened_matches`), the
+oldest date in it and a total per currency: a line's or movement's amount
+without its sign, the difference for an amount mismatch, the line's amount
+for a reopened match, summed in 128 bits so no total overflows.
+
+A break is open until a later run on the same account names its statement
+line (by external ID) or its movement (by sequence) again, as a match or as
+a break: the newest run's verdict on an item replaces older ones, so a
+break a later statement matched is closed, one found broken again counts
+once, as the newer run's break, and a reopened match is open, with its line
+and movements, until a later run names one of them. `TestOpenGroupsMatchDefinition`
+compares this with a direct quadratic reading of the rule on random runs
+that share lines and movements.
+
+Nothing is stored for the report. Runs never change once committed (a
+review commits a new run value), so the ledger keeps a summary of the open
+items grouped by account, day and kind and rebuilds it, outside the
+ledger's lock, only when the run pointers differ from those it was built
+from. A report or a scrape then costs one pass over the groups: about 85 µs
+for a ledger with 2,000,000 open breaks over 365 days, whose summary takes
+280 ms and 73 MB of transient allocation to rebuild (`BenchmarkOpenGroups`).
+The same summary feeds the gauge
+`ledgerd_recon_open_breaks{bucket="0-2"|"3-7"|"8-30"|"30+"}`, counted as of
+the clock.
+
 ## What the invariant checker proves
 
 `GET /v1/admin/invariants` and startup both run the checker:

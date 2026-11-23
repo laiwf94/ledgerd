@@ -107,7 +107,8 @@ percentage of the line, or both), fees and rounding become labelled
 near-matches that record the difference, proposed only when the line and
 the movement are each other's only candidate. A run can be saved in the log, listed, and reviewed
 match by match (confirm or reopen); the ledger checks every saved run
-against the journal before it accepts it. An invariant checker (debits equal credits per
+against the journal before it accepts it. Open breaks are reported by age
+(0-2, 3-7, 8-30 and over 30 days), with a Prometheus gauge per bucket. An invariant checker (debits equal credits per
 currency, every balance equals the fold of its entries, limits hold,
 reservations match open pending transfers) runs at startup and on demand;
 it checks a frozen copy-on-write view of the ledger, so commits keep going
@@ -179,6 +180,7 @@ JSON bodies and an optional `Idempotency-Key` header.
 | `GET /v1/reconciliations/{id}` | One run with every match (`status` `proposed`, `confirmed` or `reopened`, `status_changed_at`, `note`) and every break (`amount_mismatch`, `missing_in_ledger`, `missing_in_statement`). |
 | `POST /v1/reconciliations/{id}/confirm` | Confirm matches: `{"matches":[1,2]}` or `{"all":true}`, optional `note`. Returns `changed` and the run's summary. |
 | `POST /v1/reconciliations/{id}/reopen` | Reopen matches, the same way; their line and movement are open items again. |
+| `GET /v1/reconciliations/breaks/aging` | Open breaks of the saved runs in age buckets (`0-2`, `3-7`, `8-30`, `30+` days), each with counts by kind, the oldest date and totals per currency; a break is open until a later run names its line or movement, and reopened matches count. `?account=&as_of=` (a date; today by default). The same counts are the gauge `ledgerd_recon_open_breaks{bucket=...}`. |
 | `POST /v1/transfers` | Create a transfer; `"pending": true` for two-phase. `"balance_debit"` / `"balance_credit"` (two postings only) cut the amount to what that account's limits allow, an unset limit counting as zero; `balancing` in the response has `requested_amount` and `amount`, and nothing to move is 422 `limit_exceeded`. A posting with its own `currency` makes a multi-currency transfer: two currencies at most, balanced in each, with `"fx":{"rate":"0.9234","source":"...","quoted_at":"..."}` checked against the exchange accounts' amounts. |
 | `POST /v1/transfers/batch` | Create up to 8,190 transfers atomically: `{"transfers":[...]}`, each as for `POST /v1/transfers`. 201 with `results` in order, each `{"status":"created","transfer":{...}}`. If one is refused, nothing happens: the status and `error` are that transfer's, `error.item` is its index, and `results` has it as `failed` and the rest as `not_applied`. One `Idempotency-Key` covers the whole batch. Bodies up to 16 MiB. |
 | `GET /v1/transfers` | List transfers in creation order, `order=desc` for newest first; `?account=&state=&currency=&reference=&metadata[key]=value&limit=&cursor=`. `reference=` finds the transfers that carry an external reference. Same cursors as accounts. |

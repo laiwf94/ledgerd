@@ -204,6 +204,7 @@ func New(cfg Config) (*Server, error) {
 	s.route("GET /v1/balance-alerts", s.listAlerts, authKey)
 	s.route("GET /v1/reconciliations", s.listRecons, authKey)
 	s.route("GET /v1/reconciliations/{id}", s.getRecon, authKey)
+	s.route("GET /v1/reconciliations/breaks/aging", s.reconAging, authKey)
 	s.route("POST /v1/reconciliations/{id}/confirm", s.reviewRecon(false), authKey)
 	s.route("POST /v1/reconciliations/{id}/reopen", s.reviewRecon(true), authKey)
 	s.route("GET /v1/admin/invariants", s.invariants, authAdmin)

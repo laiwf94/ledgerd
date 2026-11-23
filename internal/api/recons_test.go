@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -337,5 +338,79 @@ func TestReconcileWithTolerancesOverHTTP(t *testing.T) {
 	}
 	if r := f.call("POST", "/v1/accounts/merchant/reconcile?tolerance_pct=10", stmt, csv...); r.status != 200 {
 		t.Fatalf("10%%: %d %s", r.status, r.body)
+	}
+}
+
+// Open breaks age from their dates; the report and the gauges agree.
+func TestReconAgingOverHTTP(t *testing.T) {
+	f := reconFixture(t)
+	csv := []string{"Content-Type", "text/csv"}
+	empty := f.must(200, "GET", "/v1/reconciliations/breaks/aging", "")
+	if empty["as_of"] != "2030-03-01" || empty["open_breaks"] != float64(0) || len(empty["buckets"].([]any)) != 4 {
+		t.Fatalf("empty report %v", empty)
+	}
+	// s3 (an amount mismatch, off by 0.01) is dated 2030-03-01, s4 (missing
+	// in the ledger, 7.00) 2030-03-02.
+	if r := f.call("POST", "/v1/accounts/merchant/reconcile?save=true&id=mar&window_days=1", settlement, csv...); r.status != 201 {
+		t.Fatalf("save: %d %s", r.status, r.body)
+	}
+	rep := f.must(200, "GET", "/v1/reconciliations/breaks/aging?as_of=2030-03-10&account=merchant", "")
+	if rep["as_of"] != "2030-03-10" || rep["account"] != "merchant" || rep["open_breaks"] != float64(2) {
+		t.Fatalf("report %v", rep)
+	}
+	buckets := rep["buckets"].([]any)
+	b37, b830, last := buckets[1].(map[string]any), buckets[2].(map[string]any), buckets[3].(map[string]any)
+	if b37["bucket"] != "3-7" || b37["min_days"] != float64(3) || b37["max_days"] != float64(7) || b37["open_breaks"] != float64(0) ||
+		len(b37["amounts"].([]any)) != 0 {
+		t.Fatalf("3-7 %v", b37)
+	}
+	// 8 and 9 days old.
+	if b830["open_breaks"] != float64(2) || b830["amount_mismatches"] != float64(1) || b830["missing_in_ledger"] != float64(1) ||
+		b830["oldest"] != "2030-03-01" || fmt.Sprint(b830["amounts"]) != "[map[amount:7.01 currency:USD]]" {
+		t.Fatalf("8-30 %v", b830)
+	}
+	if last["bucket"] != "30+" || last["min_days"] != float64(31) || last["max_days"] != nil {
+		t.Fatalf("30+ %v", last)
+	}
+	// Reopening the reference match adds it, from its date, for 10.00.
+	f.must(200, "POST", "/v1/reconciliations/mar/reopen", `{"matches":[1]}`)
+	if rep := f.must(200, "GET", "/v1/reconciliations/breaks/aging", ""); rep["open_breaks"] != float64(3) ||
+		fmt.Sprint(rep["buckets"].([]any)[0].(map[string]any)["amounts"]) != "[map[amount:17.01 currency:USD]]" {
+		t.Fatalf("after reopen %v", rep)
+	}
+	if got := f.must(200, "GET", "/v1/reconciliations/breaks/aging?account=alice", "")["open_breaks"]; got != float64(0) {
+		t.Fatalf("alice %v", got)
+	}
+	f.clock.Advance(40 * 24 * time.Hour)
+	m := f.call("GET", "/metrics", "").String()
+	for _, want := range []string{"# TYPE ledgerd_recon_open_breaks gauge", `ledgerd_recon_open_breaks{bucket="0-2"} 0`,
+		`ledgerd_recon_open_breaks{bucket="8-30"} 0`, `ledgerd_recon_open_breaks{bucket="30+"} 3`} {
+		if !strings.Contains(m, want) {
+			t.Errorf("missing %q in metrics", want)
+		}
+	}
+	for _, c := range []struct {
+		q      string
+		status int
+	}{
+		{"?as_of=2030-02-30", 400},
+		{"?as_of=", 400},
+		{"?as_of=1969-12-31", 400},
+		{"?account=a%20b", 400},
+		{"?account=ghost", 404},
+		{"?limit=5", 400},
+		{"?as_of=2030-03-01&as_of=2030-03-02", 400},
+		{"?as_of=" + strings.Repeat("9", 100), 400},
+	} {
+		if r := f.call("GET", "/v1/reconciliations/breaks/aging"+c.q, ""); r.status != c.status {
+			t.Errorf("%s: %d %s", c.q, r.status, r.body)
+		}
+	}
+	// A run may still be called breaks.
+	if r := f.call("POST", "/v1/accounts/merchant/reconcile?save=true&id=breaks", settlement, csv...); r.status != 201 {
+		t.Fatalf("save breaks: %d %s", r.status, r.body)
+	}
+	if got := f.must(200, "GET", "/v1/reconciliations/breaks", "")["id"]; got != "breaks" {
+		t.Fatalf("run named breaks: %v", got)
 	}
 }

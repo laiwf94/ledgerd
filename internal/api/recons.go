@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/laiwf94/ledgerd/internal/ledger"
@@ -165,6 +166,40 @@ func (s *Server) getRecon(w http.ResponseWriter, r *http.Request) error {
 		run.Breaks = []ledger.ReconBreak{}
 	}
 	writeJSON(w, http.StatusOK, run)
+	return nil
+}
+
+// reconAging reports the saved runs' open breaks in age buckets, as of
+// as_of= (a date, today in UTC by default), optionally for one account.
+func (s *Server) reconAging(w http.ResponseWriter, r *http.Request) error {
+	vals, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return badRequest("invalid query string: %v", err)
+	}
+	for name, vs := range vals {
+		if name != "account" && name != "as_of" {
+			return badRequest("unknown query parameter %q", name)
+		}
+		if len(vs) != 1 {
+			return badRequest("%s may be given only once", name)
+		}
+		if len(vs[0]) > maxQueryValueBytes {
+			return badRequest("%s is longer than %d bytes", name, maxQueryValueBytes)
+		}
+	}
+	account := vals.Get("account")
+	if vals.Has("account") && !ledger.ValidID(account) {
+		return badRequest("%q is not a valid account id", account)
+	}
+	asOf := vals.Get("as_of")
+	if vals.Has("as_of") && asOf == "" {
+		return badRequest("as_of must be a date (YYYY-MM-DD)")
+	}
+	rep, err := s.l.ReconAging(account, asOf)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, rep)
 	return nil
 }
 
