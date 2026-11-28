@@ -96,6 +96,22 @@ current formats.
   each statement line: 10,000 lines against 100,000 movements under one
   reference took about 2 to 4 seconds and now take about 60 ms (#85).
 
+#### Tests
+
+- `TestMatchingAgreesWithModel` compares whole reconciliation reports with
+  a naive model of the matching rules (`modelReconcile`: every search a
+  scan of all lines and movements, every batch search a try of every
+  subset) on 30,000 random statements mixing references, refunds, zero
+  amounts, payout batches, fees and clusters of repeated amounts, with and
+  without a tolerance. Every match, mismatch and break and every summary
+  count must agree, and each kind of match and both ambiguity rules must
+  be exercised hundreds of times. In each report the exact matches by
+  amount and date must equal a maximum bipartite matching of what pass 1
+  left, and the one-to-one matches, exact and near, must not exceed a
+  maximum matching of the lines and movements outside batches.
+  `TestAmountDateMatchingIsMaximal` now also runs with tolerances, where
+  batches and near-matches must leave the maximum exact matching intact.
+
 ### Change feed, live stream, webhooks and export (#27)
 
 #### Added

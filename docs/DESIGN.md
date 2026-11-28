@@ -1736,9 +1736,10 @@ Matching runs in four passes:
    movement with the same amount whose date is within `window_days` (default
    3, for settlement lag) before or after. For this interval structure the
    greedy choice matches as many lines as any assignment can; a test compares
-   it with a maximum bipartite matching on random inputs. A union-find "next
-   free" index per amount keeps the pass near-linear when thousands of
-   movements share an amount.
+   it with a maximum bipartite matching on random inputs, with and without a
+   tolerance, so batches and near-matches never cost an exact match. A
+   union-find "next free" index per amount keeps the pass near-linear when
+   thousands of movements share an amount.
 3. Batches by amount and date: a remaining line, in date order, may take a
    batch of two or more free movements dated within the window whose
    amounts sum to it (`amount_date_batch`): a payout batch, a card
@@ -1861,6 +1862,20 @@ A near-match has one movement, `matched_by` `reference_near` or
 `amount_date_near`, and `difference`, the line's amount minus the
 movement's; the summary counts `near_matches`. Like any match it is
 proposed until a reviewer confirms or reopens it.
+
+The passes together are checked against a second, naive implementation
+of these rules (`modelReconcile` in `internal/recon/model_test.go`), which
+scans every line and movement for every search and tries every subset for
+every batch. On 30,000 random statements mixing references, refunds, zero
+amounts, payout batches, fees and clusters of repeated amounts, with and
+without a tolerance, the two must give identical reports, summary counts
+included (`TestMatchingAgreesWithModel`). Each report is also held to
+maximum bipartite matchings: its exact matches by amount and date are as
+many as any assignment of what pass 1 left allows, and its one-to-one
+matches, exact and near, are no more than a maximum matching of the lines
+and movements outside batches. The model found that pass 1 counted a zero
+movement as moving a negative line's way, which pass 4 never did; zero now
+moves neither way in both.
 
 What is left is *missing in ledger* (statement lines) or *missing in
 statement* (movements dated inside the period). Movements up to the window

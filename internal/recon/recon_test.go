@@ -198,22 +198,18 @@ func TestPreEpochDates(t *testing.T) {
 	}
 }
 
-// maxMatching is an independent reference for pass 2: the size of a maximum
-// bipartite matching between lines and postings with equal amounts and dates
-// at most window days apart, by augmenting paths.
-func maxMatching(lines []Line, ps []Posting, window int64) int {
-	match := make([]int, len(ps))
+// maxMatchingBy is an independent reference: the size of a maximum
+// bipartite matching between nl lines and np postings joined where edge
+// says, by augmenting paths.
+func maxMatchingBy(nl, np int, edge func(li, pi int) bool) int {
+	match := make([]int, np)
 	for i := range match {
 		match[i] = -1
 	}
-	ok := func(l Line, p Posting) bool {
-		d, _ := time.Parse("2006-01-02", l.Date)
-		return l.Amount == p.Amount && abs(day(d)-day(p.Time)) <= window
-	}
 	var try func(li int, seen []bool) bool
 	try = func(li int, seen []bool) bool {
-		for pi := range ps {
-			if !seen[pi] && ok(lines[li], ps[pi]) {
+		for pi := 0; pi < np; pi++ {
+			if !seen[pi] && edge(li, pi) {
 				seen[pi] = true
 				if match[pi] < 0 || try(match[pi], seen) {
 					match[pi] = li
@@ -224,17 +220,31 @@ func maxMatching(lines []Line, ps []Posting, window int64) int {
 		return false
 	}
 	n := 0
-	for li := range lines {
-		if try(li, make([]bool, len(ps))) {
+	for li := 0; li < nl; li++ {
+		if try(li, make([]bool, np)) {
 			n++
 		}
 	}
 	return n
 }
 
+// maxMatching is the reference for pass 2: a maximum matching between
+// lines and postings with equal amounts and dates at most window days
+// apart.
+func maxMatching(lines []Line, ps []Posting, window int64) int {
+	return maxMatchingBy(len(lines), len(ps), func(li, pi int) bool {
+		d, _ := time.Parse("2006-01-02", lines[li].Date)
+		return lines[li].Amount == ps[pi].Amount && abs(day(d)-day(ps[pi].Time)) <= window
+	})
+}
+
+// Pass 2 is a maximum one-to-one matching by amount and date, with or
+// without a tolerance: batches and near-matches come after it, from what it
+// leaves, so they never cost an exact match.
 func TestAmountDateMatchingIsMaximal(t *testing.T) {
 	r := rand.New(rand.NewSource(7))
 	base := day0("2030-01-01")
+	var nBatch, nNear int
 	for iter := 0; iter < 2000; iter++ {
 		var lines []Line
 		var ps []Posting
@@ -247,17 +257,25 @@ func TestAmountDateMatchingIsMaximal(t *testing.T) {
 				Amount: int64(1 + r.Intn(3))})
 		}
 		w := r.Intn(3)
-		rep := Reconcile(lines, ps, base, base.AddDate(0, 0, 10), w)
-		// Pass 2 is maximal among one-to-one matches; batches come after it
-		// from what it leaves.
-		single := 0
+		opt := Options{WindowDays: w}
+		if iter%2 == 1 {
+			opt.Tolerance = int64(r.Intn(2))
+			opt.ToleranceBP = int64(r.Intn(2) * 5000) // 0 or 50%
+		}
+		rep := ReconcileWith(lines, ps, base, base.AddDate(0, 0, 10), opt)
+		exact := 0
 		for _, m := range rep.Matched {
-			if m.Postings == nil {
-				single++
+			switch m.By {
+			case ByAmountDate:
+				exact++
+			case ByAmountDateBatch:
+				nBatch++
+			case ByAmountDateNear:
+				nNear++
 			}
 		}
-		if got, want := single, maxMatching(lines, ps, int64(w)); got != want {
-			t.Fatalf("iteration %d: matched %d, a maximum matching has %d\nlines %+v\npostings %+v", iter, got, want, lines, ps)
+		if got, want := exact, maxMatching(lines, ps, int64(w)); got != want {
+			t.Fatalf("iteration %d: matched %d exactly, a maximum matching has %d, options %+v\nlines %+v\npostings %+v", iter, got, want, opt, lines, ps)
 		}
 		if rep.Summary.Matched+rep.Summary.MissingInLedger != len(lines) {
 			t.Fatalf("every line must be matched or missing")
@@ -267,6 +285,9 @@ func TestAmountDateMatchingIsMaximal(t *testing.T) {
 				t.Fatalf("matched outside the window: %+v", m)
 			}
 		}
+	}
+	if nBatch < 30 || nNear < 100 {
+		t.Fatalf("the inputs exercise too little: %d batches, %d near-matches", nBatch, nNear)
 	}
 }
 
