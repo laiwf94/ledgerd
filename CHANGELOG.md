@@ -77,6 +77,17 @@ current formats.
   rebuilt only when a run is saved or reviewed, so nothing new is stored.
   `metrics.Registry.LabeledGauge` registers one labelled gauge series.
 
+- `examples/demo.sh` step 15 reconciles a bank's camt.053 statement for an
+  operating account end to end: a card payout batch matched by its
+  `PmtInfId`, a processing fee the bank charged 0.03 above the ledger's
+  estimate matched as `reference_near` with `tolerance=0.05`, a wire matched
+  by `EndToEndId`, a pending entry skipped and an unbooked bank charge left
+  as a break. The run is saved and confirmed, the aging report and the
+  `ledgerd_recon_open_breaks` gauge show the break, and once the charge is
+  booked a second run closes it. `TestDemoScript` checks every line on two
+  runs across a restart and that both saved runs survive it; see
+  [docs/DESIGN.md](docs/DESIGN.md#a-camt053-payout-statement-end-to-end).
+
 #### Changed
 
 - `Ledger.Movements` also returns the journal head the movements were read

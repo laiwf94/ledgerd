@@ -129,7 +129,9 @@ metrics.
 $ export LEDGERD_API_KEYS=local-dev-key-0123456
 $ LEDGERD_DATA_DIR=./data go run ./cmd/ledgerd    # omit LEDGERD_DATA_DIR to keep everything in memory
 $ ./examples/demo.sh                              # card payment, refund, retry, overdraft, reconciliation,
-                                                  # then open, fund, freeze, list, raise a limit, close
+                                                  # then open, fund, freeze, list, raise a limit, close,
+                                                  # then a camt.053 payout statement with fees: batch,
+                                                  # near-match, review, aging, closing the break
 ```
 
 Or with Docker (data in a volume; set an admin token, since requests from the
@@ -360,7 +362,7 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401,
 | Export | Exports in both formats read back to exactly the entries written (no lines, several lines, two currencies, an FX source with a comma, quotes and a newline). Every cut and every flipped bit of a signed export is reported as damaged; a manifest rebuilt and signed with another key, or claiming the trusted key, is refused; out-of-order, repeated, out-of-period and past-the-head entries, wrong counts and a changed CSV header are each reported, and damage is narrowed to the span between two checkpoints. Live heap stays flat (under 10 KiB of growth) across a 110 MiB export. Over HTTP the export equals the journal feed line for line, a client that stops reading is cut off with no manifest while commits carry on, and `ledgerd verify-export` returns its exit codes against files from the real binary, whose key survives a restart. |
 | Reconciliation | The amount-and-date pass is compared with a maximum bipartite matching on random inputs, with and without a tolerance. Whole reports, with exact, batch and near-matches by reference and by date, mismatches and ambiguity counts, must equal those of a naive model that scans everything and tries every subset, on 30,000 random statements; the one-to-one matches in them must never exceed a maximum matching of what batches leave. A worst case of 10,000 lines against 100,000 identical movements must stay fast. The batch search is compared with an exhaustive subset count on random sets, must give the same report for shuffled inputs, and must stay within its step budget on statements built so that no subset ever fits. |
 | Parsers | Go fuzzing of the decimal amount parser, the log reader, the CSV and camt.053 statement parsers, the export verifier, the transfer, freeze, close and limit endpoints, and the listing and feed query strings with every cursor and position they return followed: accepted input round-trips; nothing returns a 500, breaks an invariant or an index, and no walk repeats an item or fails to end. |
-| API | Every endpoint and error code over real HTTP, a full card-payment flow, auth and admin rules, body limits, timeouts and request IDs. `examples/demo.sh` runs in CI against the real binary, twice and across a restart, and every step's outcome is checked (each refusal with its error code), followed by `ledgerd verify` on the data directory. |
+| API | Every endpoint and error code over real HTTP, a full card-payment flow, auth and admin rules, body limits, timeouts and request IDs. `examples/demo.sh` runs in CI against the real binary, twice and across a restart, and every step's outcome is checked (each refusal with its error code), including a camt.053 statement reconciled as a payout batch, a fee near-match and a break that closes once booked; the saved runs must survive the restart, followed by `ledgerd verify` on the data directory. |
 | Concurrency | The whole suite runs under the race detector in CI. |
 
 To run the suite and the ledger benchmarks:

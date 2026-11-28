@@ -2031,6 +2031,33 @@ The same summary feeds the gauge
 `ledgerd_recon_open_breaks{bucket="0-2"|"3-7"|"8-30"|"30+"}`, counted as of
 the clock.
 
+### A camt.053 payout statement, end to end
+
+Step 15 of `examples/demo.sh` reconciles a bank's camt.053 statement for an
+operating account against the ledger, and `TestDemoScript` checks every
+line it prints, on two runs across a restart. The ledger holds three card
+sales the processor pays out together under the reference `po-...`
+(120.00, 80.00 and 45.50), an estimated processing fee of 7.36 under
+`fee-po-...` and a 100.00 wire to the shop. The bank's statement has five
+entries:
+
+| Entry | camt.053 | Outcome |
+|---|---|---|
+| 245.50 CRDT | one entry with `Btch/PmtInfId` `po-...` | `reference_batch` of the three sales |
+| 7.39 DBIT | `RmtInf/Ustrd` `fee-po-...` | `reference_near` with `tolerance=0.05`: the processor rounded the fee 0.03 higher, recorded as `difference` -0.03 |
+| 100.00 DBIT | `Refs/EndToEndId` of the wire | `reference` |
+| 2.50 DBIT | an account charge the ledger has not booked | `missing_in_ledger` |
+| 60.00 CRDT | `Sts` `PDNG` | skipped and counted in `camt053.skipped_entries` |
+
+The run is saved (`save=true`), its three matches are confirmed with a note,
+and the aging report for the account shows the charge as one open break in
+the 0-2 day bucket, as does `ledgerd_recon_open_breaks{bucket="0-2"}`. The
+demo then books the charge as a transfer and reconciles the same statement
+again: the new run matches the charge by amount and date, and because it
+names the line again the break is closed and the account has no open
+breaks. Both runs, the review and the closed break survive the restart, and
+`ledgerd verify` checks them offline.
+
 ## What the invariant checker proves
 
 `GET /v1/admin/invariants` and startup both run the checker:

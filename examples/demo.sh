@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Walks through ledgerd against a running server: a card payment (authorize,
 # partial capture, refund), an idempotent retry, a refused overdraft, a
-# reconciliation run, and an account's lifecycle (open, fund, freeze, list,
-# raise a limit, close).
+# reconciliation run, an account's lifecycle (open, fund, freeze, list,
+# raise a limit, close), and a bank's camt.053 statement reconciled against a
+# payout batch net of fees, saved, confirmed and aged until its break closes.
 #   LEDGERD_URL (default http://localhost:8080), LEDGERD_API_KEY (default local-dev-key-0123456),
 #   LEDGERD_ADMIN_TOKEN (needed for the last step when the server has one, e.g. in Docker)
 set -euo pipefail
@@ -178,5 +179,94 @@ call POST /v1/transfers "{\"currency\":\"USD\",\"postings\":[
   {\"account\":\"$bank\",\"direction\":\"debit\",\"amount\":100},
   {\"account\":\"$acme\",\"direction\":\"credit\",\"amount\":100}]}" | expect account_closed
 
-echo "15. Invariants"
+echo "15. Reconcile the bank's camt.053 statement for the operating account: a card payout batch net of fees"
+ops="operating-$RUN"
+call POST /v1/accounts "{\"id\":\"$ops\",\"currency\":\"USD\",\"normal_balance\":\"debit\"}" > /dev/null
+for amt in 12000 8000 4550; do  # three card sales the processor pays out together as po-$RUN
+  call POST /v1/transfers "{\"currency\":\"USD\",\"reference\":\"po-$RUN\",\"postings\":[
+    {\"account\":\"$ops\",\"direction\":\"debit\",\"amount\":$amt},
+    {\"account\":\"$shop\",\"direction\":\"credit\",\"amount\":$amt}]}" > /dev/null
+done
+call POST /v1/transfers "{\"currency\":\"USD\",\"reference\":\"fee-po-$RUN\",\"postings\":[
+  {\"account\":\"$fees\",\"direction\":\"debit\",\"amount\":736},
+  {\"account\":\"$ops\",\"direction\":\"credit\",\"amount\":736}]}" > /dev/null
+call POST /v1/transfers "{\"currency\":\"USD\",\"reference\":\"wd-$RUN\",\"postings\":[
+  {\"account\":\"$shop\",\"direction\":\"debit\",\"amount\":10000},
+  {\"account\":\"$ops\",\"direction\":\"credit\",\"amount\":10000}]}" > /dev/null
+echo "   ledger: sales 120.00 + 80.00 + 45.50 under po-$RUN, an estimated fee of 7.36, a 100.00 wire to the shop"
+# entry ENTRY_ID AMOUNT CRDT|DBIT STATUS DETAILS -> one camt.053 Ntry
+entry() {
+  printf '      <Ntry><Amt Ccy="USD">%s</Amt><CdtDbtInd>%s</CdtDbtInd><Sts>%s</Sts><BookgDt><Dt>%s</Dt></BookgDt>
+        <ValDt><Dt>%s</Dt></ValDt><AcctSvcrRef>%s</AcctSvcrRef><NtryDtls>%s</NtryDtls></Ntry>\n' \
+    "$2" "$3" "$4" "$today" "$today" "$1" "$5"
+}
+camt=$(cat <<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
+  <BkToCstmrStmt>
+    <GrpHdr><MsgId>msg-$RUN</MsgId><CreDtTm>${today}T23:00:00Z</CreDtTm></GrpHdr>
+    <Stmt>
+      <Id>stmt-$RUN</Id><CreDtTm>${today}T23:00:00Z</CreDtTm>
+      <Acct><Id><IBAN>GB33BUKB20201555555555</IBAN></Id><Ccy>USD</Ccy></Acct>
+$(entry "bk1-$RUN" 245.50 CRDT BOOK "<Btch><PmtInfId>po-$RUN</PmtInfId><NbOfTxs>3</NbOfTxs></Btch>")
+$(entry "bk2-$RUN" 7.39 DBIT BOOK "<TxDtls><RmtInf><Ustrd>fee-po-$RUN</Ustrd></RmtInf></TxDtls>")
+$(entry "bk3-$RUN" 100.00 DBIT BOOK "<TxDtls><Refs><EndToEndId>wd-$RUN</EndToEndId></Refs></TxDtls>")
+$(entry "bk4-$RUN" 2.50 DBIT BOOK "<TxDtls><RmtInf><Ustrd>ACCOUNT MAINTENANCE</Ustrd></RmtInf></TxDtls>")
+$(entry "bk5-$RUN" 60.00 CRDT PDNG "<TxDtls><Refs><EndToEndId>po-next-$RUN</EndToEndId></Refs></TxDtls>")
+    </Stmt>
+  </BkToCstmrStmt>
+</Document>
+XML
+)
+# reconcile_camt -> saves a run of the statement with a 0.05 tolerance and prints it; prints the run id last
+reconcile_camt() {
+  curl -sS -X POST "$URL/v1/accounts/$ops/reconcile?window_days=2&tolerance=0.05&save=true" \
+    -H "Authorization: Bearer $KEY" -H 'Content-Type: application/xml' --data-binary "$camt" | python3 -c '
+import sys, json
+r = json.load(sys.stdin)
+if "error" in r: sys.exit("reconcile: %r" % r["error"])
+c = r["camt053"]
+st = c["statements"][0]
+print("   statement %s: %d entries, %d booked, %d pending skipped" % (st["id"], st["entries"], st["booked"], c["skipped_entries"]))
+for m in r["matched"]:
+    n = len(m.get("postings") or [1])
+    d = m.get("difference", 0)  # the line minus the movement, for a near-match
+    diff = " (ledger %.2f, difference %.2f)" % (m["amount"] / 100, d / 100) if d else ""
+    print("   matched           %s %8.2f -> %d movement%s by %s%s" % (
+        m["external_id"], (m["amount"] + d) / 100, n, "" if n == 1 else "s", m["matched_by"], diff))
+for m in r["missing_in_ledger"]:
+    print("   not in ledger:    %s %.2f %s" % (m["external_id"], m["amount"] / 100, m.get("reference", "")))
+run = r["reconciliation"]
+s = run["summary"]
+print("   saved run #%d: matches %d (near %d), proposed %d, breaks %d" % (
+    run["number"], s["matches"], s["near_matches"], s["proposed"], s["breaks"]))
+print(run["id"])'
+}
+aging() {
+  call GET "/v1/reconciliations/breaks/aging?account=$ops" | python3 -c 'import sys, json
+r = json.load(sys.stdin)
+print("   open breaks on %s: %d" % (r["account"], r["open_breaks"]))
+for b in r["buckets"]:
+    if b["open_breaks"]:
+        print("   %-4s days: %d missing in ledger, %d missing in statement, %d mismatched, %s" % (b["bucket"],
+            b["missing_in_ledger"], b["missing_in_statement"], b["amount_mismatches"],
+            ", ".join("%s %s" % (a["currency"], a["amount"]) for a in b["amounts"])))'
+}
+out=$(reconcile_camt)
+printf '%s\n' "$out" | sed '$d'
+recon=$(printf '%s\n' "$out" | tail -n 1)
+call POST "/v1/reconciliations/$recon/confirm" '{"all":true,"note":"checked against the payout report"}' | python3 -c '
+import sys, json
+r = json.load(sys.stdin); s = r["reconciliation"]["summary"]
+print("   confirmed %d matches: %d proposed, %d confirmed" % (r["changed"], s["proposed"], s["confirmed"]))'
+aging
+curl -sS "$URL/metrics" -H "Authorization: Bearer $KEY" | grep '^ledgerd_recon_open_breaks{bucket="0-2"}' | sed 's/^/   /'
+echo "   book the bank's 2.50 charge and reconcile the statement again: the break closes"
+call POST /v1/transfers "{\"currency\":\"USD\",\"reference\":\"bank-charge-$RUN\",\"postings\":[
+  {\"account\":\"$fees\",\"direction\":\"debit\",\"amount\":250},
+  {\"account\":\"$ops\",\"direction\":\"credit\",\"amount\":250}]}" > /dev/null
+reconcile_camt | sed '$d' | grep -E 'bk4-|saved run'
+aging
+
+echo "16. Invariants"
 curl -sS "$URL/v1/admin/invariants" -H "Authorization: Bearer ${LEDGERD_ADMIN_TOKEN:-$KEY}" | field "['ok']" | sed 's/^/   ok: /'
