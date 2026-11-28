@@ -87,6 +87,11 @@ current formats.
 
 #### Fixed
 
+- A zero movement is no longer a near-match by reference for a line that
+  takes money out: reference near-matching counted zero as moving a
+  negative line's way, while near-matching by amount and date never did.
+  The ledger only posts positive amounts, so this reached only callers of
+  `recon.ReconcileWith` with zero movements.
 - Reference matching no longer rescans every movement with a reference for
   each statement line: 10,000 lines against 100,000 movements under one
   reference took about 2 to 4 seconds and now take about 60 ms (#85).

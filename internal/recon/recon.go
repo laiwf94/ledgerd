@@ -496,7 +496,10 @@ func ReconcileWith(lines []Line, postings []Posting, from, to time.Time, opt Opt
 	}
 	nearAmbiguous := make([]bool, len(ls))
 	nearLine := func(ln line) bool { return ln.ok && ln.Amount != 0 && opt.allowed(ln.Amount) > 0 }
-	sameWay := func(a, b int64) bool { return (a > 0) == (b > 0) }
+	// sameWay: a and b move the same way. Zero moves neither way, so a
+	// zero movement is never near a line, by reference or by amount and
+	// date alike (the amount-and-date index already leaves zero out).
+	sameWay := func(a, b int64) bool { return a != 0 && b != 0 && (a > 0) == (b > 0) }
 	// nearPass finds the near-matches among the open lines want accepts
 	// and records each. One round is enough: a match is a line and a
 	// movement that are each other's only candidate, so taking them changes

@@ -1814,10 +1814,11 @@ minor units and `tolerance_bp` in basis points.
 Only lines and movements still open after the exact rounds and batches are
 considered, so a tolerance never takes a movement some line matches
 exactly or a batch needs, and without one nothing changes. A candidate
-moves the line's way (never across zero) and is within the tolerance: by
-reference, a free movement with the line's reference at any date, tried
-before amount mismatches are reported; by amount and date, a free movement
-within the window, tried after batches.
+moves the line's way (never across zero, and a zero movement moves neither
+way) and is within the tolerance: by reference, a free movement with the
+line's reference at any date, tried before amount mismatches are reported;
+by amount and date, a free movement within the window, tried after
+batches.
 
 A near-match is proposed only when the line and the movement are each
 other's only candidate. Choosing the nearest movement looks natural but is

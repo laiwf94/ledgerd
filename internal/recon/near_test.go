@@ -381,3 +381,19 @@ func BenchmarkNearMatches(b *testing.B) {
 		})
 	}
 }
+
+// A zero movement moves neither way, so it is never near a line: not by
+// reference, where it is still an amount mismatch, and not by amount and
+// date.
+func TestNearIgnoresZeroMovements(t *testing.T) {
+	lines := []Line{
+		{Row: 2, ExternalID: "a", Date: "2030-01-02", Amount: -2, Reference: "r"},
+		{Row: 3, ExternalID: "b", Date: "2030-01-02", Amount: -2},
+	}
+	ps := []Posting{pst(1, "2030-01-02", 0, "r"), pst(2, "2030-01-02", 0, "")}
+	rep := ReconcileWith(lines, ps, day0("2030-01-02"), day0("2030-01-02"), Options{WindowDays: 1, Tolerance: 5})
+	if len(rep.Matched) != 0 || len(rep.AmountMismatches) != 1 || rep.AmountMismatches[0].Seq != 1 ||
+		len(rep.MissingInLedger) != 1 || rep.MissingInLedger[0].Row != 3 {
+		t.Fatalf("zero movements: %+v", rep)
+	}
+}
